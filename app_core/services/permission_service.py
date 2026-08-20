@@ -3,6 +3,13 @@ from __future__ import annotations
 from typing import Any
 
 
+def is_god(user: Any) -> bool:
+    if not user:
+        return False
+    role = str(user.get("role") or "").strip().upper()
+    return role == "GOD"
+
+
 def has_permission(
     db: Any,
     *,
@@ -30,4 +37,3 @@ def has_permission(
     if role_row is not None:
         return bool(int(role_row["allowed"] or 0))
     return permission_key in set(default_permissions_for_role(role_name))
-

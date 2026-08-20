@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Logística Casa do Campo{% endblock %}</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="icon" type="image/png" href="/static/logo.png">
+</head>
+<body>
+    <header class="main-header">
+        <div class="header-container">
+            <div class="logo-area">
+                <img src="/static/logo.png" alt="Casa do Campo" class="logo-img">
+                <span class="system-title">LOGÍSTICA CASA DO CAMPO</span>
+            </div>
+            <nav class="main-nav">
+                <a href="/" class="nav-link">Dashboard</a>
+                <a href="/orders" class="nav-link">Pedidos</a>
+                <a href="/routes" class="nav-link">Rotas</a>
+                <a href="/settlement" class="nav-link">Acerto de Carga</a>
+                <a href="/reports" class="nav-link">Relatórios</a>
+                {% if current_user and current_user.role in ['GOD', 'Admin'] %}
+                    <a href="/admin/erp" class="nav-link">Integração ERP</a>
+                    <a href="/settings" class="nav-link">Configurações</a>
+                {% endif %}
+            </nav>
+            <div class="user-area">
+                {% if current_user %}
+                    <span class="user-badge">{{ current_user.name }} ({{ current_user.role }})</span>
+                    <a href="/logout" class="logout-btn">Sair</a>
+                {% endif %}
+            </div>
+        </div>
+    </header>
+
+    <main class="content-container">
+        {% block content %}{% endblock %}
+    </main>
+
+    <footer class="main-footer">
+        <div class="footer-container">
+            <p>&copy; {{ current_year or 2026 }} Logística Casa do Campo — Versão {{ system_version or 'v2.6.0' }}</p>
+        </div>
+    </footer>
+
+    <script src="/static/app.js"></script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

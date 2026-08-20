@@ -107,10 +107,12 @@ class LegacyProxyRuntime:
 
 def create_app() -> Flask:
     cfg = load_config()
+    template_dir = str(cfg.root_dir / "templates")
     app = Flask(
         __name__,
         static_folder=str(cfg.static_dir),
         static_url_path="/static",
+        template_folder=template_dir,
     )
     app.config["ENV"] = cfg.flask_env
     app.config["DEBUG"] = bool(cfg.debug)
@@ -128,3 +130,4 @@ def create_app() -> Flask:
         return proxy_runtime.proxy()
 
     return app
+

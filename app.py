@@ -49,7 +49,14 @@ except Exception:
     _erp_mapper = None  # type: ignore
     _ERP_AVAILABLE = False
 
+try:
+    from app_core.services import GLOBAL_CACHE, ALERT_SERVICE
+except Exception:
+    GLOBAL_CACHE = None
+    ALERT_SERVICE = None
+
 _thread_local = threading.local()
+
 
 class EventBroker:
     def __init__(self):
@@ -69,6 +76,12 @@ class EventBroker:
 
     def publish(self, event_type, data=None):
         event = {"type": event_type, "data": data or {}}
+        if GLOBAL_CACHE:
+            if event_type in ("orders_updated", "routes_updated"):
+                GLOBAL_CACHE.invalidate_prefix("dashboard_")
+                GLOBAL_CACHE.invalidate_prefix("stats_")
+            elif event_type == "master_data_updated":
+                GLOBAL_CACHE.clear()
         with self.lock:
             for q in self.subscribers:
                 try:
@@ -77,6 +90,7 @@ class EventBroker:
                     pass
 
 GLOBAL_BROKER = EventBroker()
+
 
 _CFG = load_config()
 BASE_DIR = str(_CFG.root_dir)
@@ -494,6 +508,8 @@ def validate_payment_method(value, required=False):
 
 def log_server_error(context, err):
     try:
+        if ALERT_SERVICE:
+            ALERT_SERVICE.record_error(str(context or "SERVER_ERROR"), err, context={"source": context})
         payload = {
             'timestamp': now(),
             'context': str(context or ''),
@@ -508,6 +524,7 @@ def log_server_error(context, err):
             f.write(json.dumps(payload, ensure_ascii=False) + '\n')
     except Exception:
         pass
+
 
 def holiday_dates():
     try:

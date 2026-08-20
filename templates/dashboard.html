@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard — Logística Casa do Campo{% endblock %}
+
+{% block content %}
+<div class="dashboard-header">
+    <h2>Painel Principal Operacional</h2>
+    <p>Resumo em tempo real de pedidos, faturamento e expedição.</p>
+</div>
+
+<div class="kpi-cards-grid">
+    <div class="kpi-card pending">
+        <span class="kpi-label">Venda (Pendente)</span>
+        <span class="kpi-value">{{ stats.count_venda or 0 }}</span>
+    </div>
+    <div class="kpi-card invoiced">
+        <span class="kpi-label">Faturado</span>
+        <span class="kpi-value">{{ stats.count_faturado or 0 }}</span>
+    </div>
+    <div class="kpi-card in-route">
+        <span class="kpi-label">Saiu para Entrega</span>
+        <span class="kpi-value">{{ stats.count_em_rota or 0 }}</span>
+    </div>
+    <div class="kpi-card settled">
+        <span class="kpi-label">Acertado (Concluído)</span>
+        <span class="kpi-value">{{ stats.count_acertado or 0 }}</span>
+    </div>
+</div>
+
+<div class="quick-actions-bar" style="margin-top: 20px;">
+    <a href="/orders/new" class="btn btn-primary">+ Novo Pedido</a>
+    <a href="/routes/new" class="btn btn-secondary">+ Criar Rota / Carga</a>
+    <a href="/admin/erp" class="btn btn-accent">🔄 Integração ERP</a>
+</div>
+{% endblock %}
