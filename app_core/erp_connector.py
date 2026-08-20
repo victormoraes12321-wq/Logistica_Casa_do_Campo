@@ -953,10 +953,10 @@ def _fetch_live_order_from_erp(cfg: ErpConfig, order_number: str) -> dict[str, A
         return None
 
 
-def lookup_order(order_number: str) -> dict[str, Any] | None:
+def lookup_order(order_number: str, force_live: bool = False) -> dict[str, Any] | None:
     """
     Busca pedido no cache local ERP pelo número do pedido.
-    Caso não esteja no cache, realiza busca direta no ERP ao vivo.
+    Se force_live=True ou caso não esteja no cache, realiza busca direta no ERP ao vivo.
     Retorna dict enriquecido ou None se não encontrado.
     """
     cfg = get_erp_config()
@@ -968,12 +968,15 @@ def lookup_order(order_number: str) -> dict[str, Any] | None:
         return None
 
     try:
-        ped_data = _cache_get_pedido(order_number)
+        ped_data = None if force_live else _cache_get_pedido(order_number)
         if ped_data is None:
             ped_data = _fetch_live_order_from_erp(cfg, order_number)
-            if ped_data is None:
-                logger.info("Cache/ERP: pedido '%s' não encontrado.", order_number)
-                return None
+            if ped_data is None and force_live:
+                ped_data = _cache_get_pedido(order_number)
+
+        if ped_data is None:
+            logger.info("Cache/ERP: pedido '%s' não encontrado.", order_number)
+            return None
 
         result = dict(ped_data)
         result["_erp_pedido_ok"] = True
@@ -1019,9 +1022,10 @@ def lookup_order(order_number: str) -> dict[str, Any] | None:
         return None
 
 
-def lookup_invoice_status(order_number: str) -> dict[str, Any] | None:
+def lookup_invoice_status(order_number: str, force_live: bool = False) -> dict[str, Any] | None:
     """
     Consulta status de faturamento no cache local (faturamento ou pedidos).
+    Se force_live=True, força busca ao vivo no ERP caso o cache não tenha NF.
     Retorna dict com dados da NF, ou None se não faturado.
     """
     cfg = get_erp_config()
@@ -1033,19 +1037,26 @@ def lookup_invoice_status(order_number: str) -> dict[str, Any] | None:
         return None
 
     try:
-        fat = _cache_get_faturamento(order_number)
-        if fat:
-            nf = (
-                fat.get("nota_fiscal")
-                or fat.get("numero_nota_fiscal")
-                or fat.get("numeronota")
-                or fat.get("nf")
-                or fat.get("num_nota")
-            )
-            if nf and str(nf).strip() not in ("", "0", "None", "null"):
-                return fat
+        if not force_live:
+            fat = _cache_get_faturamento(order_number)
+            if fat:
+                nf = (
+                    fat.get("nota_fiscal")
+                    or fat.get("numero_nota_fiscal")
+                    or fat.get("numeronota")
+                    or fat.get("nf")
+                    or fat.get("num_nota")
+                    or fat.get("numero_nota_fiscal_saida")
+                    or fat.get("nota_")
+                    or fat.get("num_nota_fiscal")
+                    or fat.get("notafiscal")
+                    or fat.get("numero_nfe")
+                    or fat.get("nfe")
+                )
+                if nf and str(nf).strip() not in ("", "0", "0.0", "None", "null"):
+                    return fat
 
-        ped = _cache_get_pedido(order_number)
+        ped = lookup_order(order_number, force_live=force_live)
         if ped:
             nf = (
                 ped.get("numeronota")
@@ -1055,26 +1066,37 @@ def lookup_invoice_status(order_number: str) -> dict[str, Any] | None:
                 or ped.get("nf")
                 or ped.get("notafiscal")
                 or ped.get("num_nota_fiscal")
+                or ped.get("numero_nota_fiscal_saida")
+                or ped.get("nota_")
+                or ped.get("numero_nfe")
+                or ped.get("nfe")
             )
             dt_fat = (
                 ped.get("datafaturamento")
                 or ped.get("data_faturamento")
+                or ped.get("data_faturamento_pedido")
                 or ped.get("datanota")
                 or ped.get("data_nota")
+                or ped.get("dtemissao_")
                 or ped.get("data_venda")
             )
-            st = str(ped.get("status") or ped.get("statuspedido") or ped.get("situacao") or "").upper()
-            if (nf and str(nf).strip() not in ("", "0", "None", "null")) or "FAT" in st or "CONCLU" in st:
+            st = str(ped.get("posicao_pedido") or ped.get("status") or ped.get("statuspedido") or ped.get("situacao") or "").upper()
+            is_fat = (nf and str(nf).strip() not in ("", "0", "0.0", "None", "null")) or st in ("F", "FATURADO", "FAT", "E", "EMITIDO", "CONCLUIDO", "FECHADO", "ENCERRADO")
+            if is_fat:
                 return {
                     "numeropedido": order_number,
-                    "nota_fiscal": str(nf).strip() if (nf and str(nf).strip() not in ("", "0", "None", "null")) else "1",
+                    "nota_fiscal": str(nf).strip() if (nf and str(nf).strip() not in ("", "0", "0.0", "None", "null")) else "1",
                     "data_faturamento": dt_fat,
                     "numeronota": nf,
                     "datafaturamento": dt_fat,
+                    "is_invoiced": True,
+                    "invoice_number": str(nf).strip() if (nf and str(nf).strip() not in ("", "0", "0.0", "None", "null")) else "1",
                     "raw_json": json.dumps(ped)
                 }
 
-        return fat
+        if not force_live:
+            return _cache_get_faturamento(order_number)
+        return None
     except Exception as exc:
         logger.error("lookup_invoice_status('%s') falhou: %s", order_number, exc, exc_info=True)
         return None

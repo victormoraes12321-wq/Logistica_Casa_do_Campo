@@ -297,19 +297,18 @@ def map_erp_to_logistica(erp_data: dict[str, Any]) -> dict[str, Any]:
 
     # ---- Detecção de Faturamento ----
     posicao = _clean_str(_get(erp_data, "posicao_pedido", "posicao", "posicao_")).upper()
-    raw_nf = _clean_str(_get(erp_data, "numero_nota_fiscal_saida", "nota_", "nota_fiscal", "numeronf", "numero_nfe", "nota"))
+    raw_nf = _clean_str(_get(erp_data, "numero_nota_fiscal_saida", "nota_", "nota_fiscal", "numeronf", "numero_nfe", "nota", "numeronota", "notafiscal", "num_nota", "num_nota_fiscal", "numero_nota", "nfe"))
     if raw_nf in ("0", "0.0", "None", "NULL"):
         raw_nf = ""
 
-    # Só considera Faturado se POSICAO_PEDIDO == 'F' E possuir número de Nota Fiscal > 0!
-    is_invoiced = bool(raw_nf) and (posicao in ("F", "FATURADO", "") or not posicao)
-    if posicao and posicao not in ("F", "FATURADO"):
-        is_invoiced = False
+    # Faturado se possui número de NF válido OU se a posição no ERP indica faturamento
+    invoiced_pos_codes = ("F", "FATURADO", "FAT", "E", "EMITIDO", "CONCLUIDO", "FECHADO", "ENCERRADO", "FINALIZADO")
+    is_invoiced = bool(raw_nf) or (posicao in invoiced_pos_codes)
 
-    invoice_number = raw_nf if is_invoiced else ""
-    invoiced_at = _parse_date(_get(erp_data, "data_faturamento_pedido", "data_faturamento")) if is_invoiced else ""
+    invoice_number = raw_nf if raw_nf else ("1" if is_invoiced else "")
+    invoiced_at = _parse_date(_get(erp_data, "data_faturamento_pedido", "data_faturamento", "datanota", "data_nota", "dtemissao_")) if is_invoiced else ""
     if is_invoiced and not invoiced_at:
-        invoiced_at = sale_date
+        invoiced_at = sale_date or datetime.now().strftime("%Y-%m-%d")
 
     return {
         "order_number": order_number,
@@ -362,16 +361,21 @@ def map_erp_invoice_to_logistica(erp_fat_data: dict[str, Any]) -> dict[str, Any]
     col_nf_data = _col("ERP_COL_NF_DATA", "datafaturamento")
 
     nf = _clean_str(
-        _get(erp_fat_data, col_nf_num, "numeronf", "nota_fiscal", "nf", "numernf", "numnf")
+        _get(erp_fat_data, col_nf_num, "numeronf", "nota_fiscal", "nf", "numernf", "numnf", "numero_nota_fiscal_saida", "nota_", "nota", "num_nota", "notafiscal", "numero_nota_fiscal", "nfe", "numero_nfe")
     )
-    if not nf:
+    if not nf or nf in ("0", "0.0", "None", "null"):
+        if erp_fat_data.get("is_invoiced") or erp_fat_data.get("invoice_number"):
+            nf = _clean_str(erp_fat_data.get("invoice_number"))
+
+    if not nf or nf in ("0", "0.0", "None", "null"):
         return None
 
     nf_date = _parse_date(
-        _get(erp_fat_data, col_nf_data, "datafaturamento", "data_faturamento", "data_nf", "datanf")
+        _get(erp_fat_data, col_nf_data, "datafaturamento", "data_faturamento", "data_faturamento_pedido", "data_nf", "datanf", "datanota", "data_nota", "invoiced_at")
     )
 
     return {
         "invoice_number": nf,
         "invoiced_at": nf_date or datetime.now().strftime("%Y-%m-%d"),
     }
+

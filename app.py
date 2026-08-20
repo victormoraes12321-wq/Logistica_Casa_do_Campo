@@ -7083,29 +7083,32 @@ def sync_pending_invoiced_orders_to_logistica():
         if not order_number:
             continue
         try:
-            fat_raw = _erp_connector.lookup_invoice_status(order_number)
-            if not fat_raw:
-                live_ped = _erp_connector.lookup_order(order_number)
+            # 1. Tenta buscar status de faturamento (no cache local)
+            fat_raw = _erp_connector.lookup_invoice_status(order_number, force_live=False)
+            
+            # 2. Se o cache não indicou faturamento, força consulta ao vivo diretamente no ERP!
+            if not fat_raw or not fat_raw.get('invoice_number'):
+                live_ped = _erp_connector.lookup_order(order_number, force_live=True)
                 if live_ped:
-                    fat_raw = _erp_connector.lookup_invoice_status(order_number) or live_ped
+                    fat_raw = _erp_connector.lookup_invoice_status(order_number, force_live=False) or live_ped
 
             if not fat_raw:
                 continue
 
             invoice_data = _erp_mapper.map_erp_invoice_to_logistica(fat_raw)
-            if not invoice_data:
+            if not invoice_data or not invoice_data.get('invoice_number'):
                 mapped_ped = _erp_mapper.map_erp_to_logistica(fat_raw)
                 if mapped_ped and (mapped_ped.get('is_invoiced') or mapped_ped.get('invoice_number')):
                     invoice_data = {
-                        'invoice_number': mapped_ped.get('invoice_number'),
-                        'invoiced_at': mapped_ped.get('invoiced_at') or mapped_ped.get('sale_date'),
+                        'invoice_number': mapped_ped.get('invoice_number') or '1',
+                        'invoiced_at': mapped_ped.get('invoiced_at') or mapped_ped.get('sale_date') or now()[:10],
                     }
 
             if not invoice_data or not invoice_data.get('invoice_number'):
                 continue
 
             nf = str(invoice_data['invoice_number']).strip()
-            if not nf or nf in ('0', 'None', 'null'):
+            if not nf or nf in ('0', '0.0', 'None', 'null'):
                 continue
 
             nf_date = invoice_data.get('invoiced_at') or now()[:10]
@@ -7145,11 +7148,12 @@ def _erp_invoice_sync_worker():
     _log = _logging.getLogger('logistica.erp_sync')
     _log.info('Thread de sync ERP ativa em background.')
 
-    last_sync_ts = 0.0
+    last_full_sync_ts = 0.0
+    last_pending_check_ts = 0.0
 
     while True:
         try:
-            time.sleep(15)  # Checa a cada 15s se é hora de executar o sync
+            time.sleep(10)  # Checa a cada 10s se é hora de executar os ciclos
             if not _ERP_AVAILABLE:
                 continue
 
@@ -7157,30 +7161,36 @@ def _erp_invoice_sync_worker():
             if not cfg.enabled or not cfg.sync_auto_enabled:
                 continue
 
-            interval_min = max(1, cfg.sync_interval_min if cfg.sync_interval_min > 0 else 30)
-            interval_sec = interval_min * 60
-
-            now_ts = time.time()
-            if (now_ts - last_sync_ts) < interval_sec:
-                continue
-
             in_sched, reason = is_in_erp_sync_schedule(cfg)
             if not in_sched:
                 _log.debug('Sync ERP pausado no momento: %s', reason)
                 continue
 
-            last_sync_ts = now_ts
-            _log.info('Sync ERP: executando sincronização periódica de cache (%s)...', reason)
-            sync_res = _erp_connector.sync_erp_cache()
-            _log.info('Sync ERP resultado: %s', sync_res.get('message'))
+            now_ts = time.time()
 
-            # Atualiza pedidos pendentes em Logística
-            updated = sync_pending_invoiced_orders_to_logistica()
-            if updated > 0:
-                _log.info('Sync ERP: %d pedido(s) faturado(s) e atualizado(s) em Logística.', updated)
+            # 1. Checa pedidos pendentes de faturamento a cada 60 segundos
+            if (now_ts - last_pending_check_ts) >= 60:
+                last_pending_check_ts = now_ts
+                updated_pending = sync_pending_invoiced_orders_to_logistica()
+                if updated_pending > 0:
+                    _log.info('Sync ERP: %d pedido(s) promovido(s) para Faturado em Logística.', updated_pending)
+
+            # 2. Executa sync completo de cache nos intervalos configurados (ex: a cada 30 min)
+            interval_min = max(1, cfg.sync_interval_min if cfg.sync_interval_min > 0 else 30)
+            interval_sec = interval_min * 60
+
+            if (now_ts - last_full_sync_ts) >= interval_sec:
+                last_full_sync_ts = now_ts
+                _log.info('Sync ERP: executando sincronização periódica de cache (%s)...', reason)
+                sync_res = _erp_connector.sync_erp_cache()
+                _log.info('Sync ERP resultado: %s', sync_res.get('message'))
+
+                # Re-executa verificação de faturamento após o sync de cache
+                sync_pending_invoiced_orders_to_logistica()
 
         except Exception as sync_exc:
             _log.error('Sync ERP: erro no ciclo de sync: %s', sync_exc)
+
 
 
 def create_server(host: str = HOST, port: int = PORT) -> SafeThreadingHTTPServer:

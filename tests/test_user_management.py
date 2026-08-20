@@ -9,21 +9,28 @@ import app
 class UserManagementTests(unittest.TestCase):
     def setUp(self):
         self.db_fd, self.db_path = tempfile.mkstemp()
+        self.orig_db_target = app.DB_TARGET
+        self.orig_db_path = app.DB_PATH
+
         app.DB_PATH = self.db_path
+        app.DB_TARGET = app.RuntimeDatabaseTarget(
+            backend='sqlite',
+            database_url=f'sqlite:///{self.db_path}',
+            sqlite_path=self.db_path
+        )
         app.init_db()
 
         with app.conn() as db:
-            db.execute("PRAGMA foreign_keys = OFF")
-            db.execute("DELETE FROM users")
-            db.execute("INSERT INTO users(id, name, username, password_hash, role, active, created_at) VALUES(888, 'GOD Test', 'god_test', 'hash1', 'GOD', 1, ?)", (app.now(),))
-            db.execute("INSERT INTO users(id, name, username, password_hash, role, active, created_at) VALUES(889, 'Maria Test', 'maria_test', 'hash2', 'Operador', 1, ?)", (app.now(),))
-            db.execute("PRAGMA foreign_keys = ON")
+            db.execute("INSERT INTO users(name, username, password_hash, role, active, created_at) VALUES('GOD Test', 'god_test', 'hash1', 'GOD', 1, ?)", (app.now(),))
+            db.execute("INSERT INTO users(name, username, password_hash, role, active, created_at) VALUES('Maria Test', 'maria_test', 'hash2', 'Operador', 1, ?)", (app.now(),))
             db.commit()
 
-            self.user1_id = 888
-            self.user2_id = 889
+            self.user1_id = db.execute("SELECT id FROM users WHERE username='god_test'").fetchone()['id']
+            self.user2_id = db.execute("SELECT id FROM users WHERE username='maria_test'").fetchone()['id']
 
     def tearDown(self):
+        app.DB_TARGET = self.orig_db_target
+        app.DB_PATH = self.orig_db_path
         os.close(self.db_fd)
         try:
             os.remove(self.db_path)
