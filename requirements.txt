@@ -1,0 +1,28 @@
+# Runtime
+waitress>=3.0.0
+Flask>=3.0.0
+
+# Banco e migrations
+SQLAlchemy>=2.0.30
+alembic>=1.13.2
+psycopg2-binary>=2.9.9
+
+# Config
+python-dotenv>=1.0.1
+
+# Deploy opcional
+# gunicorn util para Linux; pode ser ignorado em Windows local
+gunicorn>=21.2.0
+
+# PDF manual
+Pillow>=10.0.0
+reportlab>=4.0.0
+pypdf>=4.0.0
+
+# Integração ERP (drivers opcionais — instale apenas o necessário para seu ERP)
+# Oracle (modo thin — NÃO precisa instalar Oracle Client):
+oracledb>=2.0.0
+# MySQL/MariaDB:
+pymysql>=1.1.0
+# SQL Server (pyodbc requer ODBC Driver instalado no SO):
+# pyodbc>=5.0.0

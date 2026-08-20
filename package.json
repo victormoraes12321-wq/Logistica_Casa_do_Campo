@@ -1,0 +1,19 @@
+{
+  "name": "logistica_casa_do_campo",
+  "version": "1.0.0",
+  "description": "Sistema interno de logistica (Python + SQLite) para controlar pedidos, faturamento, cargas/rotas, acerto de carga, SLA, gargalos, relatorios, usuarios, permissoes e backup/restauracao.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "playwright": "^1.60.0"
+  }
+}

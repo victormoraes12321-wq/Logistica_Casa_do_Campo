@@ -1,0 +1,8 @@
+Migrações Alembic do Logística Casa do Campo.
+
+Fluxo recomendado:
+1) Banco já existente (produção atual):
+   - alembic stamp 0001_baseline_schema
+   - alembic upgrade head
+2) Banco novo (vazio):
+   - alembic upgrade head
