@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Logística Motorista — Casa do Campo</title>
+    <link rel="manifest" href="/static/driver_app/manifest.json">
+    <meta name="theme-color" content="#1b4d3e">
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+        body { background-color: #f4f6f8; color: #212529; padding-bottom: 30px; }
+        header { background: linear-gradient(135deg, #1b4d3e, #2d7a63); color: white; padding: 16px; text-align: center; position: sticky; top: 0; z-index: 100; box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
+        header h1 { font-size: 1.3rem; margin-bottom: 4px; display: flex; align-items: center; justify-content: center; gap: 8px; }
+        .net-status { font-size: 0.75rem; background: rgba(255,255,255,0.2); padding: 3px 8px; border-radius: 12px; display: inline-block; }
+        .container { padding: 14px; max-width: 600px; margin: 0 auto; }
+        .card { background: white; border-radius: 12px; padding: 16px; margin-bottom: 14px; box-shadow: 0 2px 6px rgba(0,0,0,0.06); border: 1px solid #e9ecef; }
+        .btn { display: block; width: 100%; padding: 14px; border: none; border-radius: 8px; font-weight: bold; font-size: 1rem; cursor: pointer; text-align: center; margin-top: 10px; transition: background 0.2s; }
+        .btn-primary { background: #28a745; color: white; }
+        .btn-primary:active { background: #218838; }
+        .btn-danger { background: #dc3545; color: white; }
+        .btn-outline { background: white; border: 2px solid #6c757d; color: #495057; }
+        .form-group { margin-bottom: 14px; }
+        .form-group label { display: block; font-weight: 600; margin-bottom: 6px; font-size: 0.9rem; }
+        .form-control { width: 100%; padding: 12px; border: 1px solid #ced4da; border-radius: 8px; font-size: 1rem; }
+        .order-item { border-left: 5px solid #007bff; padding: 12px; margin-bottom: 10px; background: #f8f9fa; border-radius: 0 8px 8px 0; }
+        .order-item.entregue { border-left-color: #28a745; background: #eef9f1; }
+        .order-item.problema { border-left-color: #dc3545; background: #fdf2f2; }
+        .order-header { display: flex; justify-content: space-between; font-weight: bold; margin-bottom: 6px; }
+        .order-address { font-size: 0.88rem; color: #495057; margin-bottom: 6px; }
+        .order-badge { padding: 3px 8px; border-radius: 12px; font-size: 0.75rem; font-weight: bold; color: white; background: #6c757d; }
+        .badge-pendente { background: #007bff; }
+        .badge-entregue { background: #28a745; }
+        .badge-problema { background: #dc3545; }
+        .camera-preview { width: 100%; max-height: 250px; object-fit: cover; border-radius: 8px; margin-top: 10px; display: none; border: 2px dashed #28a745; }
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); z-index: 200; padding: 14px; overflow-y: auto; }
+        .modal-content { background: white; border-radius: 12px; padding: 18px; max-width: 500px; margin: 20px auto; }
+        .offline-banner { background: #ffc107; color: #856404; padding: 10px; border-radius: 8px; font-size: 0.85rem; text-align: center; margin-bottom: 12px; display: none; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>🚚 Logística Motorista</h1>
+        <span class="net-status" id="netStatus">🟢 Online</span>
+    </header>
+
+    <div class="container">
+        <div class="offline-banner" id="offlineBanner">
+            ⚠️ Modo Offline ativo. Suas entregas e fotos serão salvas no celular e sincronizadas automaticamente quando o sinal 4G voltar.
+        </div>
+
+        <!-- TELA DE LOGIN DO MOTORISTA -->
+        <div id="screenLogin" class="card">
+            <h2 style="margin-bottom: 14px; text-align: center; color: #1b4d3e;">Identificação do Motorista</h2>
+            <div class="form-group">
+                <label for="driverSelect">Selecione seu Nome:</label>
+                <select id="driverSelect" class="form-control">
+                    <option value="">Carregando motoristas...</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="driverPin">Senha / PIN (Opcional):</label>
+                <input type="password" id="driverPin" class="form-control" placeholder="Digite sua senha se houver">
+            </div>
+            <button class="btn btn-primary" onclick="DriverApp.login()">Entrar e Ver Cargas</button>
+        </div>
+
+        <!-- TELA DE LISTA DE CARGAS -->
+        <div id="screenRoutes" class="card" style="display:none;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                <h3>Suas Cargas Ativas</h3>
+                <button class="btn btn-outline" style="width:auto; padding:6px 12px; font-size:0.85rem;" onclick="DriverApp.loadRoutes()">🔄 Atualizar</button>
+            </div>
+            <div id="routesList"></div>
+        </div>
+
+        <!-- TELA DE DETALHES DA CARGA DA ENTREGA -->
+        <div id="screenRouteDetail" style="display:none;">
+            <div class="card">
+                <button class="btn btn-outline" style="width:auto; margin-bottom:10px; padding:6px 12px;" onclick="DriverApp.showScreen('screenRoutes')">← Voltar para Cargas</button>
+                <h3 id="routeTitle" style="color:#1b4d3e;">Carga...</h3>
+                <p id="routeSub" style="font-size:0.85rem; color:#6c757d;"></p>
+            </div>
+
+            <div class="card">
+                <h4 style="margin-bottom: 10px;">Entregas desta Carga:</h4>
+                <div id="ordersList"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL DE CONFIRMAÇÃO DE ENTREGA / FOTO DO CANHOTO -->
+    <div id="modalDeliver" class="modal">
+        <div class="modal-content">
+            <h3 style="margin-bottom: 12px; color: #1b4d3e;" id="modalOrderTitle">Baixa de Entrega</h3>
+            
+            <div class="form-group">
+                <label>📷 Foto do Comprovante / Canhoto Assinado (Obrigatório):</label>
+                <input type="file" id="cameraInput" accept="image/*" capture="environment" class="form-control" onchange="DriverApp.previewPhoto(event)">
+                <img id="photoPreview" class="camera-preview" alt="Foto Canhoto">
+            </div>
+
+            <div class="form-group">
+                <label for="inputRecebedor">Nome de Quem Recebeu:</label>
+                <input type="text" id="inputRecebedor" class="form-control" placeholder="Ex: João da Silva">
+            </div>
+
+            <div class="form-group">
+                <label for="inputDoc">Documento / CPF (Opcional):</label>
+                <input type="text" id="inputDoc" class="form-control" placeholder="CPF ou RG do recebedor">
+            </div>
+
+            <div class="form-group">
+                <label for="selectPayment">Forma de Pagamento (se houver cobrança):</label>
+                <select id="selectPayment" class="form-control">
+                    <option value="">Mantém do pedido</option>
+                    <option value="Dinheiro">Dinheiro</option>
+                    <option value="Pix">Pix</option>
+                    <option value="Boleto">Boleto</option>
+                    <option value="Cartão">Cartão</option>
+                    <option value="Sem cobrança na entrega">Sem cobrança na entrega</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label for="inputNotes">Observações de Entrega:</label>
+                <input type="text" id="inputNotes" class="form-control" placeholder="Ex: Entregue na recepção da fazenda">
+            </div>
+
+            <button class="btn btn-primary" id="btnConfirmDeliver" onclick="DriverApp.submitDelivery(false)">✅ Confirmar Entrega 100%</button>
+            <button class="btn btn-danger" style="margin-top:8px;" onclick="DriverApp.toggleProblemForm()">⚠️ Informar Problema / Recusa</button>
+
+            <!-- FORMULÁRIO DE PROBLEMA -->
+            <div id="problemSection" style="display:none; margin-top:12px; border-top:2px dashed #dc3545; padding-top:12px;">
+                <div class="form-group">
+                    <label for="selectProblemType">Motivo do Problema:</label>
+                    <select id="selectProblemType" class="form-control">
+                        <option value="Cliente ausente">Cliente ausente</option>
+                        <option value="Endereço incorreto">Endereço incorreto</option>
+                        <option value="Cliente recusou">Cliente recusou</option>
+                        <option value="Produto errado">Produto errado</option>
+                        <option value="Chuva/estrada ruim">Chuva/estrada ruim</option>
+                        <option value="Outro motivo">Outro motivo</option>
+                    </select>
+                </div>
+                <button class="btn btn-danger" onclick="DriverApp.submitDelivery(true)"> Confirmar Registro de Problema</button>
+            </div>
+
+            <button class="btn btn-outline" style="margin-top:12px;" onclick="DriverApp.closeModal()">Cancelar</button>
+        </div>
+    </div>
+
+    <script src="/static/driver_app/driver.js"></script>
+    <script>
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('/static/driver_app/sw.js').catch(console.error);
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+{
+  "name": "Logística Motorista",
+  "short_name": "Motorista",
+  "start_url": "/static/driver_app/index.html",
+  "display": "standalone",
+  "background_color": "#1b4d3e",
+  "theme_color": "#1b4d3e",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "/static/logo.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/static/logo.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

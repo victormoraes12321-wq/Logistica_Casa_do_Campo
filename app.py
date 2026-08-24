@@ -13,7 +13,15 @@ from http import cookies
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse, quote, unquote, urlencode
 from app_core.config import load_config
-from app_core.domains import admin_dispatch, backup_dispatch, catalog_dispatch, orders_dispatch, reports_dispatch, routes_dispatch
+from app_core.domains import (
+    admin_dispatch,
+    backup_dispatch,
+    catalog_dispatch,
+    driver_api_dispatch,
+    orders_dispatch,
+    reports_dispatch,
+    routes_dispatch,
+)
 try:
     from app_core.domains import erp_admin_dispatch as _erp_admin_dispatch
     _ERP_ADMIN_DISPATCH_OK = True
@@ -911,8 +919,20 @@ def ensure_schema_migrations(db):
     ensure_column(db, 'orders', 'seller_name', 'seller_name TEXT')
     ensure_column(db, 'orders', 'delivered_at', 'delivered_at TEXT')
     ensure_column(db, 'orders', 'final_notes', 'final_notes TEXT')
+    ensure_column(db, 'orders', 'receipt_photo', 'receipt_photo TEXT')
+    ensure_column(db, 'orders', 'receipt_photo_at', 'receipt_photo_at TEXT')
     ensure_column(db, 'orders', 'updated_at', 'updated_at TEXT')
     ensure_column(db, 'orders', 'version', 'version INTEGER DEFAULT 1')
+    db.execute('''CREATE TABLE IF NOT EXISTS delivery_receipts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id INTEGER NOT NULL,
+        route_id INTEGER,
+        image_data TEXT NOT NULL,
+        mime_type TEXT DEFAULT 'image/jpeg',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
+    )''')
+    db.execute('CREATE INDEX IF NOT EXISTS idx_delivery_receipts_order ON delivery_receipts(order_id)')
     ensure_column(db, 'routes', 'status', 'status TEXT DEFAULT "Planejada"')
     ensure_column(db, 'routes', 'route_name', 'route_name TEXT')
     ensure_column(db, 'routes', 'total_weight', 'total_weight REAL DEFAULT 0')
@@ -1613,6 +1633,16 @@ class App(BaseHTTPRequestHandler):
     def send_file(self,path,ctype='application/octet-stream'):
         if not os.path.exists(path): self.send_error(404); return
         data=open(path,'rb').read(); self.send_response(200); self._common_headers(); self.send_header('Content-Type',ctype); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data); self.mark_request_timing()
+
+    def send_response_bytes(self, b_data, ctype='image/jpeg', st=200):
+        self.send_response(st)
+        self._common_headers()
+        self.send_header('Content-Type', ctype)
+        self.send_header('Cache-Control', 'public, max-age=86400')
+        self.send_header('Content-Length', str(len(b_data)))
+        self.end_headers()
+        self.wfile.write(b_data)
+        self.mark_request_timing()
     def redirect(self,p):
         self.send_response(302)
         self._common_headers()
@@ -1878,6 +1908,9 @@ class App(BaseHTTPRequestHandler):
                 return
 
             if path=='/login': return self.send_html(login_page())
+            if path.startswith('/api/v1/driver/'):
+                if driver_api_dispatch.handle_driver_api_request(self, path, 'GET'):
+                    return
             if path=='/logout':
                 c=cookies.SimpleCookie(self.headers.get('Cookie')); sid=c.get('sid')
                 logout_user=None
@@ -1955,6 +1988,9 @@ class App(BaseHTTPRequestHandler):
         path=urlparse(self.path).path
         if path=='/login':
             return self.post_login()
+        if path.startswith('/api/v1/driver/'):
+            if driver_api_dispatch.handle_driver_api_request(self, path, 'POST'):
+                return
         if not self.same_origin_ok():
             u = self.user()
             if u:

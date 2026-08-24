@@ -66,7 +66,8 @@ def load_config(force_reload: bool = False) -> AppConfig:
         return _CONFIG_CACHE
 
     root = Path(__file__).resolve().parents[1]
-    load_dotenv(root / ".env", override=False)
+    if not _as_bool(os.environ.get("LOGISTICA_IGNORE_DOTENV"), default=False):
+        load_dotenv(root / ".env", override=False)
 
     data_dir = root / "data"
     static_dir = root / "static"
