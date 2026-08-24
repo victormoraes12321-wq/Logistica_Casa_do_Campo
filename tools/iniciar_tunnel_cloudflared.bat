@@ -15,12 +15,18 @@ set "TOOL_DIR=%~dp0"
 set "CLOUDFLARED_EXE=%TOOL_DIR%cloudflared.exe"
 
 if exist "%CLOUDFLARED_EXE%" (
-    echo [OK] Executavel cloudflared.exe localizado.
-    goto START_TUNNEL
+    for %%I in ("%CLOUDFLARED_EXE%") do (
+        if %%~zI GTR 30000000 (
+            echo [OK] Executavel cloudflared.exe localizado e verificado (54MB).
+            goto START_TUNNEL
+        )
+    )
+    echo [AVISO] O arquivo cloudflared.exe anterior estava incompleto. Baixando novamente...
+    del /f /q "%CLOUDFLARED_EXE%" >nul 2>&1
 )
 
-echo [INFO] Baixando cloudflared.exe oficial da Cloudflare...
-powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' -OutFile '%CLOUDFLARED_EXE%'"
+echo [INFO] Baixando cloudflared.exe oficial da Cloudflare (54MB)...
+curl.exe -L "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -o "%CLOUDFLARED_EXE%"
 
 if not exist "%CLOUDFLARED_EXE%" (
     echo [ERRO] Falha ao baixar cloudflared.exe. Verifique a conexao com a internet.
