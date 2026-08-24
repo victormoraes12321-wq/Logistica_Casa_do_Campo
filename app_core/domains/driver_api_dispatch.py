@@ -26,6 +26,31 @@ def _today_str() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
+def _get_json_data(handler: Any) -> dict[str, Any]:
+    """Extrai os dados JSON ou form-POST enviados no corpo da requisição de forma 100% segura."""
+    try:
+        if hasattr(handler, "post_data"):
+            fn = getattr(handler, "post_data", None)
+            if callable(fn):
+                res = fn()
+                if isinstance(res, dict):
+                    return res
+    except Exception:
+        pass
+
+    try:
+        if hasattr(handler, "json_data"):
+            fn = getattr(handler, "json_data", None)
+            if callable(fn):
+                res = fn()
+                if isinstance(res, dict):
+                    return res
+    except Exception:
+        pass
+
+    return {}
+
+
 def _get_qs_param(handler: Any, param_name: str) -> str:
     """Extrai parâmetro de Query String diretamente da URL da requisição (handler.path)."""
     try:
@@ -39,7 +64,6 @@ def _get_qs_param(handler: Any, param_name: str) -> str:
     except Exception:
         pass
     return ""
-
 
 
 def check_and_auto_settle_route(db: Any, route_id: int, user_info: dict[str, Any] | None = None) -> bool:
@@ -116,7 +140,7 @@ def handle_driver_api_request(handler: Any, path: str, method: str) -> bool:
     # ---- 1. Identificação / Validação do Motorista ----
     if path == "/api/v1/driver/login" and method == "POST":
         try:
-            data = handler.json_data() or {}
+            data = _get_json_data(handler) or {}
             driver_name = str(data.get("driver_name") or data.get("name") or "").strip()
             pin = str(data.get("pin") or "").strip()
 
@@ -158,7 +182,7 @@ def handle_driver_api_request(handler: Any, path: str, method: str) -> bool:
     # ---- 1C. Cadastrar Novo Motorista pelo App ----
     if path == "/api/v1/driver/register" and method == "POST":
         try:
-            data = handler.json_data() or {}
+            data = _get_json_data(handler) or {}
             name = str(data.get("name") or "").strip()
             phone = str(data.get("phone") or "").strip()
             document = str(data.get("document") or "").strip()
@@ -201,7 +225,7 @@ def handle_driver_api_request(handler: Any, path: str, method: str) -> bool:
     # ---- 1D. Alteração de Senha / PIN do Motorista ----
     if path == "/api/v1/driver/change_password" and method == "POST":
         try:
-            data = handler.json_data() or {}
+            data = _get_json_data(handler) or {}
             driver_name = str(data.get("driver_name") or "").strip()
             new_pin = str(data.get("new_pin") or "").strip()
 
@@ -267,7 +291,7 @@ def handle_driver_api_request(handler: Any, path: str, method: str) -> bool:
     # ---- 2B. Marcar Saída da Carga (Promove status para 'Em rota') ----
     if path == "/api/v1/driver/start_route" and method == "POST":
         try:
-            data = handler.json_data() or {}
+            data = _get_json_data(handler) or {}
             route_id = int(data.get("route_id") or 0)
             if not route_id:
                 return handler.send_json({"ok": False, "message": "ID da carga não informado."}, 400)
@@ -359,7 +383,7 @@ def handle_driver_api_request(handler: Any, path: str, method: str) -> bool:
     # ---- 4. Registrar Entrega / Foto de Comprovante (Canhoto) / Problema ----
     if path == "/api/v1/driver/deliver" and method == "POST":
         try:
-            data = handler.json_data() or {}
+            data = _get_json_data(handler) or {}
             order_id = int(data.get("order_id") or 0)
             route_id = int(data.get("route_id") or 0) if data.get("route_id") else None
             delivered_to = str(data.get("delivered_to") or "").strip()

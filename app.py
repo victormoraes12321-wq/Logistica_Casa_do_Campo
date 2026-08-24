@@ -1660,8 +1660,18 @@ class App(BaseHTTPRequestHandler):
         content_length = int(self.headers.get('Content-Length', 0))
         if content_length > 10 * 1024 * 1024:  # Limite de 10 MB para evitar Denial of Service (OOM)
             raise ValueError('Tamanho da requisição excede o limite máximo permitido de 10MB.')
-        raw=self.rfile.read(content_length).decode('utf-8')
-        self._cached_post_data = {k:v[0] if v else '' for k,v in parse_qs(raw, keep_blank_values=True).items()}
+        raw = self.rfile.read(content_length).decode('utf-8', errors='ignore')
+        self._raw_post_body = raw
+        ctype = (self.headers.get('Content-Type') or '').lower()
+        if 'application/json' in ctype or raw.strip().startswith('{') or raw.strip().startswith('['):
+            try:
+                parsed_json = json.loads(raw)
+                if isinstance(parsed_json, dict):
+                    self._cached_post_data = parsed_json
+                    return self._cached_post_data
+            except Exception:
+                pass
+        self._cached_post_data = {k: v[0] if v else '' for k, v in parse_qs(raw, keep_blank_values=True).items()}
         return self._cached_post_data
 
     def client_ip(self):
