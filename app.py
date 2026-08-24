@@ -933,6 +933,10 @@ def ensure_schema_migrations(db):
         FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
     )''')
     db.execute('CREATE INDEX IF NOT EXISTS idx_delivery_receipts_order ON delivery_receipts(order_id)')
+    ensure_column(db, 'delivery_receipts', 'digital_signature', 'digital_signature TEXT')
+    ensure_column(db, 'delivery_receipts', 'delivered_to', 'delivered_to TEXT')
+    ensure_column(db, 'delivery_receipts', 'delivered_document', 'delivered_document TEXT')
+    ensure_column(db, 'delivery_receipts', 'notes', 'notes TEXT')
     ensure_column(db, 'routes', 'status', 'status TEXT DEFAULT "Planejada"')
     ensure_column(db, 'routes', 'route_name', 'route_name TEXT')
     ensure_column(db, 'routes', 'total_weight', 'total_weight REAL DEFAULT 0')

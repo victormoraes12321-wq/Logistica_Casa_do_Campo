@@ -320,8 +320,8 @@ def handle_driver_api_request(handler: Any, path: str, method: str) -> bool:
                         o.id as order_id, o.order_number, o.status as order_status, o.total_value, o.weight_kg,
                         o.expected_delivery_date, o.payment_method, o.notes as order_notes,
                         c.id as client_id, c.name as client_name, c.phone as client_phone, c.whatsapp as client_whatsapp,
-                        c.farm_name, c.city, c.address as client_full_address, c.delivery_address,
-                        c.location_link, c.reference_point
+                        c.farm_name, c.city, c.address as client_full_address, c.address as delivery_address,
+                        c.reference_point
                     FROM route_orders ro
                     JOIN orders o ON o.id = ro.order_id
                     LEFT JOIN clients c ON c.id = o.client_id
@@ -436,6 +436,13 @@ def handle_driver_api_request(handler: Any, path: str, method: str) -> bool:
                             signature_b64 = signature_b64.split(",", 1)[1]
                         try:
                             sig_bytes = base64.b64decode(signature_b64)
+                        except Exception:
+                            pass
+
+                    # Garantir que as colunas necessárias existem na tabela delivery_receipts
+                    for col_def in ["digital_signature BLOB", "delivered_to TEXT", "delivered_document TEXT", "notes TEXT"]:
+                        try:
+                            db.execute(f"ALTER TABLE delivery_receipts ADD COLUMN {col_def}")
                         except Exception:
                             pass
 

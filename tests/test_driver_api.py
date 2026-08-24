@@ -154,7 +154,12 @@ class DriverApiTests(unittest.TestCase):
             # Foto salva na tabela delivery_receipts
             rec = db.execute("SELECT * FROM delivery_receipts WHERE order_id=999").fetchone()
             self.assertIsNotNone(rec)
-            self.assertIn("FAKE_PHOTO_DATA_BYTES", base64.b64decode(rec["image_data"]).decode("utf-8"))
+            img_val = rec["image_data"]
+            if isinstance(img_val, bytes):
+                img_text = img_val.decode("utf-8", errors="ignore")
+            else:
+                img_text = base64.b64decode(img_val).decode("utf-8", errors="ignore")
+            self.assertIn("FAKE_PHOTO_DATA_BYTES", img_text)
 
             # Status do pedido atualizado para Acertado
             o_row = db.execute("SELECT status, receipt_photo_at FROM orders WHERE id=999").fetchone()
