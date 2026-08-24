@@ -2,8 +2,8 @@
 """
 tools/build_android_apk.py
 ==========================
-Gerador do Projeto Android Instalável e Guia de Deploy do App 'Logística Casa do Campo'.
-Cria o projeto nativo Android Studio (Kotlin + WebView + Câmera) e o pacote PWA/WebAPK.
+Gerador do Projeto Android Gradle Completo e Guia de Deploy do App 'Logística Casa do Campo'.
+Gera a estrutura nativa Android Studio reconhecida com suporte a Gradle, Câmera e WebView.
 """
 from __future__ import annotations
 
@@ -13,12 +13,79 @@ from pathlib import Path
 
 
 def generate_android_project(output_dir: Path | None = None) -> Path:
-    """Gera o projeto nativo Android completo com suporte a Câmera e Upload de Canhotos."""
+    """Gera o projeto nativo Android Gradle completo para o Android Studio."""
     root = Path(__file__).resolve().parents[1]
     out = output_dir or (root / "android_app_project")
     out.mkdir(parents=True, exist_ok=True)
 
-    # 1. AndroidManifest.xml
+    # 1. Root settings.gradle
+    settings_gradle = """pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = "LogisticaCasaDoCampo"
+include ':app'
+"""
+
+    # 2. Root build.gradle
+    root_build_gradle = """plugins {
+    id 'com.android.application' version '8.1.0' apply false
+    id 'org.jetbrains.kotlin.android' version '1.8.20' apply false
+}
+"""
+
+    # 3. app/build.gradle
+    app_build_gradle = """plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'br.com.casadocampo.logistica'
+    compileSdk 33
+
+    defaultConfig {
+        applicationId "br.com.casadocampo.logistica"
+        minSdk 21
+        targetSdk 33
+        versionCode 1
+        versionName "1.0.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    kotlinOptions {
+        jvmTarget = '1.8'
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.10.1'
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.9.0'
+}
+"""
+
+    # 4. AndroidManifest.xml
     manifest_xml = """<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="br.com.casadocampo.logistica">
@@ -52,7 +119,7 @@ def generate_android_project(output_dir: Path | None = None) -> Path:
 </manifest>
 """
 
-    # 2. MainActivity.kt (Kotlin com Câmera e WebChromeClient FileChooser)
+    # 5. MainActivity.kt (Kotlin com Câmera e WebChromeClient FileChooser)
     main_activity_kt = """package br.com.casadocampo.logistica
 
 import android.Manifest
@@ -60,7 +127,6 @@ import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
 import android.webkit.*
@@ -68,7 +134,6 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import java.io.File
 
 class MainActivity : AppCompatActivity() {
 
@@ -159,7 +224,7 @@ class MainActivity : AppCompatActivity() {
 }
 """
 
-    # 3. Manual de Instalação para o Usuário
+    # 6. Manual de Instalação para o Usuário
     readme_md = """# 📱 Manual de Instalação do App 'Logística Casa do Campo' no Android
 
 ## Opção 1: Instalação Instantânea no Celular Android (Recomendada - 1 Clique)
@@ -172,19 +237,34 @@ class MainActivity : AppCompatActivity() {
 ---
 
 ## Opção 2: Compilação do Arquivo `.apk` no Android Studio
-1. Abra a pasta `android_app_project` no **Android Studio**.
-2. Vá no menu `Build` -> `Build Bundle(s) / APK(s)` -> `Build APK(s)`.
-3. O arquivo **`Logística Casa do Campo.apk`** será gerado na pasta `app/build/outputs/apk/debug/app-debug.apk`.
-4. Transfira o arquivo `.apk` para os smartphones Android dos motoristas e toque para instalar!
+1. No Android Studio, clique em `File` -> `Open...` e selecione a pasta `android_app_project`.
+2. Aguarde a barra de progresso no canto inferior direito carregar a sincronização do Gradle.
+3. Vá no menu do topo: `Build` -> `Build Bundle(s) / APK(s)` -> `Build APK(s)`.
+4. O arquivo **`Logística Casa do Campo.apk`** será gerado na pasta `app/build/outputs/apk/debug/app-debug.apk`.
+5. Transfira o arquivo `.apk` para os smartphones Android dos motoristas e toque para instalar!
 """
 
-    (out / "src" / "main").mkdir(parents=True, exist_ok=True)
-    (out / "src" / "main" / "java" / "br" / "com" / "casadocampo" / "logistica").mkdir(parents=True, exist_ok=True)
+    # Grava arquivos do projeto
+    with open(out / "settings.gradle", "w", encoding="utf-8") as f:
+        f.write(settings_gradle)
 
-    with open(out / "src" / "main" / "AndroidManifest.xml", "w", encoding="utf-8") as f:
+    with open(out / "build.gradle", "w", encoding="utf-8") as f:
+        f.write(root_build_gradle)
+
+    app_dir = out / "app"
+    app_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(app_dir / "build.gradle", "w", encoding="utf-8") as f:
+        f.write(app_build_gradle)
+
+    src_dir = app_dir / "src" / "main"
+    pkg_dir = src_dir / "java" / "br" / "com" / "casadocampo" / "logistica"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(src_dir / "AndroidManifest.xml", "w", encoding="utf-8") as f:
         f.write(manifest_xml)
 
-    with open(out / "src" / "main" / "java" / "br" / "com" / "casadocampo" / "logistica" / "MainActivity.kt", "w", encoding="utf-8") as f:
+    with open(pkg_dir / "MainActivity.kt", "w", encoding="utf-8") as f:
         f.write(main_activity_kt)
 
     with open(out / "README_INSTALACAO_ANDROID.md", "w", encoding="utf-8") as f:

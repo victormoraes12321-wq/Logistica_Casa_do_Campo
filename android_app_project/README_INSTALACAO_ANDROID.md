@@ -10,7 +10,8 @@
 ---
 
 ## Opção 2: Compilação do Arquivo `.apk` no Android Studio
-1. Abra a pasta `android_app_project` no **Android Studio**.
-2. Vá no menu `Build` -> `Build Bundle(s) / APK(s)` -> `Build APK(s)`.
-3. O arquivo **`Logística Casa do Campo.apk`** será gerado na pasta `app/build/outputs/apk/debug/app-debug.apk`.
-4. Transfira o arquivo `.apk` para os smartphones Android dos motoristas e toque para instalar!
+1. No Android Studio, clique em `File` -> `Open...` e selecione a pasta `android_app_project`.
+2. Aguarde a barra de progresso no canto inferior direito carregar a sincronização do Gradle.
+3. Vá no menu do topo: `Build` -> `Build Bundle(s) / APK(s)` -> `Build APK(s)`.
+4. O arquivo **`Logística Casa do Campo.apk`** será gerado na pasta `app/build/outputs/apk/debug/app-debug.apk`.
+5. Transfira o arquivo `.apk` para os smartphones Android dos motoristas e toque para instalar!
