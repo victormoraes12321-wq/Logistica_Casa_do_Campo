@@ -172,12 +172,13 @@ const DriverApp = {
                 const total = r.total_orders || 0;
                 const delivered = r.delivered_orders || 0;
                 const pct = total > 0 ? Math.round((delivered / total) * 100) : 0;
+                const isPlanejada = (r.status === 'Planejada');
 
                 listEl.innerHTML += `
                     <div class="card" style="border-left: 6px solid var(--primary); cursor:pointer;" onclick="DriverApp.openRoute(${r.id})">
                         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
                             <span style="font-weight:800; font-size:1.1rem; color:var(--primary);">${r.name}</span>
-                            <span class="badge badge-pendente">${r.status}</span>
+                            <span class="badge ${isPlanejada ? 'badge-pendente' : 'badge-entregue'}">${r.status}</span>
                         </div>
                         
                         <div style="font-size:0.86rem; color:var(--text-muted); margin-bottom:10px;">
@@ -221,6 +222,13 @@ const DriverApp = {
             document.getElementById('routeTitle').innerText = data.route.name;
             document.getElementById('routeSub').innerText = `Veículo: ${data.route.vehicle_name || ''} ${data.route.plate ? '(' + data.route.plate + ')' : ''} | Motorista: ${data.route.driver_name || ''}`;
 
+            const startBtnContainer = document.getElementById('btnStartRouteContainer');
+            if (data.route.status === 'Planejada') {
+                startBtnContainer.style.display = 'block';
+            } else {
+                startBtnContainer.style.display = 'none';
+            }
+
             const orders = data.route.orders || [];
             const totalOrders = orders.length;
             const deliveredOrders = orders.filter(o => o.order_status === 'Acertado' || o.route_order_status === 'Entregue').length;
@@ -229,67 +237,168 @@ const DriverApp = {
             document.getElementById('routeProgressText').innerText = `${deliveredOrders}/${totalOrders} (${pct}%)`;
             document.getElementById('routeProgressBar').style.width = `${pct}%`;
 
-            ordersList.innerHTML = '';
-            orders.forEach(o => {
-                const isEntregue = (o.order_status === 'Acertado' || o.route_order_status === 'Entregue');
-                const isProblema = (o.order_status === 'Problema' || o.route_order_status === 'Com problema');
-
-                let statusClass = 'pendente';
-                let statusLabel = 'Pendente';
-                if (isEntregue) { statusClass = 'entregue'; statusLabel = 'Entregue 100%'; }
-                if (isProblema) { statusClass = 'problema'; statusLabel = 'Com Problema'; }
-
-                let receiptHtml = '';
-                if (o.has_receipt_photo) {
-                    receiptHtml = `<div style="color:var(--success); font-weight:700; font-size:0.8rem; margin-top:4px;">📷 Canhoto Salvo no Banco de Dados!</div>`;
-                }
-
-                const cleanPhone = (o.client_phone || '').replace(/\D/g, '');
-                let phoneButtons = '';
-                if (cleanPhone) {
-                    phoneButtons = `
-                        <a href="tel:${cleanPhone}" class="btn btn-outline btn-sm" style="padding:4px 8px; text-decoration:none; color:var(--text-dark);">📞 Ligar</a>
-                        <a href="https://wa.me/55${cleanPhone}" target="_blank" class="btn btn-outline btn-sm" style="padding:4px 8px; text-decoration:none; color:#25D366; border-color:#25D366;">💬 WhatsApp</a>
-                    `;
-                }
-
-                ordersList.innerHTML += `
-                    <div class="order-card ${statusClass}">
-                        <div class="order-header-row">
-                            <span class="order-num">Pedido #${o.order_number}</span>
-                            <span class="badge badge-${statusClass}">${statusLabel}</span>
-                        </div>
-                        <div class="client-name">${o.client_name || 'Cliente Casa do Campo'}</div>
-                        <div class="order-info-line">📍 ${o.delivery_address || 'Endereço não informado'}</div>
-                        <div class="order-info-line">🏡 Fazenda/Local: ${o.farm_name || 'N/A'}</div>
-                        
-                        <div style="font-size:0.85rem; color:var(--text-dark); margin-top:8px; display:flex; justify-content:space-between; background:#f8fafc; padding:8px 12px; border-radius:8px;">
-                            <span>Valor: <strong>R$ ${(o.total_value || 0).toFixed(2)}</strong></span>
-                            <span>Peso: <strong>${(o.weight_kg || 0).toFixed(1)} kg</strong></span>
-                        </div>
-
-                        <div style="display:flex; align-items:center; justify-content:space-between; margin-top:8px;">
-                            ${receiptHtml}
-                            <div style="display:flex; gap:6px;">${phoneButtons}</div>
-                        </div>
-
-                        <div class="action-row">
-                            ${!isEntregue ? `
-                                <button class="btn btn-primary" onclick="DriverApp.openDeliverModal(${o.order_id})">
-                                    📷 Fotografar Canhoto & Dar Baixa
-                                </button>
-                            ` : `
-                                <button class="btn btn-outline" style="font-size:0.85rem; color:var(--success); border-color:var(--success);" onclick="DriverApp.openDeliverModal(${o.order_id})">
-                                    🔄 Atualizar Comprovante / Foto
-                                </button>
-                            `}
-                        </div>
-                    </div>
-                `;
-            });
+            this.renderOrders(orders);
         } catch(e) {
             ordersList.innerHTML = '<div class="card" style="color:var(--danger); text-align:center;">Erro ao carregar pedidos da carga.</div>';
         }
+    },
+
+    startRoute: async function() {
+        if (!this.currentRoute) return;
+        
+        if (!confirm('Deseja marcar a saída desta carga? O status será alterado no sistema da empresa em tempo real para "Em Rota".')) {
+            return;
+        }
+
+        try {
+            const res = await fetch('/api/v1/driver/start_route', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ route_id: this.currentRoute.id })
+            });
+            const data = await res.json();
+            if (!data.ok) {
+                alert('Erro ao marcar saída: ' + data.message);
+                return;
+            }
+
+            alert('🚀 ' + data.message);
+            document.getElementById('btnStartRouteContainer').style.display = 'none';
+            this.openRoute(this.currentRoute.id);
+        } catch(e) {
+            alert('Erro de conexão ao marcar saída da carga.');
+        }
+    },
+
+    renderOrders: function(orders) {
+        const ordersList = document.getElementById('ordersList');
+        ordersList.innerHTML = '';
+
+        if (!orders || orders.length === 0) {
+            ordersList.innerHTML = '<div class="card" style="text-align:center; color:var(--text-muted);">Nenhum pedido encontrado.</div>';
+            return;
+        }
+
+        orders.forEach(o => {
+            const isEntregue = (o.order_status === 'Acertado' || o.route_order_status === 'Entregue');
+            const isProblema = (o.order_status === 'Problema' || o.route_order_status === 'Com problema');
+
+            let statusClass = 'pendente';
+            let statusLabel = 'Pendente';
+            if (isEntregue) { statusClass = 'entregue'; statusLabel = 'Entregue 100%'; }
+            if (isProblema) { statusClass = 'problema'; statusLabel = 'Com Problema'; }
+
+            let receiptHtml = '';
+            if (o.has_receipt_photo) {
+                receiptHtml = `<div style="color:var(--success); font-weight:700; font-size:0.8rem; margin-top:4px;">📷 Canhoto Salvo no Banco de Dados!</div>`;
+            }
+
+            // Telefones e WhatsApp do Cliente/Fazenda
+            const rawPhone = (o.client_phone || '').trim();
+            const rawWa = (o.client_whatsapp || o.client_phone || '').trim();
+            const cleanPhone = rawPhone.replace(/\D/g, '');
+            const cleanWa = rawWa.replace(/\D/g, '');
+
+            let contactButtons = '';
+            if (cleanPhone) {
+                contactButtons += `<a href="tel:${cleanPhone}" class="btn btn-outline btn-sm" style="padding:4px 8px; font-size:0.8rem; text-decoration:none; color:var(--text-dark);">📞 Ligar (${rawPhone})</a> `;
+            }
+            if (cleanWa) {
+                contactButtons += `<a href="https://wa.me/55${cleanWa}" target="_blank" class="btn btn-outline btn-sm" style="padding:4px 8px; font-size:0.8rem; text-decoration:none; color:#25D366; border-color:#25D366;">💬 WhatsApp</a> `;
+            }
+
+            // Link do GPS / Google Maps
+            const fullAddress = o.delivery_address || o.client_full_address || `${o.farm_name || ''} ${o.city || ''}`;
+            const mapQuery = encodeURIComponent(fullAddress);
+            const gpsUrl = o.location_link || `https://www.google.com/maps/search/?api=1&query=${mapQuery}`;
+
+            // Tabela de Produtos / Itens do Pedido
+            let itemsHtml = '';
+            if (o.items && o.items.length > 0) {
+                let rowsStr = '';
+                o.items.forEach(it => {
+                    rowsStr += `
+                        <tr>
+                            <td><strong>${it.product_name}</strong></td>
+                            <td style="text-align:center;">${it.quantity} ${it.unit || 'un'}</td>
+                            <td style="text-align:right;">${(it.weight_kg || 0).toFixed(1)} kg</td>
+                        </tr>
+                    `;
+                });
+                itemsHtml = `
+                    <div class="items-accordion" id="items-${o.order_id}" style="display:none;">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Produto</th>
+                                    <th style="text-align:center;">Qtde</th>
+                                    <th style="text-align:right;">Peso</th>
+                                </tr>
+                            </thead>
+                            <tbody>${rowsStr}</tbody>
+                        </table>
+                    </div>
+                `;
+            }
+
+            ordersList.innerHTML += `
+                <div class="order-card ${statusClass}" data-search="${(o.client_name + ' ' + o.farm_name + ' ' + o.order_number + ' ' + fullAddress).toLowerCase()}">
+                    <div class="order-header-row">
+                        <span class="order-num">Pedido #${o.order_number}</span>
+                        <span class="badge badge-${statusClass}">${statusLabel}</span>
+                    </div>
+                    <div class="client-name">${o.client_name || 'Cliente Casa do Campo'}</div>
+                    <div class="order-info-line">📍 ${fullAddress}</div>
+                    <div class="order-info-line">🏡 Fazenda/Local: ${o.farm_name || 'N/A'} ${o.reference_point ? '(' + o.reference_point + ')' : ''}</div>
+                    
+                    <div style="font-size:0.85rem; color:var(--text-dark); margin-top:8px; display:flex; justify-content:space-between; background:#f8fafc; padding:8px 12px; border-radius:8px;">
+                        <span>Valor: <strong>R$ ${(o.total_value || 0).toFixed(2)}</strong></span>
+                        <span>Peso: <strong>${(o.weight_kg || 0).toFixed(1)} kg</strong></span>
+                    </div>
+
+                    <div style="display:flex; flex-wrap:wrap; gap:6px; margin-top:10px;">
+                        ${contactButtons}
+                        <a href="${gpsUrl}" target="_blank" class="btn btn-outline btn-sm" style="padding:4px 8px; font-size:0.8rem; text-decoration:none; color:#0284c7; border-color:#0284c7;">🗺️ GPS Waze/Maps</a>
+                        ${o.items && o.items.length > 0 ? `
+                            <button class="btn btn-outline btn-sm" style="padding:4px 8px; font-size:0.8rem;" onclick="DriverApp.toggleItems(${o.order_id})">📦 Ver ${o.items.length} Produto(s)</button>
+                        ` : ''}
+                    </div>
+
+                    ${itemsHtml}
+                    ${receiptHtml}
+
+                    <div class="action-row">
+                        ${!isEntregue ? `
+                            <button class="btn btn-primary" onclick="DriverApp.openDeliverModal(${o.order_id})">
+                                📷 Fotografar Canhoto & Dar Baixa
+                            </button>
+                        ` : `
+                            <button class="btn btn-outline" style="font-size:0.85rem; color:var(--success); border-color:var(--success);" onclick="DriverApp.openDeliverModal(${o.order_id})">
+                                🔄 Atualizar Comprovante / Foto
+                            </button>
+                        `}
+                    </div>
+                </div>
+            `;
+        });
+    },
+
+    toggleItems: function(orderId) {
+        const el = document.getElementById(`items-${orderId}`);
+        if (el) el.style.display = (el.style.display === 'none') ? 'block' : 'none';
+    },
+
+    filterOrders: function() {
+        const term = document.getElementById('orderSearchInput').value.toLowerCase().trim();
+        const cards = document.querySelectorAll('.order-card');
+        cards.forEach(card => {
+            const dataSearch = card.getAttribute('data-search') || '';
+            if (!term || dataSearch.includes(term)) {
+                card.style.display = 'block';
+            } else {
+                card.style.display = 'none';
+            }
+        });
     },
 
     openDeliverModal: function(orderId) {

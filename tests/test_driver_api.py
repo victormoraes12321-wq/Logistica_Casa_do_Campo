@@ -73,6 +73,46 @@ class DriverApiTests(unittest.TestCase):
         driver_names = [d["name"] for d in drivers]
         self.assertIn("Motorista Novo Teste", driver_names)
 
+    def test_driver_start_route_and_order_items(self):
+        from app_core.domains.driver_api_dispatch import handle_driver_api_request
+
+        with app.conn() as db:
+            db.execute("INSERT OR REPLACE INTO drivers(id, name, active) VALUES(88, 'Motorista Rota Teste', 1)")
+            db.execute("INSERT OR REPLACE INTO vehicles(id, name, plate) VALUES(88, 'Caminhão 1620', 'XYZ-8888')")
+            db.execute("INSERT OR REPLACE INTO clients(id, name, phone, whatsapp, farm_name, created_at) VALUES(88, 'Cliente Fazenda Boa Vista', '(33) 98888-7777', '(33) 98888-7777', 'Fazenda Boa Vista', '2026-08-24 10:00:00')")
+            db.execute("""
+                INSERT INTO orders(id, order_number, client_id, status, total_value, weight_kg, created_at, updated_at)
+                VALUES(888, 'PED-ROTA-88', 88, 'Pendente', 1500.0, 300.0, '2026-08-24 10:00:00', '2026-08-24 10:00:00')
+            """)
+            db.execute("INSERT INTO order_items(order_id, product_name, quantity, unit, weight_kg) VALUES(888, 'Ração Bovinos 50kg', 6, 'un', 300.0)")
+            db.execute("""
+                INSERT INTO routes(id, name, driver_id, vehicle_id, status, created_at)
+                VALUES(88, 'Rota Teófilo Otoni #88', 88, 88, 'Planejada', '2026-08-24 10:00:00')
+            """)
+            db.execute("INSERT INTO route_orders(route_id, order_id, delivery_order, status) VALUES(88, 888, 1, 'Pendente')")
+            db.commit()
+
+        # 1. Testa marcar saída da carga
+        start_handler = DummyHandler({"route_id": 88})
+        handled_start = handle_driver_api_request(start_handler, "/api/v1/driver/start_route", "POST")
+        self.assertTrue(handled_start)
+        self.assertTrue(start_handler.result_data.get("ok"))
+        self.assertEqual(start_handler.result_data.get("status"), "Em rota")
+
+        # 2. Testa detalhamento da rota com itens e contatos
+        detail_handler = DummyHandler()
+        handled_detail = handle_driver_api_request(detail_handler, "/api/v1/driver/route/88", "GET")
+        self.assertTrue(handled_detail)
+        route_data = detail_handler.result_data.get("route", {})
+        self.assertEqual(route_data.get("status"), "Em rota")
+
+        orders = route_data.get("orders", [])
+        self.assertEqual(len(orders), 1)
+        ord_items = orders[0].get("items", [])
+        self.assertEqual(len(ord_items), 1)
+        self.assertEqual(ord_items[0]["product_name"], "Ração Bovinos 50kg")
+        self.assertEqual(orders[0]["client_phone"], "(33) 98888-7777")
+
     def test_driver_deliver_saves_photo_to_db_and_auto_settles(self):
         with app.conn() as db:
             # 1. Cria motorista, veículo, cliente, pedido e rota

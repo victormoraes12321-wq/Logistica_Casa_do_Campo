@@ -238,6 +238,57 @@ def handle_driver_api_request(handler, path: str, method: str) -> bool:
         except Exception as exc:
             return handler.send_json({"ok": False, "message": str(exc)}, 500)
 
+    # ---- 2B. Marcar Saída da Carga (Promove status para 'Em rota') ----
+    if path == "/api/v1/driver/start_route" and method == "POST":
+        try:
+            data = handler.json_data() or {}
+            route_id = int(data.get("route_id") or 0)
+            if not route_id:
+                return handler.send_json({"ok": False, "message": "ID da carga não informado."}, 400)
+
+            now_ts = _now_str()
+            with handler.conn() as db:
+                route = db.execute("SELECT * FROM routes WHERE id=?", (route_id,)).fetchone()
+                if not route:
+                    return handler.send_json({"ok": False, "message": "Carga não encontrada."}, 404)
+
+                r_dict = dict(route)
+                curr_status = str(r_dict.get("status") or "").strip()
+
+                if curr_status == "Em rota":
+                    return handler.send_json({"ok": True, "message": "Esta carga já está em rota de entrega!"})
+
+                db.execute("UPDATE routes SET status='Em rota', updated_at=?, version=COALESCE(version,1)+1 WHERE id=?", (now_ts, route_id))
+
+                # Atualiza também o status dos pedidos associados para 'Saiu para entrega'
+                db.execute("""
+                    UPDATE orders SET status='Saiu para entrega', updated_at=?, version=COALESCE(version,1)+1
+                    WHERE id IN (SELECT order_id FROM route_orders WHERE route_id=?) AND status NOT IN ('Acertado', 'Entregue')
+                """, (now_ts, route_id))
+
+                db.execute("""
+                    INSERT INTO audit_logs(created_at, source_ip, action, module, entity, notes)
+                    VALUES(?, '127.0.0.1', 'Saída de Carga Iniciada', 'Motorista App', ?, 'Saída da carga iniciada diretamente pelo App do Motorista')
+                """, (now_ts, str(route_id)))
+                db.commit()
+
+                # Notifica WebSocket/EventSource
+                try:
+                    from app_core.services.broker import GLOBAL_BROKER
+                    GLOBAL_BROKER.publish("routes_updated", {"route_id": route_id, "status": "Em rota"})
+                except Exception:
+                    pass
+
+                return handler.send_json({
+                    "ok": True,
+                    "route_id": route_id,
+                    "status": "Em rota",
+                    "message": "🚀 Saída da carga registrada com sucesso! Boa viagem."
+                })
+        except Exception as exc:
+            logger.error("Erro ao marcar saída da carga: %s", exc)
+            return handler.send_json({"ok": False, "message": str(exc)}, 500)
+
     # ---- 3. Detalhes de uma Rota / Paradas ----
     if path.startswith("/api/v1/driver/route/") and method == "GET":
         try:
@@ -263,8 +314,8 @@ def handle_driver_api_request(handler, path: str, method: str) -> bool:
                            o.client_id, o.total_value, o.weight_kg, o.delivery_address,
                            o.location_link, o.city, o.uf, o.notes, o.payment_method,
                            o.delivered_to, o.delivered_at, o.receipt_photo_at,
-                           c.name as client_name, c.phone as client_phone, c.farm_name,
-                           c.neighborhood
+                           c.name as client_name, c.phone as client_phone, c.whatsapp as client_whatsapp,
+                           c.farm_name, c.neighborhood, c.reference_point, c.address as client_full_address
                     FROM route_orders ro
                     JOIN orders o ON o.id = ro.order_id
                     LEFT JOIN clients c ON c.id = o.client_id
@@ -275,6 +326,13 @@ def handle_driver_api_request(handler, path: str, method: str) -> bool:
                 orders_list = []
                 for o_row in orders_rows:
                     od = dict(o_row)
+                    # Busca os produtos/itens do pedido
+                    items_rows = db.execute("""
+                        SELECT id, product_code, product_name, category, quantity, unit, weight_kg, notes
+                        FROM order_items WHERE order_id=? ORDER BY id ASC
+                    """, (od["order_id"],)).fetchall()
+                    od["items"] = [dict(i) for i in items_rows]
+
                     # Verifica se possui foto de comprovante salva no banco
                     has_receipt = bool(od.get("receipt_photo_at"))
                     if not has_receipt:
