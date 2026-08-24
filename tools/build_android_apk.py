@@ -140,11 +140,20 @@ zipStorePath=wrapper/dists
             android:screenOrientation="fullSensor"
             android:stateNotNeeded="true"
             android:theme="@style/zxing_CaptureTheme" />
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="br.com.casadocampo.logistica.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 </manifest>
 """
 
-    # 7. MainActivity.kt (Kotlin Nativo com Leitor de QR Code na Inicialização + Permissão de Mídia WebRTC)
+    # 7. MainActivity.kt (Kotlin Nativo com FileProvider para Câmera Nativa do Android)
     main_activity_kt = """package br.com.casadocampo.logistica
 
 import android.Manifest
@@ -154,6 +163,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
+import android.os.Environment
 import android.provider.MediaStore
 import android.webkit.*
 import android.widget.EditText
@@ -162,13 +172,18 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import com.google.zxing.integration.android.IntentIntegrator
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.*
 
 @Suppress("DEPRECATION")
 class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
+    private var cameraPhotoPath: String? = null
     private val FILE_CHOOSER_REQUEST_CODE = 1001
     private val PREFS_NAME = "LogisticaPrefs"
     private val PREF_SERVER_URL = "server_url"
@@ -192,7 +207,6 @@ class MainActivity : AppCompatActivity() {
         settings.allowUniversalAccessFromFileURLs = true
 
         webView.webChromeClient = object : WebChromeClient() {
-            // CORRIGE TELA ESCURA AO ABRIR CÂMERA NO WEBVIEW
             override fun onPermissionRequest(request: PermissionRequest?) {
                 runOnUiThread {
                     request?.grant(request.resources)
@@ -207,15 +221,46 @@ class MainActivity : AppCompatActivity() {
                 this@MainActivity.filePathCallback?.onReceiveValue(null)
                 this@MainActivity.filePathCallback = filePathCallback
 
-                val takePictureIntent = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
+                var takePictureIntent: Intent? = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
+                if (takePictureIntent?.resolveActivity(packageManager) != null) {
+                    var photoFile: File? = null
+                    try {
+                        val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+                        val imageFileName = "JPEG_${timeStamp}_"
+                        val storageDir = getExternalFilesDir(Environment.DIRECTORY_PICTURES)
+                        photoFile = File.createTempFile(imageFileName, ".jpg", storageDir)
+                        cameraPhotoPath = "file:" + photoFile.absolutePath
+                    } catch (ex: Exception) {
+                        cameraPhotoPath = null
+                    }
+
+                    if (photoFile != null) {
+                        val photoURI = FileProvider.getUriForFile(
+                            this@MainActivity,
+                            "br.com.casadocampo.logistica.fileprovider",
+                            photoFile
+                        )
+                        takePictureIntent.putExtra(MediaStore.EXTRA_OUTPUT, photoURI)
+                    } else {
+                        takePictureIntent = null
+                    }
+                }
+
+                val contentSelectionIntent = Intent(Intent.ACTION_GET_CONTENT)
+                contentSelectionIntent.addCategory(Intent.CATEGORY_OPENABLE)
+                contentSelectionIntent.type = "image/*"
+
+                val intentArray: Array<Intent?> = takePictureIntent?.let { arrayOf(it) } ?: arrayOfNulls(0)
+
                 val chooserIntent = Intent(Intent.ACTION_CHOOSER)
-                chooserIntent.putExtra(Intent.EXTRA_INTENT, takePictureIntent)
-                chooserIntent.putExtra(Intent.EXTRA_TITLE, "Tirar Foto do Canhoto ou Selecionar Comprovante")
+                chooserIntent.putExtra(Intent.EXTRA_INTENT, contentSelectionIntent)
+                chooserIntent.putExtra(Intent.EXTRA_TITLE, "Tirar Foto ou Selecionar Comprovante")
+                chooserIntent.putExtra(Intent.EXTRA_INITIAL_INTENTS, intentArray)
 
                 try {
                     startActivityForResult(chooserIntent, FILE_CHOOSER_REQUEST_CODE)
                 } catch (e: Exception) {
-                    Toast.makeText(this@MainActivity, "Erro ao abrir câmera: " + e.message, Toast.LENGTH_SHORT).show()
+                    this@MainActivity.filePathCallback = null
                     return false
                 }
                 return true
@@ -302,7 +347,9 @@ class MainActivity : AppCompatActivity() {
             Manifest.permission.CAMERA,
             Manifest.permission.INTERNET,
             Manifest.permission.ACCESS_NETWORK_STATE,
-            Manifest.permission.RECORD_AUDIO
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.READ_EXTERNAL_STORAGE,
+            Manifest.permission.WRITE_EXTERNAL_STORAGE
         )
         val needed = permissions.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
@@ -335,8 +382,15 @@ class MainActivity : AppCompatActivity() {
             if (filePathCallback == null) return
             var results: Array<Uri>? = null
             if (resultCode == RESULT_OK) {
-                data?.data?.let {
-                    results = arrayOf(it)
+                if (data == null || data.data == null) {
+                    if (cameraPhotoPath != null) {
+                        results = arrayOf(Uri.parse(cameraPhotoPath))
+                    }
+                } else {
+                    val dataString = data.dataString
+                    if (dataString != null) {
+                        results = arrayOf(Uri.parse(dataString))
+                    }
                 }
             }
             filePathCallback?.onReceiveValue(results)
@@ -370,6 +424,11 @@ class MainActivity : AppCompatActivity() {
     src_dir = app_dir / "src" / "main"
     res_drawable_dir = src_dir / "res" / "drawable"
     res_drawable_dir.mkdir(parents=True, exist_ok=True)
+
+    res_xml_dir = src_dir / "res" / "xml"
+    res_xml_dir.mkdir(parents=True, exist_ok=True)
+    with open(res_xml_dir / "file_paths.xml", "w", encoding="utf-8") as f:
+        f.write('<?xml version="1.0" encoding="utf-8"?>\n<paths xmlns:android="http://schemas.android.com/apk/res/android">\n    <external-files-path name="my_images" path="Pictures" />\n</paths>\n')
 
     # Copia logo.png para res/drawable/logo.png
     src_logo = root / "static" / "logo.png"

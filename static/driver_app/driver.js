@@ -654,7 +654,13 @@ const DriverApp = {
         document.getElementById('inputNotes').value = '';
         document.getElementById('inputProblemNotes').value = '';
         document.getElementById('cameraInput').value = '';
-        document.getElementById('photoPreview').style.display = 'none';
+        
+        const previewEl = document.getElementById('photoPreview');
+        if (previewEl) previewEl.style.display = 'none';
+        
+        const statusEl = document.getElementById('photoStatusText');
+        if (statusEl) statusEl.style.display = 'none';
+        
         document.getElementById('problemSection').style.display = 'none';
         this.compressedPhotoBase64 = '';
         this.clearSignature();
@@ -668,7 +674,7 @@ const DriverApp = {
     },
 
     previewPhoto: function(event) {
-        const file = event.target.files[0];
+        const file = event.target && event.target.files && event.target.files[0];
         if (!file) return;
 
         const reader = new FileReader();
@@ -696,10 +702,24 @@ const DriverApp = {
                 this.compressedPhotoBase64 = canvas.toDataURL('image/jpeg', 0.75);
 
                 const previewEl = document.getElementById('photoPreview');
-                previewEl.src = this.compressedPhotoBase64;
-                previewEl.style.display = 'block';
+                if (previewEl) {
+                    previewEl.src = this.compressedPhotoBase64;
+                    previewEl.style.display = 'block';
+                }
+
+                const statusEl = document.getElementById('photoStatusText');
+                if (statusEl) {
+                    statusEl.innerText = `✅ Foto capturada (${file.name || 'comprovante.jpg'})!`;
+                    statusEl.style.display = 'block';
+                }
+            };
+            img.onerror = () => {
+                alert('Erro ao processar a imagem da foto. Tente novamente.');
             };
             img.src = e.target.result;
+        };
+        reader.onerror = () => {
+            alert('Erro ao carregar o arquivo da câmera.');
         };
         reader.readAsDataURL(file);
     },
