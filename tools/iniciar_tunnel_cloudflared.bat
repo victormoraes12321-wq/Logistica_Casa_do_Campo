@@ -24,6 +24,6 @@ echo Envie esse link para os motoristas acessarem no celular!
 echo ----------------------------------------------------------------------
 echo.
 
-cloudflared.exe tunnel --url http://127.0.0.1:3000
+cloudflared.exe tunnel --url http://127.0.0.1:3000 --protocol http2 --edge-ip-version 4
 
 pause
