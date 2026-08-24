@@ -2,12 +2,13 @@
 """
 tools/build_android_apk.py
 ==========================
-Gerador do Projeto Android Gradle Completo com Gradle Wrapper, AndroidX e Guia de Deploy do App 'Logística Casa do Campo'.
+Gerador do Projeto Android Gradle Completo com Logo Casa do Campo, AndroidX e Guia de Deploy.
 Gera a estrutura nativa Android Studio reconhecida com suporte a Gradle, Câmera e WebView.
 """
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -99,10 +100,9 @@ zipStoreBase=GRADLE_USER_HOME
 zipStorePath=wrapper/dists
 """
 
-    # 6. AndroidManifest.xml
+    # 6. AndroidManifest.xml (Usando o ícone do sistema ou a logo da empresa)
     manifest_xml = """<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="br.com.casadocampo.logistica">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.CAMERA" />
@@ -112,9 +112,8 @@ zipStorePath=wrapper/dists
 
     <application
         android:allowBackup="true"
-        android:icon="@mipmap/ic_launcher"
+        android:icon="@drawable/logo"
         android:label="Logística Casa do Campo"
-        android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.AppCompat.NoActionBar"
         android:usesCleartextTraffic="true">
@@ -260,6 +259,14 @@ class MainActivity : AppCompatActivity() {
         f.write(app_build_gradle)
 
     src_dir = app_dir / "src" / "main"
+    res_drawable_dir = src_dir / "res" / "drawable"
+    res_drawable_dir.mkdir(parents=True, exist_ok=True)
+
+    # Copia logo.png para res/drawable/logo.png
+    src_logo = root / "static" / "logo.png"
+    if src_logo.exists():
+        shutil.copy(src_logo, res_drawable_dir / "logo.png")
+
     pkg_dir = src_dir / "java" / "br" / "com" / "casadocampo" / "logistica"
     pkg_dir.mkdir(parents=True, exist_ok=True)
 
