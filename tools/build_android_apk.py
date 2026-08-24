@@ -3,7 +3,7 @@
 tools/build_android_apk.py
 ==========================
 Gerador do Projeto Android Gradle Completo com Logo Casa do Campo, AndroidX e Guia de Deploy.
-Gera a estrutura nativa Android Studio reconhecida com suporte a Gradle, Câmera e WebView.
+Gera a estrutura nativa Android Studio reconhecida com suporte a Gradle, Câmera e WebView sem avisos de depreciação.
 """
 from __future__ import annotations
 
@@ -100,7 +100,7 @@ zipStoreBase=GRADLE_USER_HOME
 zipStorePath=wrapper/dists
 """
 
-    # 6. AndroidManifest.xml (Usando o ícone do sistema ou a logo da empresa)
+    # 6. AndroidManifest.xml
     manifest_xml = """<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
@@ -132,7 +132,7 @@ zipStorePath=wrapper/dists
 </manifest>
 """
 
-    # 7. MainActivity.kt (Kotlin com Câmera e WebChromeClient FileChooser)
+    # 7. MainActivity.kt (Kotlin com Câmera e WebChromeClient FileChooser e Suppress Deprecation)
     main_activity_kt = """package br.com.casadocampo.logistica
 
 import android.Manifest
@@ -148,6 +148,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 
+@Suppress("DEPRECATION")
 class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
