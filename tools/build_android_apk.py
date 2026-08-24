@@ -2,7 +2,7 @@
 """
 tools/build_android_apk.py
 ==========================
-Gerador do Projeto Android Gradle Completo com Gradle Wrapper e Guia de Deploy do App 'Logística Casa do Campo'.
+Gerador do Projeto Android Gradle Completo com Gradle Wrapper, AndroidX e Guia de Deploy do App 'Logística Casa do Campo'.
 Gera a estrutura nativa Android Studio reconhecida com suporte a Gradle, Câmera e WebView.
 """
 from __future__ import annotations
@@ -45,7 +45,13 @@ include ':app'
 }
 """
 
-    # 3. app/build.gradle
+    # 3. gradle.properties (Habilita AndroidX e Jetifier)
+    gradle_properties = """android.useAndroidX=true
+android.enableJetifier=true
+org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+"""
+
+    # 4. app/build.gradle
     app_build_gradle = """plugins {
     id 'com.android.application'
     id 'org.jetbrains.kotlin.android'
@@ -85,7 +91,7 @@ dependencies {
 }
 """
 
-    # 4. gradle-wrapper.properties
+    # 5. gradle-wrapper.properties
     gradle_wrapper_properties = """distributionBase=GRADLE_USER_HOME
 distributionPath=wrapper/dists
 distributionUrl=https\\://services.gradle.org/distributions/gradle-8.0-bin.zip
@@ -93,7 +99,7 @@ zipStoreBase=GRADLE_USER_HOME
 zipStorePath=wrapper/dists
 """
 
-    # 5. AndroidManifest.xml
+    # 6. AndroidManifest.xml
     manifest_xml = """<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="br.com.casadocampo.logistica">
@@ -127,7 +133,7 @@ zipStorePath=wrapper/dists
 </manifest>
 """
 
-    # 6. MainActivity.kt (Kotlin com Câmera e WebChromeClient FileChooser)
+    # 7. MainActivity.kt (Kotlin com Câmera e WebChromeClient FileChooser)
     main_activity_kt = """package br.com.casadocampo.logistica
 
 import android.Manifest
@@ -238,6 +244,9 @@ class MainActivity : AppCompatActivity() {
 
     with open(out / "build.gradle", "w", encoding="utf-8") as f:
         f.write(root_build_gradle)
+
+    with open(out / "gradle.properties", "w", encoding="utf-8") as f:
+        f.write(gradle_properties)
 
     wrapper_dir = out / "gradle" / "wrapper"
     wrapper_dir.mkdir(parents=True, exist_ok=True)
