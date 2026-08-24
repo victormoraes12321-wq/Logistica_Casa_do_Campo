@@ -1,6 +1,6 @@
 /**
  * driver.js — Lógica do Aplicativo Android do Motorista 'Logística Casa do Campo'
- * Câmera, Assinatura Digital Touch, Configuração de Servidor Dinâmico, Sol Forte & Totalizadores
+ * Câmera, Assinatura Digital Touch, Configuração de Servidor Dinâmico, Sol Forte & Totalizadores de Peso
  */
 
 const DriverApp = {
@@ -330,19 +330,17 @@ const DriverApp = {
             const orders = data.route.orders || [];
             const totalOrders = orders.length;
             const deliveredOrders = orders.filter(o => o.order_status === 'Acertado' || o.route_order_status === 'Entregue').length;
+            const pendingCount = totalOrders - deliveredOrders;
             const pct = totalOrders > 0 ? Math.round((deliveredOrders / totalOrders) * 100) : 0;
 
-            // Calcula totalizadores
-            let totalVal = 0;
             let remainingW = 0;
             orders.forEach(o => {
-                totalVal += (o.total_value || 0);
                 if (o.order_status !== 'Acertado' && o.route_order_status !== 'Entregue') {
                     remainingW += (o.weight_kg || 0);
                 }
             });
 
-            document.getElementById('statTotalValue').innerText = `R$ ${totalVal.toFixed(2)}`;
+            document.getElementById('statPendingOrders').innerText = `${pendingCount} pedido(s)`;
             document.getElementById('statRemainingWeight').innerText = `${remainingW.toFixed(1)} kg`;
 
             document.getElementById('routeProgressText').innerText = `${deliveredOrders}/${totalOrders} (${pct}%)`;
@@ -461,8 +459,7 @@ const DriverApp = {
                     <div class="order-info-line">🏡 Fazenda/Local: ${o.farm_name || 'N/A'} ${o.reference_point ? '(' + o.reference_point + ')' : ''}</div>
                     
                     <div style="font-size:0.85rem; color:var(--text-dark); margin-top:8px; display:flex; justify-content:space-between; background:#f8fafc; padding:8px 12px; border-radius:8px;">
-                        <span>Valor: <strong>R$ ${(o.total_value || 0).toFixed(2)}</strong></span>
-                        <span>Peso: <strong>${(o.weight_kg || 0).toFixed(1)} kg</strong></span>
+                        <span>Peso Carga: <strong>${(o.weight_kg || 0).toFixed(1)} kg</strong></span>
                     </div>
 
                     <div style="display:flex; flex-wrap:wrap; gap:6px; margin-top:10px;">
@@ -597,7 +594,7 @@ const DriverApp = {
             route_id: this.currentRoute ? this.currentRoute.id : null,
             delivered_to: document.getElementById('inputRecebedor').value,
             delivered_document: document.getElementById('inputDoc').value,
-            payment_method: document.getElementById('selectPayment').value,
+            payment_method: '',
             final_notes: isProblem ? problemNotes : generalNotes,
             receipt_photo: this.compressedPhotoBase64,
             digital_signature: this.signatureBase64,
