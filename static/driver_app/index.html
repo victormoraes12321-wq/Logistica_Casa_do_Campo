@@ -7,6 +7,7 @@
     <link rel="manifest" href="/static/driver_app/manifest.json">
     <meta name="theme-color" content="#1b4d3e">
     <link rel="icon" type="image/png" href="/static/logo.png">
+    <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
     <style>
         :root {
             --primary: #1b4d3e;
@@ -456,6 +457,14 @@
             color: var(--text-muted);
             text-transform: uppercase;
         }
+
+        #qrReaderContainer {
+            width: 100%;
+            border-radius: 12px;
+            overflow: hidden;
+            background: #000;
+            margin-top: 10px;
+        }
     </style>
 </head>
 <body>
@@ -471,7 +480,8 @@
             </div>
             <div class="header-tools">
                 <button class="icon-btn" onclick="DriverApp.toggleHighContrast()" title="Sol Forte / Noturno">☀️</button>
-                <button class="icon-btn" onclick="DriverApp.openServerConfigModal()" title="Servidor">⚙️</button>
+                <button class="icon-btn" onclick="DriverApp.openProfileModal()" title="Perfil e Configurações">⚙️</button>
+                <button class="icon-btn" id="btnLogoutHeader" style="display:none;" onclick="DriverApp.logout()" title="Sair da Conta">🚪 Sair</button>
                 <div class="net-status" id="netStatus">
                     <span>🟢</span> <span>Online</span>
                 </div>
@@ -500,8 +510,12 @@
                 </select>
             </div>
 
-            <button class="btn btn-outline" style="margin-bottom: 16px; font-size: 0.86rem; padding: 10px;" onclick="DriverApp.openRegisterDriverModal()">
+            <button class="btn btn-outline" style="margin-bottom: 12px; font-size: 0.86rem; padding: 10px;" onclick="DriverApp.openRegisterDriverModal()">
                 ➕ Não encontrou seu nome? Cadastrar Novo Motorista
+            </button>
+
+            <button class="btn btn-outline" style="margin-bottom: 16px; font-size: 0.88rem; padding: 10px; color: var(--primary); border-color: var(--primary);" onclick="DriverApp.openQrScannerForServer()">
+                📷 Escanear QR Code de Conexão na Tela do Computador
             </button>
 
             <div class="form-group">
@@ -522,14 +536,22 @@
                         <div style="font-size: 0.8rem; opacity: 0.85; text-transform: uppercase;">Bem-vindo(a),</div>
                         <h3 id="loggedDriverName" style="font-size: 1.2rem; font-weight: 800;">Motorista</h3>
                     </div>
-                    <button class="btn btn-outline btn-sm" style="background: rgba(255,255,255,0.2); color: white; border: none;" onclick="DriverApp.loadRoutes()">
-                        🔄 Atualizar
-                    </button>
+                    <div style="display:flex; gap:6px;">
+                        <button class="btn btn-outline btn-sm" style="background: rgba(255,255,255,0.2); color: white; border: none;" onclick="DriverApp.loadRoutes()">
+                            🔄 Atualizar
+                        </button>
+                        <button class="btn btn-outline btn-sm" style="background: rgba(239,68,68,0.3); color: white; border: none;" onclick="DriverApp.logout()">
+                            🚪 Sair
+                        </button>
+                    </div>
                 </div>
             </div>
 
-            <div style="margin-bottom: 10px; font-weight: 700; color: var(--primary); font-size: 0.95rem;">
-                Cargas Ativas para Entrega:
+            <div style="margin-bottom: 10px; font-weight: 700; color: var(--primary); font-size: 0.95rem; display:flex; justify-content:space-between; align-items:center;">
+                <span>Cargas Ativas para Entrega:</span>
+                <button class="btn btn-outline btn-sm" style="font-size:0.78rem; padding:4px 8px;" onclick="DriverApp.loadAllCompanyRoutes()">
+                    🌐 Ver Todas da Empresa
+                </button>
             </div>
 
             <div id="routesList"></div>
@@ -572,8 +594,11 @@
                 </div>
             </div>
 
-            <div class="form-group" style="margin-bottom: 12px;">
+            <div class="form-group" style="margin-bottom: 12px; display:flex; gap:8px;">
                 <input type="text" id="orderSearchInput" class="form-control" placeholder="🔍 Buscar cliente, fazenda ou nº do pedido..." onkeyup="DriverApp.filterOrders()">
+                <button class="btn btn-outline btn-sm" style="white-space:nowrap; padding:0 12px;" onclick="DriverApp.openQrScannerForOrder()">
+                    📷 QR Code
+                </button>
             </div>
 
             <div style="margin-bottom: 10px; font-weight: 700; color: var(--primary); font-size: 0.95rem;">
@@ -584,22 +609,58 @@
         </div>
     </div>
 
-    <!-- MODAL DE CONFIGURAÇÃO DE URL DO SERVIDOR -->
-    <div id="modalServerConfig" class="modal">
+    <!-- MODAL DE LEITOR DE QR CODE DA CÂMERA -->
+    <div id="modalQrScanner" class="modal">
         <div class="modal-content">
             <div class="card-header">
-                <div class="card-title">⚙️ Servidor da Empresa</div>
-                <button style="background:none; border:none; font-size:1.2rem; cursor:pointer;" onclick="DriverApp.closeServerConfigModal()">✕</button>
+                <div class="card-title" id="qrScannerTitle">📷 Leitor de QR Code</div>
+                <button style="background:none; border:none; font-size:1.2rem; cursor:pointer;" onclick="DriverApp.closeQrScannerModal()">✕</button>
             </div>
-            <div class="form-group">
-                <label for="inputServerUrl">URL / Endereço do Servidor:</label>
-                <input type="text" id="inputServerUrl" class="form-control" placeholder="Ex: https://meuservidor.trycloudflare.com">
-                <small style="color:var(--text-muted); font-size:0.78rem; display:block; margin-top:4px;">
-                    Deixe em branco para usar a conexão automática atual.
-                </small>
+            <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 10px;">
+                Aponte a câmera do celular para o QR Code (na tela do computador ou no comprovante do pedido).
+            </p>
+            <div id="qrReaderContainer"></div>
+            <button class="btn btn-secondary" style="margin-top: 14px;" onclick="DriverApp.closeQrScannerModal()">Cancelar</button>
+        </div>
+    </div>
+
+    <!-- MODAL DE PERFIL & CONFIGURAÇÕES COMPLETA -->
+    <div id="modalProfile" class="modal">
+        <div class="modal-content">
+            <div class="card-header">
+                <div class="card-title">⚙️ Perfil & Configurações</div>
+                <button style="background:none; border:none; font-size:1.2rem; cursor:pointer;" onclick="DriverApp.closeProfileModal()">✕</button>
             </div>
-            <button class="btn btn-primary" onclick="DriverApp.saveServerConfig()">💾 Salvar Endereço</button>
-            <button class="btn btn-secondary" style="margin-top: 8px;" onclick="DriverApp.closeServerConfigModal()">Cancelar</button>
+            
+            <div class="card" style="box-shadow:none; border:1px solid #e2e8f0; padding:12px; margin-bottom:14px;">
+                <h4 style="color:var(--primary); font-weight:700; margin-bottom:4px;" id="profDriverName">Motorista</h4>
+                <div style="font-size:0.84rem; color:var(--text-muted);" id="profDriverDetails">Logística Casa do Campo</div>
+            </div>
+
+            <!-- FORMULÁRIO DE TROCA DE SENHA / PIN -->
+            <div style="border-top: 1px solid #e2e8f0; padding-top: 12px; margin-bottom: 14px;">
+                <h4 style="color:var(--primary); font-size:0.95rem; font-weight:700; margin-bottom:10px;">🔑 Alterar Senha / PIN do Motorista:</h4>
+                <div class="form-group">
+                    <label for="inputNewPin">Nova Senha / PIN:</label>
+                    <input type="password" id="inputNewPin" class="form-control" placeholder="Digite a nova senha">
+                </div>
+                <button class="btn btn-primary" onclick="DriverApp.submitChangePassword()">💾 Salvar Nova Senha</button>
+            </div>
+
+            <!-- CONFIGURAÇÃO DE SERVIDOR -->
+            <div style="border-top: 1px solid #e2e8f0; padding-top: 12px; margin-bottom: 14px;">
+                <h4 style="color:var(--primary); font-size:0.95rem; font-weight:700; margin-bottom:6px;">🌐 Endereço do Servidor:</h4>
+                <div class="form-group">
+                    <input type="text" id="inputServerUrl" class="form-control" placeholder="https://meuservidor.trycloudflare.com">
+                </div>
+                <div style="display:flex; gap:6px;">
+                    <button class="btn btn-outline btn-sm" style="flex:1;" onclick="DriverApp.openQrScannerForServer()">📷 Escanear QR Code</button>
+                    <button class="btn btn-primary btn-sm" style="flex:1;" onclick="DriverApp.saveServerConfig()">💾 Salvar</button>
+                </div>
+            </div>
+
+            <button class="btn btn-danger" style="margin-top: 10px;" onclick="DriverApp.logout()">🚪 Sair da Conta (Deslogar)</button>
+            <button class="btn btn-secondary" style="margin-top: 8px;" onclick="DriverApp.closeProfileModal()">Fechar</button>
         </div>
     </div>
 

@@ -1,6 +1,6 @@
 /**
  * driver.js — Lógica do Aplicativo Android do Motorista 'Logística Casa do Campo'
- * Câmera, Assinatura Digital Touch, Configuração de Servidor Dinâmico, Sol Forte & Totalizadores de Peso
+ * Câmera, Assinatura Digital Touch, QR Code Server & Order Scanner, Perfil, Troca de Senha & Logout
  */
 
 const DriverApp = {
@@ -11,6 +11,7 @@ const DriverApp = {
     signatureBase64: '',
     isDrawing: false,
     signatureCtx: null,
+    html5QrScanner: null,
 
     init: function() {
         this.bindNetworkEvents();
@@ -21,8 +22,7 @@ const DriverApp = {
         if (savedUser) {
             try {
                 this.currentDriver = JSON.parse(savedUser);
-                const loggedEl = document.getElementById('loggedDriverName');
-                if (loggedEl) loggedEl.innerText = this.currentDriver.name;
+                this.updateUserUI();
                 this.showScreen('screenRoutes');
                 this.loadRoutes();
             } catch(e) {
@@ -31,33 +31,166 @@ const DriverApp = {
         }
     },
 
+    updateUserUI: function() {
+        if (!this.currentDriver) return;
+        const loggedEl = document.getElementById('loggedDriverName');
+        const profNameEl = document.getElementById('profDriverName');
+        const profDetailsEl = document.getElementById('profDriverDetails');
+        const btnLogoutHeader = document.getElementById('btnLogoutHeader');
+
+        if (loggedEl) loggedEl.innerText = this.currentDriver.name;
+        if (profNameEl) profNameEl.innerText = this.currentDriver.name;
+        if (profDetailsEl) profDetailsEl.innerText = `Motorista Ativo • Logística Casa do Campo`;
+        if (btnLogoutHeader) btnLogoutHeader.style.display = 'inline-flex';
+    },
+
+    logout: function() {
+        if (!confirm('Deseja realmente sair da sua conta de motorista?')) return;
+        localStorage.removeItem('driver_user');
+        this.currentDriver = null;
+        this.currentRoute = null;
+
+        const btnLogoutHeader = document.getElementById('btnLogoutHeader');
+        if (btnLogoutHeader) btnLogoutHeader.style.display = 'none';
+
+        this.closeProfileModal();
+        this.showScreen('screenLogin');
+        this.loadDriverList();
+    },
+
     getServerUrl: function() {
         return localStorage.getItem('custom_server_url') || '';
     },
 
-    openServerConfigModal: function() {
-        document.getElementById('inputServerUrl').value = this.getServerUrl();
-        document.getElementById('modalServerConfig').style.display = 'block';
-    },
-
-    closeServerConfigModal: function() {
-        document.getElementById('modalServerConfig').style.display = 'none';
-    },
-
-    saveServerConfig: function() {
-        let url = document.getElementById('inputServerUrl').value.trim();
-        if (url && !url.startsWith('http://') && !url.startsWith('https://')) {
-            url = 'https://' + url;
+    saveServerUrlValue: function(url) {
+        let cleanUrl = url.trim();
+        if (cleanUrl && !cleanUrl.startsWith('http://') && !cleanUrl.startsWith('https://')) {
+            cleanUrl = 'https://' + cleanUrl;
         }
-        if (url) {
-            localStorage.setItem('custom_server_url', url);
-            alert('⚙️ Endereço do Servidor salvo com sucesso!');
+        if (cleanUrl) {
+            localStorage.setItem('custom_server_url', cleanUrl);
+            alert('⚙️ Conexão do Servidor atualizada com sucesso!\nURL: ' + cleanUrl);
         } else {
             localStorage.removeItem('custom_server_url');
             alert('⚙️ Usando conexão automática padrão.');
         }
-        this.closeServerConfigModal();
         this.loadDriverList();
+        if (this.currentDriver) this.loadRoutes();
+    },
+
+    openProfileModal: function() {
+        if (this.currentDriver) this.updateUserUI();
+        document.getElementById('inputServerUrl').value = this.getServerUrl();
+        document.getElementById('inputNewPin').value = '';
+        document.getElementById('modalProfile').style.display = 'block';
+    },
+
+    closeProfileModal: function() {
+        document.getElementById('modalProfile').style.display = 'none';
+    },
+
+    submitChangePassword: async function() {
+        if (!this.currentDriver) {
+            alert('Você precisa estar logado para alterar a senha.');
+            return;
+        }
+        const newPin = document.getElementById('inputNewPin').value.trim();
+        if (!newPin) {
+            alert('Por favor, informe a nova senha ou PIN.');
+            return;
+        }
+
+        try {
+            const baseUrl = this.getServerUrl();
+            const res = await fetch(`${baseUrl}/api/v1/driver/change_password`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    driver_name: this.currentDriver.name,
+                    new_pin: newPin
+                })
+            });
+            const data = await res.json();
+            if (!data.ok) {
+                alert('Erro ao alterar senha: ' + data.message);
+                return;
+            }
+            alert('🔑 ' + data.message);
+            document.getElementById('inputNewPin').value = '';
+        } catch(e) {
+            alert('Erro de conexão ao alterar senha: ' + e);
+        }
+    },
+
+    saveServerConfig: function() {
+        const url = document.getElementById('inputServerUrl').value;
+        this.saveServerUrlValue(url);
+        this.closeProfileModal();
+    },
+
+    /* ---- 📷 LEITOR DE QR CODE ---- */
+    openQrScannerForServer: function() {
+        this.startQrScanner('Escanear QR Code de Conexão do Servidor', (decodedText) => {
+            console.log('QR Code Servidor lido:', decodedText);
+            this.saveServerUrlValue(decodedText);
+            this.closeQrScannerModal();
+        });
+    },
+
+    openQrScannerForOrder: function() {
+        this.startQrScanner('Escanear QR Code do Pedido / Endereço', (decodedText) => {
+            console.log('QR Code Pedido lido:', decodedText);
+            const searchInput = document.getElementById('orderSearchInput');
+            if (searchInput) {
+                searchInput.value = decodedText;
+                this.filterOrders();
+            }
+            this.closeQrScannerModal();
+        });
+    },
+
+    startQrScanner: function(title, onSuccessCallback) {
+        document.getElementById('qrScannerTitle').innerText = `📷 ${title}`;
+        document.getElementById('modalQrScanner').style.display = 'block';
+
+        if (this.html5QrScanner) {
+            try { this.html5QrScanner.clear(); } catch(e) {}
+        }
+
+        this.html5QrScanner = new Html5Qrcode("qrReaderContainer");
+        const config = { fps: 10, qrbox: { width: 220, height: 220 } };
+
+        this.html5QrScanner.start(
+            { facingMode: "environment" },
+            config,
+            (decodedText) => {
+                try {
+                    this.html5QrScanner.stop().then(() => {
+                        onSuccessCallback(decodedText);
+                    }).catch(() => {
+                        onSuccessCallback(decodedText);
+                    });
+                } catch(e) {
+                    onSuccessCallback(decodedText);
+                }
+            },
+            () => {}
+        ).catch(err => {
+            alert('Não foi possível iniciar a câmera para o QR Code: ' + err);
+            this.closeQrScannerModal();
+        });
+    },
+
+    closeQrScannerModal: function() {
+        if (this.html5QrScanner) {
+            try {
+                this.html5QrScanner.stop().then(() => {
+                    this.html5QrScanner.clear();
+                    this.html5QrScanner = null;
+                }).catch(() => { this.html5QrScanner = null; });
+            } catch(e) { this.html5QrScanner = null; }
+        }
+        document.getElementById('modalQrScanner').style.display = 'none';
     },
 
     toggleHighContrast: function() {
@@ -237,18 +370,20 @@ const DriverApp = {
         this.currentDriver = { name: name, pin: pin };
         localStorage.setItem('driver_user', JSON.stringify(this.currentDriver));
         
-        const loggedEl = document.getElementById('loggedDriverName');
-        if (loggedEl) loggedEl.innerText = this.currentDriver.name;
-
+        this.updateUserUI();
         this.showScreen('screenRoutes');
         this.loadRoutes();
     },
 
-    loadRoutes: async function() {
+    loadAllCompanyRoutes: function() {
+        this.loadRoutes(true);
+    },
+
+    loadRoutes: async function(showAll) {
         const listEl = document.getElementById('routesList');
         listEl.innerHTML = '<div style="text-align:center; padding:30px; color:var(--text-muted);">Buscando cargas ativas...</div>';
         try {
-            const driverName = this.currentDriver ? this.currentDriver.name : '';
+            const driverName = (showAll || !this.currentDriver) ? '' : this.currentDriver.name;
             const baseUrl = this.getServerUrl();
             const res = await fetch(`${baseUrl}/api/v1/driver/routes?driver_name=${encodeURIComponent(driverName)}`);
             const data = await res.json();
@@ -258,7 +393,8 @@ const DriverApp = {
                     <div class="card" style="text-align:center; padding:30px;">
                         <div style="font-size:2.5rem; margin-bottom:10px;">🚚</div>
                         <h4 style="color:var(--primary); font-weight:700;">Nenhuma carga pendente</h4>
-                        <p style="font-size:0.85rem; color:var(--text-muted); margin-top:4px;">Não há cargas ativas designadas para você no momento.</p>
+                        <p style="font-size:0.85rem; color:var(--text-muted); margin-top:4px;">Não há cargas ativas designadas no momento.</p>
+                        <button class="btn btn-outline btn-sm" style="margin-top:12px;" onclick="DriverApp.loadAllCompanyRoutes()">🌐 Ver Todas da Empresa</button>
                     </div>
                 `;
                 return;

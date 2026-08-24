@@ -212,27 +212,67 @@ def handle_driver_api_request(handler, path: str, method: str) -> bool:
             logger.error("Erro no cadastro de motorista pelo app: %s", exc)
             return handler.send_json({"ok": False, "message": str(exc)}, 500)
 
+    # ---- 1B. Alteração de Senha / PIN do Motorista ----
+    if path == "/api/v1/driver/change_password" and method == "POST":
+        try:
+            data = handler.json_data() or {}
+            driver_name = str(data.get("driver_name") or "").strip()
+            new_pin = str(data.get("new_pin") or "").strip()
+
+            if not driver_name:
+                return handler.send_json({"ok": False, "message": "Informe o nome do motorista."}, 400)
+
+            if not new_pin:
+                return handler.send_json({"ok": False, "message": "Informe a nova senha / PIN."}, 400)
+
+            now_ts = _now_str()
+            with handler.conn() as db:
+                try:
+                    db.execute("ALTER TABLE drivers ADD COLUMN pin TEXT DEFAULT ''")
+                except Exception:
+                    pass
+
+                driver = db.execute("SELECT id FROM drivers WHERE LOWER(name)=LOWER(?) AND active=1", (driver_name,)).fetchone()
+                if not driver:
+                    return handler.send_json({"ok": False, "message": f"Motorista '{driver_name}' não encontrado."}, 404)
+
+                db.execute("UPDATE drivers SET pin=?, updated_at=?, version=COALESCE(version,1)+1 WHERE id=?", (new_pin, now_ts, driver["id"]))
+                db.commit()
+
+                return handler.send_json({"ok": True, "message": "🔑 Senha / PIN alterado com sucesso no banco de dados!"})
+        except Exception as exc:
+            logger.error("Erro ao alterar senha do motorista: %s", exc)
+            return handler.send_json({"ok": False, "message": str(exc)}, 500)
+
     # ---- 2. Lista de Rotas Ativas do Motorista ----
     if path == "/api/v1/driver/routes" and method == "GET":
         try:
             driver_name = handler.qs_get("driver_name") or handler.qs_get("driver") or ""
             with handler.conn() as db:
-                query = """
+                base_query = """
                     SELECT r.*, d.name as driver_name, v.name as vehicle_name, v.plate,
-                           COUNT(ro.id) as total_orders
+                           COUNT(ro.id) as total_orders,
+                           SUM(CASE WHEN ro.status = 'Entregue' OR o.status = 'Acertado' THEN 1 ELSE 0 END) as delivered_orders
                     FROM routes r
                     LEFT JOIN drivers d ON d.id = r.driver_id
                     LEFT JOIN vehicles v ON v.id = r.vehicle_id
                     LEFT JOIN route_orders ro ON ro.route_id = r.id
-                    WHERE r.status IN ('Em rota', 'Planejada')
+                    LEFT JOIN orders o ON o.id = ro.order_id
+                    WHERE r.status IN ('Em rota', 'Planejada', 'Aguardando', 'Criada')
                 """
                 params = []
                 if driver_name:
-                    query += " AND (LOWER(d.name) LIKE LOWER(?) OR LOWER(r.name) LIKE LOWER(?))"
+                    query = base_query + " AND (LOWER(d.name) LIKE LOWER(?) OR LOWER(r.name) LIKE LOWER(?)) GROUP BY r.id ORDER BY r.id DESC"
                     params.extend([f"%{driver_name}%", f"%{driver_name}%"])
-
-                query += " GROUP BY r.id ORDER BY r.id DESC"
-                routes = [dict(r) for r in db.execute(query, params).fetchall()]
+                    routes = [dict(r) for r in db.execute(query, params).fetchall()]
+                    
+                    # Se não encontrou cargas específicas pelo filtro, busca todas as cargas ativas para garantir sincronia
+                    if not routes:
+                        query_all = base_query + " GROUP BY r.id ORDER BY r.id DESC"
+                        routes = [dict(r) for r in db.execute(query_all).fetchall()]
+                else:
+                    query = base_query + " GROUP BY r.id ORDER BY r.id DESC"
+                    routes = [dict(r) for r in db.execute(query).fetchall()]
 
                 return handler.send_json({"ok": True, "routes": routes, "count": len(routes)})
         except Exception as exc:

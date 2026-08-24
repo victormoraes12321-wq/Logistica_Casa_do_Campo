@@ -166,5 +166,31 @@ class DriverApiTests(unittest.TestCase):
             self.assertEqual(r_row["status"], "Acertada")
 
 
+    def test_driver_change_password(self):
+        from app_core.domains.driver_api_dispatch import handle_driver_api_request
+
+        with app.conn() as db:
+            try:
+                db.execute("ALTER TABLE drivers ADD COLUMN pin TEXT DEFAULT ''")
+            except Exception:
+                pass
+            db.execute("INSERT OR REPLACE INTO drivers(id, name, pin, active) VALUES(77, 'Motorista Troca Senha', '1234', 1)")
+            db.commit()
+
+        handler = DummyHandler({
+            "driver_name": "Motorista Troca Senha",
+            "new_pin": "5678"
+        })
+        handled = handle_driver_api_request(handler, "/api/v1/driver/change_password", "POST")
+        self.assertTrue(handled)
+        self.assertTrue(handler.result_data.get("ok"))
+        self.assertIn("Senha / PIN alterado com sucesso", handler.result_data.get("message"))
+
+        with app.conn() as db:
+            d_row = db.execute("SELECT pin FROM drivers WHERE id=77").fetchone()
+            self.assertEqual(d_row["pin"], "5678")
+
+
 if __name__ == "__main__":
     unittest.main()
+
