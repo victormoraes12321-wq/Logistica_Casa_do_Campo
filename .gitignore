@@ -40,3 +40,4 @@ releases/
 .DS_Store
 Thumbs.db
 .gemini/
+tools/cloudflared.exe
