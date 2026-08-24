@@ -159,6 +159,59 @@ def handle_driver_api_request(handler, path: str, method: str) -> bool:
             logger.error("Erro no login do motorista: %s", exc)
             return handler.send_json({"ok": False, "message": f"Erro interno: {exc}"}, 500)
 
+    # ---- 1B. Listar Todos os Motoristas Cadastrados ----
+    if path == "/api/v1/driver/all_drivers" and method == "GET":
+        try:
+            with handler.conn() as db:
+                drivers = db.execute("SELECT id, name, phone, document, vehicle_default FROM drivers WHERE active=1 ORDER BY name ASC").fetchall()
+                drivers_list = [dict(d) for d in drivers]
+                return handler.send_json({"ok": True, "drivers": drivers_list, "count": len(drivers_list)})
+        except Exception as exc:
+            return handler.send_json({"ok": False, "message": str(exc)}, 500)
+
+    # ---- 1C. Cadastrar Novo Motorista pelo App ----
+    if path == "/api/v1/driver/register" and method == "POST":
+        try:
+            data = handler.json_data() or {}
+            name = str(data.get("name") or "").strip()
+            phone = str(data.get("phone") or "").strip()
+            document = str(data.get("document") or "").strip()
+            vehicle_default = str(data.get("vehicle_default") or "").strip()
+
+            if not name:
+                return handler.send_json({"ok": False, "message": "Informe o nome do motorista."}, 400)
+
+            now_ts = _now_str()
+            with handler.conn() as db:
+                # Verifica se motorista já existe por nome
+                existing = db.execute("SELECT id FROM drivers WHERE LOWER(name)=LOWER(?) AND active=1", (name,)).fetchone()
+                if existing:
+                    return handler.send_json({
+                        "ok": True,
+                        "driver_id": existing["id"],
+                        "name": name,
+                        "already_existed": True,
+                        "message": f"Motorista '{name}' já estava cadastrado."
+                    })
+
+                cursor = db.execute("""
+                    INSERT INTO drivers(name, phone, document, vehicle_default, active, updated_at, version)
+                    VALUES(?, ?, ?, ?, 1, ?, 1)
+                """, (name, phone, document, vehicle_default, now_ts))
+                new_id = cursor.lastrowid
+                db.commit()
+
+                return handler.send_json({
+                    "ok": True,
+                    "driver_id": new_id,
+                    "name": name,
+                    "already_existed": False,
+                    "message": f"Motorista '{name}' cadastrado com sucesso no banco de dados!"
+                })
+        except Exception as exc:
+            logger.error("Erro no cadastro de motorista pelo app: %s", exc)
+            return handler.send_json({"ok": False, "message": str(exc)}, 500)
+
     # ---- 2. Lista de Rotas Ativas do Motorista ----
     if path == "/api/v1/driver/routes" and method == "GET":
         try:

@@ -1,6 +1,6 @@
 /**
- * driver.js — Lógica do Aplicativo Android do Motorista
- * Câmera, Compressão de Fotos no Celular, Offline Store & Auto-Sync
+ * driver.js — Lógica do Aplicativo Android do Motorista 'Logística Casa do Campo'
+ * Câmera, Compressão de Fotos no Celular, Cadastro de Motoristas, Offline Store & Auto-Sync
  */
 
 const DriverApp = {
@@ -54,28 +54,78 @@ const DriverApp = {
     },
 
     loadDriverList: async function() {
+        const select = document.getElementById('driverSelect');
+        select.innerHTML = '<option value="">Buscando motoristas cadastrados...</option>';
+
         try {
-            const res = await fetch('/api/v1/driver/routes');
+            const res = await fetch('/api/v1/driver/all_drivers');
             const data = await res.json();
-            const select = document.getElementById('driverSelect');
-            select.innerHTML = '<option value="">-- Selecione seu nome --</option>';
             
-            if (data.routes && data.routes.length > 0) {
-                const drivers = new Set();
-                data.routes.forEach(r => {
-                    if (r.driver_name) drivers.add(r.driver_name);
+            select.innerHTML = '<option value="">-- Selecione seu nome --</option>';
+
+            if (data.ok && data.drivers && data.drivers.length > 0) {
+                data.drivers.forEach(d => {
+                    select.innerHTML += `<option value="${d.name}">${d.name} ${d.vehicle_default ? ' (' + d.vehicle_default + ')' : ''}</option>`;
                 });
-                drivers.forEach(d => {
-                    select.innerHTML += `<option value="${d}">${d}</option>`;
-                });
-            }
-            // Se não houver cargas ativas com nome, lista genérica
-            if (select.children.length <= 1) {
-                select.innerHTML += '<option value="GOD Admin">GOD Admin</option>';
+            } else {
                 select.innerHTML += '<option value="Motorista Padrao">Motorista Geral</option>';
             }
         } catch(e) {
-            console.warn('Erro ao carregar lista de motoristas:', e);
+            console.warn('Erro ao carregar lista de motoristas do banco:', e);
+            select.innerHTML = '<option value="">-- Erro ao carregar (Cadastre abaixo) --</option>';
+        }
+    },
+
+    openRegisterDriverModal: function() {
+        document.getElementById('regDriverName').value = '';
+        document.getElementById('regDriverPhone').value = '';
+        document.getElementById('regDriverDoc').value = '';
+        document.getElementById('regDriverVehicle').value = '';
+        document.getElementById('modalRegisterDriver').style.display = 'block';
+    },
+
+    closeRegisterDriverModal: function() {
+        document.getElementById('modalRegisterDriver').style.display = 'none';
+    },
+
+    submitRegisterDriver: async function() {
+        const name = document.getElementById('regDriverName').value.trim();
+        const phone = document.getElementById('regDriverPhone').value.trim();
+        const doc = document.getElementById('regDriverDoc').value.trim();
+        const vehicle = document.getElementById('regDriverVehicle').value.trim();
+
+        if (!name) {
+            alert('Por favor, informe seu nome completo.');
+            return;
+        }
+
+        try {
+            const res = await fetch('/api/v1/driver/register', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    name: name,
+                    phone: phone,
+                    document: doc,
+                    vehicle_default: vehicle
+                })
+            });
+            const data = await res.json();
+
+            if (!data.ok) {
+                alert('Erro ao cadastrar motorista: ' + data.message);
+                return;
+            }
+
+            alert('✅ ' + data.message);
+            this.closeRegisterDriverModal();
+
+            // Recarrega lista e auto-seleciona o novo motorista
+            await this.loadDriverList();
+            const select = document.getElementById('driverSelect');
+            select.value = name;
+        } catch(e) {
+            alert('Erro de conexão ao cadastrar motorista: ' + e);
         }
     },
 
@@ -83,7 +133,7 @@ const DriverApp = {
         const name = document.getElementById('driverSelect').value;
         const pin = document.getElementById('driverPin').value;
         if (!name) {
-            alert('Por favor, selecione seu nome.');
+            alert('Por favor, selecione seu nome ou cadastre-se no botão acima.');
             return;
         }
         this.currentDriver = { name: name, pin: pin };

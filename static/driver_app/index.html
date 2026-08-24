@@ -3,9 +3,10 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>Logística Motorista — Casa do Campo</title>
+    <title>Logística Casa do Campo</title>
     <link rel="manifest" href="/static/driver_app/manifest.json">
     <meta name="theme-color" content="#1b4d3e">
+    <link rel="icon" type="image/png" href="/static/logo.png">
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
         body { background-color: #f4f6f8; color: #212529; padding-bottom: 30px; }
@@ -19,6 +20,7 @@
         .btn-primary:active { background: #218838; }
         .btn-danger { background: #dc3545; color: white; }
         .btn-outline { background: white; border: 2px solid #6c757d; color: #495057; }
+        .btn-accent { background: #1b4d3e; color: white; }
         .form-group { margin-bottom: 14px; }
         .form-group label { display: block; font-weight: 600; margin-bottom: 6px; font-size: 0.9rem; }
         .form-control { width: 100%; padding: 12px; border: 1px solid #ced4da; border-radius: 8px; font-size: 1rem; }
@@ -39,7 +41,7 @@
 </head>
 <body>
     <header>
-        <h1>🚚 Logística Motorista</h1>
+        <h1>🚚 Logística Casa do Campo</h1>
         <span class="net-status" id="netStatus">🟢 Online</span>
     </header>
 
@@ -48,15 +50,18 @@
             ⚠️ Modo Offline ativo. Suas entregas e fotos serão salvas no celular e sincronizadas automaticamente quando o sinal 4G voltar.
         </div>
 
-        <!-- TELA DE LOGIN DO MOTORISTA -->
+        <!-- TELA DE LOGIN / SELEÇÃO DO MOTORISTA -->
         <div id="screenLogin" class="card">
             <h2 style="margin-bottom: 14px; text-align: center; color: #1b4d3e;">Identificação do Motorista</h2>
             <div class="form-group">
                 <label for="driverSelect">Selecione seu Nome:</label>
                 <select id="driverSelect" class="form-control">
-                    <option value="">Carregando motoristas...</option>
+                    <option value="">Carregando motoristas do sistema...</option>
                 </select>
             </div>
+            <button class="btn btn-outline" style="margin-top:0; margin-bottom:14px; padding:8px; font-size:0.88rem;" onclick="DriverApp.openRegisterDriverModal()">
+                ➕ Não achou seu nome? Cadastre-se Aqui
+            </button>
             <div class="form-group">
                 <label for="driverPin">Senha / PIN (Opcional):</label>
                 <input type="password" id="driverPin" class="form-control" placeholder="Digite sua senha se houver">
@@ -85,6 +90,31 @@
                 <h4 style="margin-bottom: 10px;">Entregas desta Carga:</h4>
                 <div id="ordersList"></div>
             </div>
+        </div>
+    </div>
+
+    <!-- MODAL DE CADASTRO DE NOVO MOTORISTA -->
+    <div id="modalRegisterDriver" class="modal">
+        <div class="modal-content">
+            <h3 style="margin-bottom: 12px; color: #1b4d3e;">Cadastrar Novo Motorista</h3>
+            <div class="form-group">
+                <label for="regDriverName">Nome Completo (Obrigatório):</label>
+                <input type="text" id="regDriverName" class="form-control" placeholder="Ex: Carlos Eduardo de Oliveira">
+            </div>
+            <div class="form-group">
+                <label for="regDriverPhone">Telefone / WhatsApp:</label>
+                <input type="text" id="regDriverPhone" class="form-control" placeholder="(33) 99999-9999">
+            </div>
+            <div class="form-group">
+                <label for="regDriverDoc">Documento / CNH / CPF:</label>
+                <input type="text" id="regDriverDoc" class="form-control" placeholder="Número do documento">
+            </div>
+            <div class="form-group">
+                <label for="regDriverVehicle">Veículo Padrão (Opcional):</label>
+                <input type="text" id="regDriverVehicle" class="form-control" placeholder="Ex: Caminhão Baú Mercedes">
+            </div>
+            <button class="btn btn-primary" onclick="DriverApp.submitRegisterDriver()">Salvar e Selecionar</button>
+            <button class="btn btn-outline" style="margin-top:8px;" onclick="DriverApp.closeRegisterDriverModal()">Cancelar</button>
         </div>
     </div>
 

@@ -8,6 +8,24 @@ import app
 from app_core.runtime_db import RuntimeDatabaseTarget
 
 
+class DummyHandler:
+    def __init__(self, data=None):
+        self._data = data or {}
+        self.result_data = None
+        self.result_status = 200
+
+    def json_data(self):
+        return self._data
+
+    def conn(self):
+        return app.conn()
+
+    def send_json(self, data, st=200):
+        self.result_data = data
+        self.result_status = st
+        return True
+
+
 class DriverApiTests(unittest.TestCase):
     def setUp(self):
         self.db_fd, self.db_path = tempfile.mkstemp()
@@ -30,6 +48,30 @@ class DriverApiTests(unittest.TestCase):
             os.remove(self.db_path)
         except Exception:
             pass
+
+    def test_driver_list_all_and_register(self):
+        from app_core.domains.driver_api_dispatch import handle_driver_api_request
+
+        # 1. Cadastra novo motorista via API
+        reg_handler = DummyHandler({
+            "name": "Motorista Novo Teste",
+            "phone": "(33) 99999-8888",
+            "document": "12345678900",
+            "vehicle_default": "Caminhão 1620"
+        })
+        handled = handle_driver_api_request(reg_handler, "/api/v1/driver/register", "POST")
+        self.assertTrue(handled)
+        self.assertTrue(reg_handler.result_data.get("ok"))
+        self.assertIn("cadastrado com sucesso", reg_handler.result_data.get("message"))
+
+        # 2. Lista todos os motoristas cadastrados
+        list_handler = DummyHandler()
+        handled_list = handle_driver_api_request(list_handler, "/api/v1/driver/all_drivers", "GET")
+        self.assertTrue(handled_list)
+        self.assertTrue(list_handler.result_data.get("ok"))
+        drivers = list_handler.result_data.get("drivers", [])
+        driver_names = [d["name"] for d in drivers]
+        self.assertIn("Motorista Novo Teste", driver_names)
 
     def test_driver_deliver_saves_photo_to_db_and_auto_settles(self):
         with app.conn() as db:
@@ -58,22 +100,7 @@ class DriverApiTests(unittest.TestCase):
             "is_problem": False
         }
 
-        class DummyHandler:
-            def __init__(self):
-                self._data = payload
-
-            def json_data(self):
-                return self._data
-
-            def conn(self):
-                return app.conn()
-
-            def send_json(self, data, st=200):
-                self.result_data = data
-                self.result_status = st
-                return True
-
-        handler = DummyHandler()
+        handler = DummyHandler(payload)
         from app_core.domains.driver_api_dispatch import handle_driver_api_request
         handled = handle_driver_api_request(handler, "/api/v1/driver/deliver", "POST")
 
