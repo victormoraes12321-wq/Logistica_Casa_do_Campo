@@ -2,8 +2,8 @@
 """
 tools/build_android_apk.py
 ==========================
-Gerador do Projeto Android Gradle Completo com Logo Casa do Campo, Dialog Nativo de Conexão do Servidor, AndroidX e Guia de Deploy.
-Gera a estrutura nativa Android Studio reconhecida com suporte a Gradle, Câmera e WebView.
+Gerador do Projeto Android Gradle Completo com ZXing Native QR Code Scanner, WebChromeClient PermissionRequest fix,
+Logo Casa do Campo, AndroidX e Guia de Deploy.
 """
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ android.enableJetifier=true
 org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
 """
 
-    # 4. app/build.gradle
+    # 4. app/build.gradle (Inclui zxing-android-embedded para QR Code nativo da câmera)
     app_build_gradle = """plugins {
     id 'com.android.application'
     id 'org.jetbrains.kotlin.android'
@@ -89,6 +89,7 @@ dependencies {
     implementation 'androidx.core:core-ktx:1.10.1'
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'com.google.android.material:material:1.9.0'
+    implementation 'com.journeyapps:zxing-android-embedded:4.3.0'
 }
 """
 
@@ -106,15 +107,20 @@ zipStorePath=wrapper/dists
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
 
     <application
         android:allowBackup="true"
         android:icon="@drawable/logo"
         android:label="Logística Casa do Campo"
         android:supportsRtl="true"
+        android:hardwareAccelerated="true"
         android:theme="@style/Theme.AppCompat.NoActionBar"
         android:usesCleartextTraffic="true">
         
@@ -128,11 +134,17 @@ zipStorePath=wrapper/dists
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name="com.journeyapps.zxing.capture.CaptureActivity"
+            android:screenOrientation="fullSensor"
+            android:stateNotNeeded="true"
+            android:theme="@style/zxing_CaptureTheme" />
     </application>
 </manifest>
 """
 
-    # 7. MainActivity.kt (Kotlin com Prompt Nativo de URL do Servidor no Celular + Câmera)
+    # 7. MainActivity.kt (Kotlin Nativo com Leitor de QR Code na Inicialização + Permissão de Mídia WebRTC)
     main_activity_kt = """package br.com.casadocampo.logistica
 
 import android.Manifest
@@ -150,6 +162,7 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.google.zxing.integration.android.IntentIntegrator
 
 @Suppress("DEPRECATION")
 class MainActivity : AppCompatActivity() {
@@ -175,8 +188,17 @@ class MainActivity : AppCompatActivity() {
         settings.allowFileAccess = true
         settings.allowContentAccess = true
         settings.mediaPlaybackRequiresUserGesture = false
+        settings.allowFileAccessFromFileURLs = true
+        settings.allowUniversalAccessFromFileURLs = true
 
         webView.webChromeClient = object : WebChromeClient() {
+            // CORRIGE TELA ESCURA AO ABRIR CÂMERA NO WEBVIEW
+            override fun onPermissionRequest(request: PermissionRequest?) {
+                runOnUiThread {
+                    request?.grant(request.resources)
+                }
+            }
+
             override fun onShowFileChooser(
                 webView: WebView?,
                 filePathCallback: ValueCallback<Array<Uri>>?,
@@ -188,7 +210,7 @@ class MainActivity : AppCompatActivity() {
                 val takePictureIntent = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
                 val chooserIntent = Intent(Intent.ACTION_CHOOSER)
                 chooserIntent.putExtra(Intent.EXTRA_INTENT, takePictureIntent)
-                chooserIntent.putExtra(Intent.EXTRA_TITLE, "Selecione a Câmera ou Comprovante")
+                chooserIntent.putExtra(Intent.EXTRA_TITLE, "Tirar Foto do Canhoto ou Selecionar Comprovante")
 
                 try {
                     startActivityForResult(chooserIntent, FILE_CHOOSER_REQUEST_CODE)
@@ -209,7 +231,7 @@ class MainActivity : AppCompatActivity() {
             override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
                 super.onReceivedError(view, request, error)
                 if (request?.isForMainFrame == true) {
-                    showServerUrlDialog("Não foi possível conectar ao servidor. Digite o link HTTPS gerado pelo computador da empresa:")
+                    showServerUrlDialog("Não foi possível conectar ao servidor. Escaneie o QR Code na tela CMD do computador ou informe o link HTTPS:")
                 }
             }
         }
@@ -222,7 +244,7 @@ class MainActivity : AppCompatActivity() {
         var savedUrl = prefs.getString(PREF_SERVER_URL, null)
 
         if (savedUrl.isNullOrEmpty() || savedUrl.contains("127.0.0.1")) {
-            showServerUrlDialog("Digite o link HTTPS do servidor da empresa (gerado pelo script no computador):")
+            showServerUrlDialog("Bem-vindo! Escaneie o QR Code na tela do computador (CMD) para conectar o celular instantaneamente:")
         } else {
             if (!savedUrl.endsWith("/static/driver_app/index.html") && !savedUrl.endsWith(".html")) {
                 savedUrl = savedUrl.trimEnd('/') + "/static/driver_app/index.html"
@@ -236,13 +258,16 @@ class MainActivity : AppCompatActivity() {
         val current = prefs.getString(PREF_SERVER_URL, "") ?: ""
 
         val input = EditText(this)
-        input.hint = "https://xxxx-yyyy.trycloudflare.com"
+        input.hint = "https://xxxx.trycloudflare.com ou https://xxxx.lhr.life"
         input.setText(current)
 
         AlertDialog.Builder(this)
-            .setTitle("⚙️ Servidor da Empresa")
+            .setTitle("⚙️ Conexão do Servidor")
             .setMessage(message)
             .setView(input)
+            .setNeutralButton("📷 Escanear QR Code (CMD)") { _, _ ->
+                startNativeQrScanner()
+            }
             .setPositiveButton("Conectar") { _, _ ->
                 var url = input.text.toString().trim()
                 if (url.isNotEmpty()) {
@@ -255,7 +280,7 @@ class MainActivity : AppCompatActivity() {
                     Toast.makeText(this, "Por favor, digite um link válido.", Toast.LENGTH_SHORT).show()
                 }
             }
-            .setNegativeButton("Servidor Local (Rede interna)") { _, _ ->
+            .setNegativeButton("IP Local (Wi-Fi Interno)") { _, _ ->
                 prefs.edit().putString(PREF_SERVER_URL, "http://192.168.0.100:3000").apply()
                 loadSavedServerUrl()
             }
@@ -263,11 +288,21 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    private fun startNativeQrScanner() {
+        val integrator = IntentIntegrator(this)
+        integrator.setPrompt("Aponte a câmera para o QR Code exibido na tela CMD do computador")
+        integrator.setBeepEnabled(true)
+        integrator.setOrientationLocked(false)
+        integrator.setCameraId(0)
+        integrator.initiateScan()
+    }
+
     private fun checkPermissions() {
         val permissions = arrayOf(
             Manifest.permission.CAMERA,
             Manifest.permission.INTERNET,
-            Manifest.permission.ACCESS_NETWORK_STATE
+            Manifest.permission.ACCESS_NETWORK_STATE,
+            Manifest.permission.RECORD_AUDIO
         )
         val needed = permissions.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
@@ -278,6 +313,23 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        val result = IntentIntegrator.parseActivityResult(requestCode, resultCode, data)
+        if (result != null) {
+            if (result.contents != null) {
+                var scannedUrl = result.contents.trim()
+                if (!scannedUrl.startsWith("http://") && !scannedUrl.startsWith("https://")) {
+                    scannedUrl = "https://$scannedUrl"
+                }
+                val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                prefs.edit().putString(PREF_SERVER_URL, scannedUrl).apply()
+                Toast.makeText(this, "⚙️ Servidor Conectado via QR Code!", Toast.LENGTH_SHORT).show()
+                loadSavedServerUrl()
+            } else {
+                showServerUrlDialog("Escaneamento cancelado. Digite o link HTTPS ou tente novamente:")
+            }
+            return
+        }
+
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == FILE_CHOOSER_REQUEST_CODE) {
             if (filePathCallback == null) return
