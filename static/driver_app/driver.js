@@ -410,6 +410,7 @@ const DriverApp = {
         document.getElementById('inputRecebedor').value = '';
         document.getElementById('inputDoc').value = '';
         document.getElementById('inputNotes').value = '';
+        document.getElementById('inputProblemNotes').value = '';
         document.getElementById('cameraInput').value = '';
         document.getElementById('photoPreview').style.display = 'none';
         document.getElementById('problemSection').style.display = 'none';
@@ -474,13 +475,21 @@ const DriverApp = {
             return;
         }
 
+        const problemNotes = document.getElementById('inputProblemNotes').value.trim();
+        const generalNotes = document.getElementById('inputNotes').value.trim();
+
+        if (isProblem && !problemNotes) {
+            alert('Por favor, digite a observação/motivo detalhado do porque a entrega não foi realizada.');
+            return;
+        }
+
         const payload = {
             order_id: this.selectedOrder.order_id,
             route_id: this.currentRoute ? this.currentRoute.id : null,
             delivered_to: document.getElementById('inputRecebedor').value,
             delivered_document: document.getElementById('inputDoc').value,
             payment_method: document.getElementById('selectPayment').value,
-            final_notes: document.getElementById('inputNotes').value,
+            final_notes: isProblem ? problemNotes : generalNotes,
             receipt_photo: this.compressedPhotoBase64,
             is_problem: isProblem,
             problem_type: document.getElementById('selectProblemType').value
@@ -495,7 +504,7 @@ const DriverApp = {
 
         const btn = document.getElementById('btnConfirmDeliver');
         btn.disabled = true;
-        btn.innerText = 'Enviando foto e salvando no banco...';
+        btn.innerText = 'Enviando dados para o banco do sistema...';
 
         try {
             const res = await fetch('/api/v1/driver/deliver', {
@@ -508,13 +517,15 @@ const DriverApp = {
             btn.innerText = '✅ Confirmar Entrega 100% OK';
 
             if (!data.ok) {
-                alert('Erro ao enviar baixa: ' + data.message);
+                alert('Erro ao registrar baixa: ' + data.message);
                 return;
             }
 
             this.closeModal();
 
-            if (data.route_auto_settled) {
+            if (isProblem) {
+                alert('⚠️ O problema/recusa de entrega foi registrado no sistema com a sua observação!');
+            } else if (data.route_auto_settled) {
                 alert('🎉 PARABÉNS! Todas as entregas desta carga foram concluídas 100%! O acerto de carga foi finalizado automaticamente pelo sistema!');
             } else {
                 alert('✅ Entrega registrada com sucesso! Comprovante salvo no banco de dados.');
@@ -527,7 +538,7 @@ const DriverApp = {
             btn.disabled = false;
             btn.innerText = '✅ Confirmar Entrega 100% OK';
             this.saveToOfflineQueue(payload);
-            alert('Sinal fraco ou indisponível. A entrega foi salva no aparelho para auto-envio.');
+            alert('Sinal fraco ou indisponível. O registro foi salvo no aparelho para auto-envio.');
             this.closeModal();
         }
     },

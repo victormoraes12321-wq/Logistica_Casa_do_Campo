@@ -589,7 +589,7 @@
             <!-- SEÇÃO DE REGISTRO DE PROBLEMA -->
             <div id="problemSection" style="display:none; margin-top: 14px; border-top: 2px dashed var(--danger); padding-top: 14px;">
                 <div class="form-group">
-                    <label for="selectProblemType" style="color: var(--danger);">Motivo do Problema:</label>
+                    <label for="selectProblemType" style="color: var(--danger); font-weight:700;">Categoria do Problema:</label>
                     <select id="selectProblemType" class="form-control">
                         <option value="Cliente ausente">Cliente ausente</option>
                         <option value="Endereço incorreto">Endereço incorreto</option>
@@ -599,8 +599,14 @@
                         <option value="Outro motivo">Outro motivo</option>
                     </select>
                 </div>
+
+                <div class="form-group">
+                    <label for="inputProblemNotes" style="color: var(--danger); font-weight:700;">📝 Observação / Detalhes do Motivo da Não Entrega:</label>
+                    <textarea id="inputProblemNotes" class="form-control" rows="3" placeholder="Ex: Cliente informou que viajou e só retorna na próxima terça-feira. Pediu para devolver a carga."></textarea>
+                </div>
+
                 <button class="btn btn-danger" onclick="DriverApp.submitDelivery(true)">
-                    🚨 Confirmar Registro de Problema
+                    🚨 Registrar Não Entrega no Sistema
                 </button>
             </div>
 
