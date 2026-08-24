@@ -400,6 +400,17 @@ def handle_driver_api_request(handler, path: str, method: str) -> bool:
                     """, (raw_b64[:200] + "...(salvo_no_banco)", now_ts, order_id))
                     image_saved = True
 
+                signature_base64 = str(data.get("digital_signature") or "").strip()
+                if signature_base64:
+                    raw_sig_b64 = signature_base64
+                    if "," in raw_sig_b64:
+                        raw_sig_b64 = raw_sig_b64.split(",", 1)[1]
+                    db.execute("""
+                        INSERT INTO delivery_receipts(order_id, route_id, image_data, mime_type, created_at)
+                        VALUES(?, ?, ?, 'image/png;signature=1', ?)
+                    """, (order_id, route_id or None, raw_sig_b64, now_ts))
+                    image_saved = True
+
                 if is_problem:
                     # Registra problema de entrega
                     new_status = "Problema"

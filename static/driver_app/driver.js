@@ -1,6 +1,6 @@
 /**
  * driver.js — Lógica do Aplicativo Android do Motorista 'Logística Casa do Campo'
- * Câmera, Compressão de Fotos no Celular, Cadastro de Motoristas, Offline Store & Auto-Sync
+ * Câmera, Assinatura Digital Touch, Configuração de Servidor Dinâmico, Sol Forte & Totalizadores
  */
 
 const DriverApp = {
@@ -8,10 +8,14 @@ const DriverApp = {
     currentRoute: null,
     selectedOrder: null,
     compressedPhotoBase64: '',
+    signatureBase64: '',
+    isDrawing: false,
+    signatureCtx: null,
 
     init: function() {
         this.bindNetworkEvents();
         this.loadDriverList();
+        this.initSignatureCanvas();
 
         const savedUser = localStorage.getItem('driver_user');
         if (savedUser) {
@@ -24,6 +28,97 @@ const DriverApp = {
             } catch(e) {
                 localStorage.removeItem('driver_user');
             }
+        }
+    },
+
+    getServerUrl: function() {
+        return localStorage.getItem('custom_server_url') || '';
+    },
+
+    openServerConfigModal: function() {
+        document.getElementById('inputServerUrl').value = this.getServerUrl();
+        document.getElementById('modalServerConfig').style.display = 'block';
+    },
+
+    closeServerConfigModal: function() {
+        document.getElementById('modalServerConfig').style.display = 'none';
+    },
+
+    saveServerConfig: function() {
+        let url = document.getElementById('inputServerUrl').value.trim();
+        if (url && !url.startsWith('http://') && !url.startsWith('https://')) {
+            url = 'https://' + url;
+        }
+        if (url) {
+            localStorage.setItem('custom_server_url', url);
+            alert('⚙️ Endereço do Servidor salvo com sucesso!');
+        } else {
+            localStorage.removeItem('custom_server_url');
+            alert('⚙️ Usando conexão automática padrão.');
+        }
+        this.closeServerConfigModal();
+        this.loadDriverList();
+    },
+
+    toggleHighContrast: function() {
+        document.body.classList.toggle('high-contrast');
+    },
+
+    initSignatureCanvas: function() {
+        const canvas = document.getElementById('signatureCanvas');
+        if (!canvas) return;
+
+        this.signatureCtx = canvas.getContext('2d');
+        canvas.width = canvas.offsetWidth || 300;
+        canvas.height = canvas.offsetHeight || 150;
+
+        this.signatureCtx.strokeStyle = '#1b4d3e';
+        this.signatureCtx.lineWidth = 3;
+        this.signatureCtx.lineCap = 'round';
+
+        const getPos = (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+            const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+            return { x: clientX - rect.left, y: clientY - rect.top };
+        };
+
+        const startDraw = (e) => {
+            this.isDrawing = true;
+            const pos = getPos(e);
+            this.signatureCtx.beginPath();
+            this.signatureCtx.moveTo(pos.x, pos.y);
+        };
+
+        const draw = (e) => {
+            if (!this.isDrawing) return;
+            e.preventDefault();
+            const pos = getPos(e);
+            this.signatureCtx.lineTo(pos.x, pos.y);
+            this.signatureCtx.stroke();
+        };
+
+        const stopDraw = () => {
+            if (this.isDrawing) {
+                this.isDrawing = false;
+                this.signatureBase64 = canvas.toDataURL('image/png');
+            }
+        };
+
+        canvas.addEventListener('mousedown', startDraw);
+        canvas.addEventListener('mousemove', draw);
+        canvas.addEventListener('mouseup', stopDraw);
+
+        canvas.addEventListener('touchstart', startDraw, { passive: false });
+        canvas.addEventListener('touchmove', draw, { passive: false });
+        canvas.addEventListener('touchend', stopDraw);
+    },
+
+    clearSignature: function() {
+        const canvas = document.getElementById('signatureCanvas');
+        if (canvas && this.signatureCtx) {
+            this.signatureCtx.clearRect(0, 0, canvas.width, canvas.height);
+            this.signatureBase64 = '';
         }
     },
 
@@ -60,7 +155,8 @@ const DriverApp = {
         select.innerHTML = '<option value="">Buscando motoristas cadastrados...</option>';
 
         try {
-            const res = await fetch('/api/v1/driver/all_drivers');
+            const baseUrl = this.getServerUrl();
+            const res = await fetch(`${baseUrl}/api/v1/driver/all_drivers`);
             const data = await res.json();
             
             select.innerHTML = '<option value="">-- Selecione seu nome --</option>';
@@ -102,7 +198,8 @@ const DriverApp = {
         }
 
         try {
-            const res = await fetch('/api/v1/driver/register', {
+            const baseUrl = this.getServerUrl();
+            const res = await fetch(`${baseUrl}/api/v1/driver/register`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -122,7 +219,6 @@ const DriverApp = {
             alert('✅ ' + data.message);
             this.closeRegisterDriverModal();
 
-            // Recarrega lista e auto-seleciona o novo motorista
             await this.loadDriverList();
             const select = document.getElementById('driverSelect');
             select.value = name;
@@ -153,7 +249,8 @@ const DriverApp = {
         listEl.innerHTML = '<div style="text-align:center; padding:30px; color:var(--text-muted);">Buscando cargas ativas...</div>';
         try {
             const driverName = this.currentDriver ? this.currentDriver.name : '';
-            const res = await fetch(`/api/v1/driver/routes?driver_name=${encodeURIComponent(driverName)}`);
+            const baseUrl = this.getServerUrl();
+            const res = await fetch(`${baseUrl}/api/v1/driver/routes?driver_name=${encodeURIComponent(driverName)}`);
             const data = await res.json();
             
             if (!data.routes || data.routes.length === 0) {
@@ -211,7 +308,8 @@ const DriverApp = {
         ordersList.innerHTML = '<div style="text-align:center; padding:30px; color:var(--text-muted);">Carregando pedidos da carga...</div>';
         
         try {
-            const res = await fetch(`/api/v1/driver/route/${routeId}`);
+            const baseUrl = this.getServerUrl();
+            const res = await fetch(`${baseUrl}/api/v1/driver/route/${routeId}`);
             const data = await res.json();
             if (!data.ok || !data.route) {
                 alert('Erro ao carregar detalhes da carga.');
@@ -234,6 +332,19 @@ const DriverApp = {
             const deliveredOrders = orders.filter(o => o.order_status === 'Acertado' || o.route_order_status === 'Entregue').length;
             const pct = totalOrders > 0 ? Math.round((deliveredOrders / totalOrders) * 100) : 0;
 
+            // Calcula totalizadores
+            let totalVal = 0;
+            let remainingW = 0;
+            orders.forEach(o => {
+                totalVal += (o.total_value || 0);
+                if (o.order_status !== 'Acertado' && o.route_order_status !== 'Entregue') {
+                    remainingW += (o.weight_kg || 0);
+                }
+            });
+
+            document.getElementById('statTotalValue').innerText = `R$ ${totalVal.toFixed(2)}`;
+            document.getElementById('statRemainingWeight').innerText = `${remainingW.toFixed(1)} kg`;
+
             document.getElementById('routeProgressText').innerText = `${deliveredOrders}/${totalOrders} (${pct}%)`;
             document.getElementById('routeProgressBar').style.width = `${pct}%`;
 
@@ -251,7 +362,8 @@ const DriverApp = {
         }
 
         try {
-            const res = await fetch('/api/v1/driver/start_route', {
+            const baseUrl = this.getServerUrl();
+            const res = await fetch(`${baseUrl}/api/v1/driver/start_route`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ route_id: this.currentRoute.id })
@@ -293,7 +405,6 @@ const DriverApp = {
                 receiptHtml = `<div style="color:var(--success); font-weight:700; font-size:0.8rem; margin-top:4px;">📷 Canhoto Salvo no Banco de Dados!</div>`;
             }
 
-            // Telefones e WhatsApp do Cliente/Fazenda
             const rawPhone = (o.client_phone || '').trim();
             const rawWa = (o.client_whatsapp || o.client_phone || '').trim();
             const cleanPhone = rawPhone.replace(/\D/g, '');
@@ -307,12 +418,10 @@ const DriverApp = {
                 contactButtons += `<a href="https://wa.me/55${cleanWa}" target="_blank" class="btn btn-outline btn-sm" style="padding:4px 8px; font-size:0.8rem; text-decoration:none; color:#25D366; border-color:#25D366;">💬 WhatsApp</a> `;
             }
 
-            // Link do GPS / Google Maps
             const fullAddress = o.delivery_address || o.client_full_address || `${o.farm_name || ''} ${o.city || ''}`;
             const mapQuery = encodeURIComponent(fullAddress);
             const gpsUrl = o.location_link || `https://www.google.com/maps/search/?api=1&query=${mapQuery}`;
 
-            // Tabela de Produtos / Itens do Pedido
             let itemsHtml = '';
             if (o.items && o.items.length > 0) {
                 let rowsStr = '';
@@ -370,7 +479,7 @@ const DriverApp = {
                     <div class="action-row">
                         ${!isEntregue ? `
                             <button class="btn btn-primary" onclick="DriverApp.openDeliverModal(${o.order_id})">
-                                📷 Fotografar Canhoto & Dar Baixa
+                                📷 Fotografar / Assinar Canhoto
                             </button>
                         ` : `
                             <button class="btn btn-outline" style="font-size:0.85rem; color:var(--success); border-color:var(--success);" onclick="DriverApp.openDeliverModal(${o.order_id})">
@@ -415,8 +524,10 @@ const DriverApp = {
         document.getElementById('photoPreview').style.display = 'none';
         document.getElementById('problemSection').style.display = 'none';
         this.compressedPhotoBase64 = '';
+        this.clearSignature();
 
         document.getElementById('modalDeliver').style.display = 'block';
+        setTimeout(() => this.initSignatureCanvas(), 200);
     },
 
     closeModal: function() {
@@ -431,7 +542,6 @@ const DriverApp = {
         reader.onload = (e) => {
             const img = new Image();
             img.onload = () => {
-                // Compressão via HTML5 Canvas
                 const canvas = document.createElement('canvas');
                 const maxDim = 1280;
                 let width = img.width;
@@ -450,7 +560,6 @@ const DriverApp = {
                 const ctx = canvas.getContext('2d');
                 ctx.drawImage(img, 0, 0, width, height);
 
-                // Converte para JPEG 75% qualidade (~120KB)
                 this.compressedPhotoBase64 = canvas.toDataURL('image/jpeg', 0.75);
 
                 const previewEl = document.getElementById('photoPreview');
@@ -470,8 +579,8 @@ const DriverApp = {
     submitDelivery: async function(isProblem) {
         if (!this.selectedOrder) return;
 
-        if (!isProblem && !this.compressedPhotoBase64) {
-            alert('Por favor, tire a foto do canhoto/comprovante assinado antes de confirmar.');
+        if (!isProblem && !this.compressedPhotoBase64 && !this.signatureBase64) {
+            alert('Por favor, tire a foto do canhoto assinado ou recolha a assinatura digital no celular.');
             return;
         }
 
@@ -491,13 +600,14 @@ const DriverApp = {
             payment_method: document.getElementById('selectPayment').value,
             final_notes: isProblem ? problemNotes : generalNotes,
             receipt_photo: this.compressedPhotoBase64,
+            digital_signature: this.signatureBase64,
             is_problem: isProblem,
             problem_type: document.getElementById('selectProblemType').value
         };
 
         if (!navigator.onLine) {
             this.saveToOfflineQueue(payload);
-            alert('⚡ Modo Offline: Entrega e foto salvas no celular! Serão enviadas automaticamente quando o 4G voltar.');
+            alert('⚡ Modo Offline: Entrega, foto e assinatura salvas no celular! Serão enviadas automaticamente quando o 4G voltar.');
             this.closeModal();
             return;
         }
@@ -507,7 +617,8 @@ const DriverApp = {
         btn.innerText = 'Enviando dados para o banco do sistema...';
 
         try {
-            const res = await fetch('/api/v1/driver/deliver', {
+            const baseUrl = this.getServerUrl();
+            const res = await fetch(`${baseUrl}/api/v1/driver/deliver`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload)
@@ -555,10 +666,11 @@ const DriverApp = {
 
         console.log(`Sincronizando ${queue.length} entregas offline pendentes...`);
         const remaining = [];
+        const baseUrl = this.getServerUrl();
 
         for (let item of queue) {
             try {
-                const res = await fetch('/api/v1/driver/deliver', {
+                const res = await fetch(`${baseUrl}/api/v1/driver/deliver`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(item)
