@@ -1768,6 +1768,9 @@ class App(BaseHTTPRequestHandler):
                 return True
         return False
 
+    def conn(self):
+        return conn()
+
     def validate_csrf(self):
         sid, sess = self.session_data()
         if not sid or not sess:
@@ -1868,11 +1871,21 @@ class App(BaseHTTPRequestHandler):
         if idx >= len(parts) or not str(parts[idx]).isdigit():
             raise ValueError('ID inválido na rota.')
         return int(parts[idx])
+    def do_HEAD(self):
+        self.do_GET()
+
     def do_GET(self):
         path=urlparse(self.path).path
         try:
             if path.startswith('/static/'):
-                fp=os.path.join(STATIC_DIR,os.path.basename(path)); ext=os.path.splitext(fp)[1].lower(); c={'.css':'text/css; charset=utf-8','.js':'application/javascript; charset=utf-8','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.svg':'image/svg+xml'}.get(ext,'application/octet-stream'); return self.send_file(fp,c)
+                rel_path = path[len('/static/'):].lstrip('/')
+                fp = os.path.abspath(os.path.join(STATIC_DIR, rel_path))
+                if not fp.startswith(os.path.abspath(STATIC_DIR)):
+                    self.send_error(403)
+                    return
+                ext = os.path.splitext(fp)[1].lower()
+                c = {'.css':'text/css; charset=utf-8','.js':'application/javascript; charset=utf-8','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.svg':'image/svg+xml','.json':'application/json; charset=utf-8','.html':'text/html; charset=utf-8'}.get(ext,'application/octet-stream')
+                return self.send_file(fp,c)
             if path == '/favicon.ico':
                 icon_path = os.path.join(STATIC_DIR, 'logo.png')
                 if os.path.exists(icon_path):
