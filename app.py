@@ -1712,6 +1712,10 @@ class App(BaseHTTPRequestHandler):
             return xff.split(',')[0].strip()
         return str(self.client_address[0] if self.client_address else '').strip()
 
+    def is_https(self):
+        proto = (self.headers.get('X-Forwarded-Proto') or '').strip().lower()
+        return proto == 'https'
+
     def session_data(self):
         if hasattr(self, '_cached_session_data'):
             return self._cached_session_data
@@ -2293,7 +2297,8 @@ class App(BaseHTTPRequestHandler):
         with conn() as db:
             audit(db,user,'Login','Acesso',user['username'],'','',f'IP: {ip}', source_ip=ip)
             db.commit()
-        secure_cookie = '; Secure' if SECURE_COOKIE_FLAG else ''
+        use_secure = SECURE_COOKIE_FLAG and self.is_https()
+        secure_cookie = '; Secure' if use_secure else ''
         redirect_target = '/force-password' if self.must_change_password(user) else '/dashboard'
         self.send_response(302)
         self._common_headers()
