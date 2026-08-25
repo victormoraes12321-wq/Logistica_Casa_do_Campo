@@ -155,6 +155,8 @@ class DriverApiTests(unittest.TestCase):
             "order_id": 3111,
             "route_id": 311,
             "delivered_to": "Recebedor",
+            "delivered_document": "123.456.789-01",
+            "delivered_document_type": "CPF",
             "receipt_photo": photo,
             "is_problem": False,
             "latitude": -20.3155,
@@ -171,9 +173,10 @@ class DriverApiTests(unittest.TestCase):
         self.assertTrue(replay.result_data["idempotent_replay"])
         with app.conn() as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM delivery_receipts WHERE order_id=3111").fetchone()[0], 1)
-            rec = db.execute("SELECT latitude,longitude,delivery_location_link FROM delivery_receipts WHERE order_id=3111").fetchone()
+            rec = db.execute("SELECT latitude,longitude,delivery_location_link,delivered_document_type FROM delivery_receipts WHERE order_id=3111").fetchone()
             self.assertEqual(rec["latitude"], -20.3155)
             self.assertEqual(rec["longitude"], -40.3128)
+            self.assertEqual(rec["delivered_document_type"], "CPF")
             self.assertIn("https://www.google.com/maps?q=-20.3155", rec["delivery_location_link"])
             self.assertEqual(db.execute("SELECT COUNT(*) FROM driver_delivery_operations WHERE order_id=3111").fetchone()[0], 1)
             history = db.execute("SELECT old_status,new_status,action FROM order_history WHERE order_id=3111").fetchone()

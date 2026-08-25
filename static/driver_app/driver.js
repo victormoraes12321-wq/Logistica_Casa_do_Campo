@@ -105,11 +105,53 @@ const DriverApp = {
     this.el('submitProblem').addEventListener('click', () => this.submitOperation(true));
     this.el('confirmCancel').addEventListener('click', () => this.finishConfirm(false));
     this.el('confirmAccept').addEventListener('click', () => this.finishConfirm(true));
+    const docInput = this.el('deliveredDocument');
+    const typeSelect = this.el('deliveredDocumentType');
+    const applyMask = () => {
+      if (!docInput) return;
+      const type = typeSelect ? typeSelect.value : 'CPF';
+      docInput.value = this.formatDocumentNumber(docInput.value, type);
+      if (type === 'CPF') docInput.placeholder = '000.000.000-00';
+      else if (type === 'CNPJ') docInput.placeholder = '00.000.000/0001-00';
+      else if (type === 'RG') docInput.placeholder = '00.000.000-0';
+      else docInput.placeholder = 'Número do documento';
+    };
+    if (docInput && typeSelect) {
+      docInput.addEventListener('input', applyMask);
+      typeSelect.addEventListener('change', applyMask);
+    }
     window.addEventListener('online', () => { this.updateConnectionStatus(); this.toast('Conexão restabelecida. Sincronizando…', 'ok'); this.syncQueue(); });
     window.addEventListener('offline', () => { this.updateConnectionStatus(); this.toast('Sem internet. Novos registros ficarão no aparelho.'); });
     window.addEventListener('resize', () => { if (this.el('signatureDialog').open) this.resizeSignatureCanvas(true); });
     window.addEventListener('orientationchange', () => setTimeout(() => { if (this.el('signatureDialog').open) this.resizeSignatureCanvas(true); }, 250));
     document.addEventListener('visibilitychange', () => { if (!document.hidden && navigator.onLine) this.syncQueue(); });
+  },
+
+  formatDocumentNumber(value, docType) {
+    if (!value) return '';
+    if (docType === 'CPF') {
+      const v = value.replace(/\D/g, '').slice(0, 11);
+      if (v.length <= 3) return v;
+      if (v.length <= 6) return `${v.slice(0,3)}.${v.slice(3)}`;
+      if (v.length <= 9) return `${v.slice(0,3)}.${v.slice(3,6)}.${v.slice(6)}`;
+      return `${v.slice(0,3)}.${v.slice(3,6)}.${v.slice(6,9)}-${v.slice(9)}`;
+    }
+    if (docType === 'CNPJ') {
+      const v = value.replace(/\D/g, '').slice(0, 14);
+      if (v.length <= 2) return v;
+      if (v.length <= 5) return `${v.slice(0,2)}.${v.slice(2)}`;
+      if (v.length <= 8) return `${v.slice(0,2)}.${v.slice(2,5)}.${v.slice(5)}`;
+      if (v.length <= 12) return `${v.slice(0,2)}.${v.slice(2,5)}.${v.slice(5,8)}/${v.slice(8)}`;
+      return `${v.slice(0,2)}.${v.slice(2,5)}.${v.slice(5,8)}/${v.slice(8,12)}-${v.slice(12)}`;
+    }
+    if (docType === 'RG') {
+      const v = value.replace(/[^\w]/g, '').slice(0, 9);
+      if (v.length <= 2) return v;
+      if (v.length <= 5) return `${v.slice(0,2)}.${v.slice(2)}`;
+      if (v.length <= 8) return `${v.slice(0,2)}.${v.slice(2,5)}.${v.slice(5)}`;
+      return `${v.slice(0,2)}.${v.slice(2,5)}.${v.slice(5,8)}-${v.slice(8)}`;
+    }
+    return value;
   },
 
   finishConfirm(value) {
@@ -479,12 +521,14 @@ const DriverApp = {
   },
 
   buildPayload(isProblem, coords) {
+    const docTypeSelect = this.el('deliveredDocumentType');
     return {
       idempotency_key: this.uuid(),
       order_id: this.selectedOrder.order_id,
       route_id: this.currentRoute.id,
       delivered_to: this.el('deliveredTo').value.trim(),
       delivered_document: this.el('deliveredDocument').value.trim(),
+      delivered_document_type: docTypeSelect ? docTypeSelect.value : 'CPF',
       final_notes: isProblem ? this.el('problemNotes').value.trim() : this.el('deliveryNotes').value.trim(),
       receipt_photo: isProblem ? '' : this.photoData,
       digital_signature: isProblem ? '' : this.signatureData,

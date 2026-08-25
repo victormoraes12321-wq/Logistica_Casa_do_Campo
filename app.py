@@ -944,6 +944,7 @@ def ensure_schema_migrations(db):
     ensure_column(db, 'delivery_receipts', 'digital_signature', 'digital_signature TEXT')
     ensure_column(db, 'delivery_receipts', 'delivered_to', 'delivered_to TEXT')
     ensure_column(db, 'delivery_receipts', 'delivered_document', 'delivered_document TEXT')
+    ensure_column(db, 'delivery_receipts', 'delivered_document_type', 'delivered_document_type TEXT')
     ensure_column(db, 'delivery_receipts', 'notes', 'notes TEXT')
     ensure_column(db, 'delivery_receipts', 'latitude', 'latitude REAL')
     ensure_column(db, 'delivery_receipts', 'longitude', 'longitude REAL')
@@ -951,6 +952,7 @@ def ensure_schema_migrations(db):
     ensure_column(db, 'orders', 'delivery_latitude', 'delivery_latitude REAL')
     ensure_column(db, 'orders', 'delivery_longitude', 'delivery_longitude REAL')
     ensure_column(db, 'orders', 'delivery_location_link', 'delivery_location_link TEXT')
+    ensure_column(db, 'orders', 'delivered_document_type', 'delivered_document_type TEXT')
     ensure_column(db, 'delivery_problems', 'route_id', 'route_id INTEGER')
     ensure_column(db, 'routes', 'status', 'status TEXT DEFAULT "Planejada"')
     ensure_column(db, 'routes', 'route_name', 'route_name TEXT')
@@ -3763,6 +3765,7 @@ document.addEventListener('DOMContentLoaded', function(){
         r_receipt_photo = r['receipt_photo'] if 'receipt_photo' in r.keys() else None
         r_delivered_to = r['delivered_to'] if 'delivered_to' in r.keys() else None
         r_delivered_doc = r['delivered_document'] if 'delivered_document' in r.keys() else None
+        r_delivered_doc_type = r['delivered_document_type'] if 'delivered_document_type' in r.keys() else None
         r_delivered_at = r['delivered_at'] if 'delivered_at' in r.keys() else None
         r_final_notes = r['final_notes'] if 'final_notes' in r.keys() else None
 
@@ -3777,6 +3780,7 @@ document.addEventListener('DOMContentLoaded', function(){
         if has_receipt_photo or has_signature or r_delivered_to or loc_link:
             rec_to = esc(receipt['delivered_to'] if receipt and receipt['delivered_to'] else (r_delivered_to or '—'))
             rec_doc = esc(receipt['delivered_document'] if receipt and receipt['delivered_document'] else (r_delivered_doc or ''))
+            rec_doc_type = esc(receipt['delivered_document_type'] if (receipt and 'delivered_document_type' in receipt.keys() and receipt['delivered_document_type']) else (r_delivered_doc_type or 'CPF'))
             rec_date = brdate(receipt['created_at']) if receipt and receipt['created_at'] else brdate(r_delivered_at)
             rec_notes = esc(receipt['notes'] if receipt and receipt['notes'] else (r_final_notes or '—'))
 
@@ -3799,7 +3803,7 @@ document.addEventListener('DOMContentLoaded', function(){
             receipt_panel = f'''<section class="panel" style="border-left:5px solid #10b981;">
                 <h2 style="color:#065f46;">📷 Comprovante e Assinatura da Entrega (App do Motorista)</h2>
                 <div class="info-grid">
-                    <p><b>Recebido por</b>{rec_to} {f"({rec_doc})" if rec_doc else ""}</p>
+                    <p><b>Recebido por</b>{rec_to} {f"({rec_doc_type}: {rec_doc})" if rec_doc else ""}</p>
                     <p><b>Data Registro</b>{rec_date}</p>
                     <p><b>Observação Motorista</b>{rec_notes}</p>
                     {gps_html}
