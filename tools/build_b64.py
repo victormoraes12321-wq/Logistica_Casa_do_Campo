@@ -1,6 +1,6 @@
 import base64
 
-ps_code = """
+ps_code = r"""
 $ErrorActionPreference = 'Stop'
 $d = 'C:\\Caddy'
 if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }

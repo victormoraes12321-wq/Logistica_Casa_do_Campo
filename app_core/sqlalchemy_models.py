@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import CheckConstraint, ForeignKey, Index, Integer, PrimaryKeyConstraint, REAL, TEXT, String, Text
+from sqlalchemy import CheckConstraint, ForeignKey, Index, Integer, LargeBinary, PrimaryKeyConstraint, REAL, TEXT, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -65,6 +65,7 @@ class DeliveryProblem(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="CASCADE"), nullable=False)
+    route_id: Mapped[int | None] = mapped_column(ForeignKey("routes.id", ondelete="SET NULL"), nullable=True)
     problem_type: Mapped[str | None] = mapped_column(Text, nullable=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[str] = mapped_column(Text, nullable=False)
@@ -81,6 +82,58 @@ class Driver(Base):
     active: Mapped[int | None] = mapped_column(Integer, nullable=True, default=1)
     updated_at: Mapped[str | None] = mapped_column(Text, nullable=True)
     version: Mapped[int | None] = mapped_column(Integer, nullable=True, default=1)
+    password_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    must_change_password: Mapped[int | None] = mapped_column(Integer, nullable=True, default=1)
+
+
+class DriverSession(Base):
+    __tablename__ = "driver_sessions"
+    __table_args__ = (
+        Index("idx_driver_sessions_driver", "driver_id"),
+        Index("idx_driver_sessions_expires", "expires_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    driver_id: Mapped[int] = mapped_column(ForeignKey("drivers.id", ondelete="CASCADE"), nullable=False)
+    token_hash: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[str] = mapped_column(Text, nullable=False)
+    last_seen_at: Mapped[str | None] = mapped_column(Text, nullable=True)
+    revoked_at: Mapped[str | None] = mapped_column(Text, nullable=True)
+    client_ip: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class DriverDeliveryOperation(Base):
+    __tablename__ = "driver_delivery_operations"
+    __table_args__ = (Index("idx_driver_operations_route_order", "route_id", "order_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    idempotency_key: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    driver_id: Mapped[int] = mapped_column(ForeignKey("drivers.id"), nullable=False)
+    route_id: Mapped[int] = mapped_column(ForeignKey("routes.id"), nullable=False)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=False)
+    operation_type: Mapped[str] = mapped_column(Text, nullable=False)
+    request_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    response_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+    completed_at: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class DeliveryReceipt(Base):
+    __tablename__ = "delivery_receipts"
+    __table_args__ = (Index("idx_delivery_receipts_order", "order_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="CASCADE"), nullable=False)
+    route_id: Mapped[int | None] = mapped_column(ForeignKey("routes.id", ondelete="SET NULL"), nullable=True)
+    image_data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    mime_type: Mapped[str | None] = mapped_column(Text, nullable=True, default="image/jpeg")
+    digital_signature: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    delivered_to: Mapped[str | None] = mapped_column(Text, nullable=True)
+    delivered_document: Mapped[str | None] = mapped_column(Text, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
 
 
 class Holiday(Base):

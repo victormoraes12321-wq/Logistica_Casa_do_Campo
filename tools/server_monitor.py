@@ -116,7 +116,9 @@ def print_header(host: str, port: int, python_exe: str) -> None:
     safe_print("=" * 75 + "\n")
 
 def run_server_monitor(host: str = "0.0.0.0", port: int = 3000, restart_delay: int = 5):
+    os.environ["APP_HOST"] = host
     os.environ["LOGISTICA_HOST"] = host
+    os.environ["APP_PORT"] = str(port)
     os.environ["LOGISTICA_PORT"] = str(port)
     os.environ["PYTHONUNBUFFERED"] = "1"
     os.environ["PYTHONIOENCODING"] = "utf-8"

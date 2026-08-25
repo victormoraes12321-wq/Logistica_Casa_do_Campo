@@ -153,6 +153,7 @@ def main():
 
     tmpdir = Path(tempfile.mkdtemp(prefix='audit_final_'))
     db_path = tmpdir / 'audit.sqlite3'
+    created_backup_files = []
     shutil.copy2(SOURCE_DB, db_path)
     ensure_admin_login(db_path, "admin123")
 
@@ -306,11 +307,17 @@ def main():
         c, b, h = exp.post('/clients', {'name': 'NoCreate'})
         push(results, 'inactive_session_blocked', c in (200, 302) and ('Acesso operacional' in b or '/login' in (h.get('Location') or '')), f'code={c},loc={h.get("Location")}')
 
+        backup_dir = ROOT / 'backups'
+        backups_before = {path.resolve() for path in backup_dir.glob('*.sqlite3')}
         c, b, _ = admin.post('/backup/create', {})
         push(results, 'backup_create', c in (200, 302), f'code={c}')
-        backup_files = sorted([x for x in os.listdir(ROOT / 'backups') if x.endswith('.sqlite3')], reverse=True)
-        if backup_files:
-            c, b, _ = admin.post('/backup/restore', {'backup_file': backup_files[0], 'confirm_text': 'RESTAURAR', 'reason': 'audit'})
+        created_backup_files = sorted(
+            (path.resolve() for path in backup_dir.glob('*.sqlite3') if path.resolve() not in backups_before),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if created_backup_files:
+            c, b, _ = admin.post('/backup/restore', {'backup_file': created_backup_files[0].name, 'confirm_text': 'RESTAURAR', 'reason': 'audit'})
             push(results, 'backup_restore', c in (200, 302), f'code={c}')
         else:
             push(results, 'backup_restore', False, 'no file')
@@ -346,6 +353,12 @@ def main():
             shutil.rmtree(tmpdir)
         except Exception:
             pass
+        for backup_file in created_backup_files:
+            try:
+                if backup_file.parent == (ROOT / 'backups').resolve():
+                    backup_file.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 if __name__ == '__main__':

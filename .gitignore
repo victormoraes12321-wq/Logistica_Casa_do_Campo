@@ -14,6 +14,14 @@ venv/
 # Node and frontend deps
 node_modules/
 
+# Android/Gradle local build state
+android_app_project/.gradle/
+android_app_project/**/build/
+android_app_project/local.properties
+**/keystore.properties
+**/*.jks
+**/*.keystore
+
 # Runtime databases & local data
 *.db
 *.sqlite3

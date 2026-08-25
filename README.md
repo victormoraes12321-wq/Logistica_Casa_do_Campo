@@ -13,6 +13,7 @@ Sistema interno para operacao de pedidos, faturamento, cargas/rotas, acerto, SLA
   - `app_core/repositories/*`
   - `app_core/services/*`
 - Banco versionado com Alembic em `migrations/`.
+- App do motorista: PWA em `static/driver_app` e contêiner nativo em `android_app_project`.
 
 ## 2) Requisitos
 
@@ -150,6 +151,7 @@ Migrations atuais:
 - `0001_baseline_schema`
 - `0002_audit_log_user_ip`
 - `0003_runtime_hardening_columns_indexes`
+- `0004_driver_app_security_integrity`
 
 Aplicar:
 
@@ -256,6 +258,16 @@ Implementado:
 - matriz de permissao em backend
 - auditoria com user, IP, antes/depois e acao
 - mensagens amigaveis para usuario (sem erro tecnico cru)
+- autenticação do motorista por senha PBKDF2, bearer token expirável e logout
+- cargas do motorista autorizadas por `driver_id`, sem fallback para cargas alheias
+- entrega/problema transacional e idempotente, com fila offline IndexedDB no PWA
+
+## 11.1) App Android e acesso externo
+
+- build e instalação: `android_app_project/README_INSTALACAO_ANDROID.md`
+- Cloudflare Tunnel nomeado no Windows: `docs/cloudflare_named_tunnel_windows.md`
+- healthcheck público: `tools/check_driver_public_endpoint.ps1`
+- configuração do app: uma origem HTTPS validada em `/healthz`; o PWA usa `window.location.origin`
 
 ## 12) Testes e gate de release
 
@@ -319,7 +331,6 @@ python tools/reset_producao.py --force-default-passwords
 
 ## 16) Riscos conhecidos
 
-- Sem repositorio Git inicializado na pasta atual, tag Git nativa nao foi criada.
-  - Mitigacao aplicada: RC interno por artefatos em `releases/`.
 - Validacao de paridade com PostgreSQL depende de instancia PostgreSQL disponivel.
   - Scripts e trilha tecnica ja estao prontos; executar no ambiente alvo.
+- A instalação do Cloudflare Tunnel exige domínio e login da conta da empresa; scripts não incorporam tokens.

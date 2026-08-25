@@ -1,7 +1,7 @@
 param(
   [string]$ServiceName = "LogisticaCasaDoCampo",
   [string]$DisplayName = "Logistica Casa do Campo",
-  [string]$BindHost = "0.0.0.0",
+  [string]$BindHost = "127.0.0.1",
   [int]$Port = 3000,
   [switch]$RemoveOnly
 )
@@ -14,6 +14,7 @@ New-Item -ItemType Directory -Path $logsDir -Force | Out-Null
 
 function Find-Python {
   $candidates = @(
+    (Join-Path $baseDir ".venv\Scripts\python.exe"),
     "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
     "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
     "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe"
@@ -43,6 +44,14 @@ $pythonExe = Find-Python
 $runPy = Join-Path $baseDir "run.py"
 $stdoutLog = Join-Path $logsDir "service_stdout.log"
 $stderrLog = Join-Path $logsDir "service_stderr.log"
+
+if (-not (Test-Path -LiteralPath $runPy)) {
+  throw "run.py não encontrado em $baseDir"
+}
+& $pythonExe -c "import dotenv, flask, waitress"
+if ($LASTEXITCODE -ne 0) {
+  throw "Dependências de produção ausentes no Python selecionado: $pythonExe"
+}
 
 $env:APP_RUNTIME = "flask"
 $env:APP_HOST = $BindHost

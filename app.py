@@ -45,6 +45,7 @@ from app_core.services.backup_service import (
     restore_sqlite_from_backup,
 )
 from app_core.services.permission_service import has_permission as permission_service_has_permission
+from app_core.services.driver_security import DEFAULT_DRIVER_PASSWORD, hash_driver_password
 import queue
 
 # Integração ERP (importação condicional — nunca quebra o app se módulo ausente)
@@ -102,6 +103,11 @@ GLOBAL_BROKER = EventBroker()
 
 _CFG = load_config()
 BASE_DIR = str(_CFG.root_dir)
+try:
+    with open(os.path.join(BASE_DIR, 'VERSION'), 'r', encoding='utf-8') as _version_file:
+        SYSTEM_VERSION = _version_file.read().strip() or 'unknown'
+except OSError:
+    SYSTEM_VERSION = 'unknown'
 DATA_DIR = str(_CFG.data_dir)
 STATIC_DIR = str(_CFG.static_dir)
 BACKUP_DIR = str(_CFG.backup_dir)
@@ -849,7 +855,7 @@ def db_executescript(db):
     CREATE TABLE IF NOT EXISTS holidays(id INTEGER PRIMARY KEY AUTOINCREMENT,date TEXT UNIQUE NOT NULL,name TEXT,created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,username TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,role TEXT NOT NULL,active INTEGER DEFAULT 1,must_change_password INTEGER DEFAULT 0,last_login_at TEXT,created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS clients(id INTEGER PRIMARY KEY AUTOINCREMENT,customer_code TEXT,name TEXT NOT NULL,document TEXT,phone TEXT,whatsapp TEXT,city TEXT,neighborhood TEXT,farm_name TEXT,address TEXT,reference_point TEXT,notes TEXT,route_name TEXT,active INTEGER DEFAULT 1,created_at TEXT NOT NULL,updated_at TEXT,version INTEGER DEFAULT 1);
-    CREATE TABLE IF NOT EXISTS drivers(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,phone TEXT,document TEXT,vehicle_default TEXT,active INTEGER DEFAULT 1,updated_at TEXT,version INTEGER DEFAULT 1);
+    CREATE TABLE IF NOT EXISTS drivers(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,phone TEXT,document TEXT,vehicle_default TEXT,active INTEGER DEFAULT 1,updated_at TEXT,version INTEGER DEFAULT 1,password_hash TEXT,must_change_password INTEGER DEFAULT 1);
     CREATE TABLE IF NOT EXISTS vehicles(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,plate TEXT,type TEXT,capacity TEXT,capacity_kg REAL,active INTEGER DEFAULT 1,updated_at TEXT,version INTEGER DEFAULT 1);
     CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY AUTOINCREMENT,order_number TEXT UNIQUE NOT NULL,external_id TEXT,client_id INTEGER,seller_id INTEGER,seller_name TEXT,status TEXT NOT NULL,urgency TEXT DEFAULT 'Normal',sale_date TEXT,expected_delivery_date TEXT,invoice_limit_date TEXT,payment_method TEXT,total_value REAL DEFAULT 0,weight_kg REAL DEFAULT 0,delivery_address TEXT,location_link TEXT,route_name TEXT,city TEXT,uf TEXT,notes TEXT,invoice_number TEXT,invoice_file_path TEXT,invoiced_at TEXT,driver_id INTEGER,vehicle_id INTEGER,delivered_to TEXT,delivered_document TEXT,delivered_at TEXT,final_notes TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,version INTEGER DEFAULT 1,FOREIGN KEY(client_id) REFERENCES clients(id),FOREIGN KEY(seller_id) REFERENCES users(id),FOREIGN KEY(driver_id) REFERENCES drivers(id),FOREIGN KEY(vehicle_id) REFERENCES vehicles(id));
     CREATE TABLE IF NOT EXISTS order_items(id INTEGER PRIMARY KEY AUTOINCREMENT,order_id INTEGER NOT NULL,product_code TEXT,product_name TEXT NOT NULL,category TEXT,quantity REAL DEFAULT 0,unit TEXT,weight_kg REAL DEFAULT 0,notes TEXT,FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE);
@@ -857,9 +863,11 @@ def db_executescript(db):
     CREATE TABLE IF NOT EXISTS route_orders(id INTEGER PRIMARY KEY AUTOINCREMENT,route_id INTEGER NOT NULL,order_id INTEGER NOT NULL,delivery_order INTEGER DEFAULT 1,status TEXT DEFAULT 'Pendente',FOREIGN KEY(route_id) REFERENCES routes(id) ON DELETE CASCADE,FOREIGN KEY(order_id) REFERENCES orders(id));
     CREATE TABLE IF NOT EXISTS route_cities(id INTEGER PRIMARY KEY AUTOINCREMENT,route_name TEXT,city TEXT,uf TEXT,delivery_order INTEGER,active INTEGER DEFAULT 1,notes TEXT,created_at TEXT,updated_at TEXT,version INTEGER DEFAULT 1);
     CREATE TABLE IF NOT EXISTS order_history(id INTEGER PRIMARY KEY AUTOINCREMENT,order_id INTEGER NOT NULL,user_id INTEGER,old_status TEXT,new_status TEXT,action TEXT NOT NULL,notes TEXT,created_at TEXT NOT NULL,FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE,FOREIGN KEY(user_id) REFERENCES users(id));
-    CREATE TABLE IF NOT EXISTS delivery_problems(id INTEGER PRIMARY KEY AUTOINCREMENT,order_id INTEGER NOT NULL,problem_type TEXT,description TEXT,created_at TEXT NOT NULL,FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE);
+    CREATE TABLE IF NOT EXISTS delivery_problems(id INTEGER PRIMARY KEY AUTOINCREMENT,order_id INTEGER NOT NULL,route_id INTEGER,problem_type TEXT,description TEXT,created_at TEXT NOT NULL,FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE,FOREIGN KEY(route_id) REFERENCES routes(id) ON DELETE SET NULL);
     CREATE TABLE IF NOT EXISTS attachments(id INTEGER PRIMARY KEY AUTOINCREMENT,order_id INTEGER,file_path TEXT,file_type TEXT,description TEXT,created_at TEXT NOT NULL,FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE);
     CREATE TABLE IF NOT EXISTS audit_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,created_at TEXT,user_id INTEGER,user_name TEXT,source_ip TEXT,action TEXT,module TEXT,entity TEXT,old_value TEXT,new_value TEXT,notes TEXT);
+    CREATE TABLE IF NOT EXISTS driver_sessions(id INTEGER PRIMARY KEY AUTOINCREMENT,driver_id INTEGER NOT NULL,token_hash TEXT NOT NULL UNIQUE,created_at TEXT NOT NULL,expires_at TEXT NOT NULL,last_seen_at TEXT,revoked_at TEXT,client_ip TEXT,FOREIGN KEY(driver_id) REFERENCES drivers(id) ON DELETE CASCADE);
+    CREATE TABLE IF NOT EXISTS driver_delivery_operations(id INTEGER PRIMARY KEY AUTOINCREMENT,idempotency_key TEXT NOT NULL UNIQUE,driver_id INTEGER NOT NULL,route_id INTEGER NOT NULL,order_id INTEGER NOT NULL,operation_type TEXT NOT NULL,request_hash TEXT NOT NULL,status TEXT NOT NULL,response_json TEXT,created_at TEXT NOT NULL,completed_at TEXT,FOREIGN KEY(driver_id) REFERENCES drivers(id),FOREIGN KEY(route_id) REFERENCES routes(id),FOREIGN KEY(order_id) REFERENCES orders(id));
     CREATE TABLE IF NOT EXISTS role_permissions(role_name TEXT NOT NULL,perm TEXT NOT NULL,allowed INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL,PRIMARY KEY(role_name,perm));
     CREATE TABLE IF NOT EXISTS user_permissions(user_id INTEGER NOT NULL,perm TEXT NOT NULL,allowed INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL,PRIMARY KEY(user_id,perm),FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE);
     CREATE TABLE IF NOT EXISTS erp_cache_pedidos (
@@ -937,6 +945,7 @@ def ensure_schema_migrations(db):
     ensure_column(db, 'delivery_receipts', 'delivered_to', 'delivered_to TEXT')
     ensure_column(db, 'delivery_receipts', 'delivered_document', 'delivered_document TEXT')
     ensure_column(db, 'delivery_receipts', 'notes', 'notes TEXT')
+    ensure_column(db, 'delivery_problems', 'route_id', 'route_id INTEGER')
     ensure_column(db, 'routes', 'status', 'status TEXT DEFAULT "Planejada"')
     ensure_column(db, 'routes', 'route_name', 'route_name TEXT')
     ensure_column(db, 'routes', 'total_weight', 'total_weight REAL DEFAULT 0')
@@ -956,6 +965,8 @@ def ensure_schema_migrations(db):
     ensure_column(db, 'clients', 'customer_code', 'customer_code TEXT')
     ensure_column(db, 'drivers', 'updated_at', 'updated_at TEXT')
     ensure_column(db, 'drivers', 'version', 'version INTEGER DEFAULT 1')
+    ensure_column(db, 'drivers', 'password_hash', 'password_hash TEXT')
+    ensure_column(db, 'drivers', 'must_change_password', 'must_change_password INTEGER DEFAULT 1')
     ensure_column(db, 'vehicles', 'capacity_kg', 'capacity_kg REAL')
     ensure_column(db, 'vehicles', 'updated_at', 'updated_at TEXT')
     ensure_column(db, 'vehicles', 'version', 'version INTEGER DEFAULT 1')
@@ -997,6 +1008,9 @@ def ensure_indexes(db):
     db.execute('CREATE INDEX IF NOT EXISTS idx_orders_seller ON orders(seller_id)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_clients_active_name ON clients(active, name)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_drivers_active ON drivers(active)')
+    db.execute('CREATE INDEX IF NOT EXISTS idx_driver_sessions_driver ON driver_sessions(driver_id)')
+    db.execute('CREATE INDEX IF NOT EXISTS idx_driver_sessions_expires ON driver_sessions(expires_at)')
+    db.execute('CREATE INDEX IF NOT EXISTS idx_driver_operations_route_order ON driver_delivery_operations(route_id,order_id)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_vehicles_active ON vehicles(active)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)')
     try:
@@ -1116,6 +1130,14 @@ def init_db():
             )
         db.execute("UPDATE drivers SET updated_at=COALESCE(updated_at,?) WHERE updated_at IS NULL",(now(),))
         db.execute("UPDATE drivers SET version=1 WHERE version IS NULL")
+        for driver_row in db.execute("SELECT id FROM drivers WHERE password_hash IS NULL OR TRIM(password_hash)='' ").fetchall():
+            db.execute(
+                "UPDATE drivers SET password_hash=?,must_change_password=1 WHERE id=?",
+                (hash_driver_password(DEFAULT_DRIVER_PASSWORD), driver_row['id']),
+            )
+        db.execute("UPDATE drivers SET must_change_password=1 WHERE must_change_password IS NULL")
+        if 'pin' in {column['name'] for column in db.execute("PRAGMA table_info(drivers)").fetchall()}:
+            db.execute("UPDATE drivers SET pin=NULL WHERE pin IS NOT NULL")
         db.execute("UPDATE vehicles SET capacity_kg=CAST(COALESCE(NULLIF(capacity,''),'0') AS REAL) WHERE capacity_kg IS NULL")
         db.execute("UPDATE vehicles SET updated_at=COALESCE(updated_at,?) WHERE updated_at IS NULL",(now(),))
         db.execute("UPDATE vehicles SET version=1 WHERE version IS NULL")
@@ -1138,7 +1160,7 @@ def init_db():
             tuple(PERMISSION_KEYS),
         )
         apply_named_user_permission_overrides(db)
-        if not db.execute('SELECT id FROM drivers LIMIT 1').fetchone(): db.execute('INSERT INTO drivers(name,phone,document,vehicle_default,active,updated_at,version) VALUES(?,?,?,?,1,?,1)',('Motorista padrão','','','',now()))
+        if not db.execute('SELECT id FROM drivers LIMIT 1').fetchone(): db.execute('INSERT INTO drivers(name,phone,document,vehicle_default,active,updated_at,version,password_hash,must_change_password) VALUES(?,?,?,?,1,?,1,?,1)',('Motorista padrão','','','',now(),hash_driver_password(DEFAULT_DRIVER_PASSWORD)))
         if not db.execute('SELECT id FROM vehicles LIMIT 1').fetchone(): db.execute('INSERT INTO vehicles(name,plate,type,capacity,capacity_kg,active,updated_at,version) VALUES(?,?,?,?,?,1,?,1)',('Veículo padrão','','Caminhão','11000',11000.0,now()))
         # Migrações seguras para fluxo simplificado sem apagar histórico.
         db.execute("""UPDATE orders
@@ -1571,7 +1593,15 @@ class App(BaseHTTPRequestHandler):
         self.send_header('Permissions-Policy', 'geolocation=(), microphone=(), camera=(), payment=()')
         self.send_header('Cross-Origin-Opener-Policy', 'same-origin')
         self.send_header('Cross-Origin-Resource-Policy', 'same-origin')
-        self.send_header('Content-Security-Policy', "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+        try:
+            request_path = urlparse(self.path).path
+        except Exception:
+            request_path = ''
+        if request_path.startswith('/static/driver_app/') or request_path.startswith('/api/v1/driver/'):
+            csp = "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        else:
+            csp = "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        self.send_header('Content-Security-Policy', csp)
 
     def send_error(self, code, message=None, explain=None):
         title_map = {
@@ -1906,11 +1936,22 @@ class App(BaseHTTPRequestHandler):
                     return self.send_file(icon_path, 'image/png')
                 self.send_error(404)
                 return
+            if path in ('/driver-app', '/driver-app/'):
+                return self.send_file(os.path.join(STATIC_DIR, 'driver_app', 'index.html'), 'text/html; charset=utf-8')
             if path == '/healthz':
                 runtime_state_cleanup()
                 with SESSIONS_LOCK:
                     active_sessions = len(SESSIONS)
-                return self.send_json({'status': 'ok', 'time': now(), 'host': HOST, 'port': PORT, 'active_sessions': active_sessions})
+                return self.send_json({
+                    'ok': True,
+                    'status': 'ok',
+                    'service': 'logistica-casa-do-campo',
+                    'api_version': 'v1',
+                    'driver_api_version': 1,
+                    'system_version': SYSTEM_VERSION,
+                    'time': now(),
+                    'active_sessions': active_sessions,
+                })
             if path == '/events':
                 u = self.user()
                 if not u:
@@ -2705,7 +2746,13 @@ class App(BaseHTTPRequestHandler):
         q=qs.get('q',[''])[0].strip()
         if q:
             like=f'%{q}%'; sql += ' AND (o.order_number LIKE ? OR o.invoice_number LIKE ? OR c.name LIKE ? OR c.farm_name LIKE ? OR o.city LIKE ? OR o.route_name LIKE ? OR o.seller_name LIKE ? OR o.notes LIKE ?)'; p += [like]*8
-        sql += " ORDER BY CASE WHEN o.expected_delivery_date<? AND o.status NOT IN ('Acertado','Problema','Cancelado','Agendado') THEN 0 ELSE 1 END, o.expected_delivery_date ASC, o.id DESC"; p.append(today())
+        if history_mode:
+            # No histórico, o usuário precisa ver primeiro o que acabou de ser
+            # finalizado; ordenar por SLA escondia registros recentes na paginação.
+            sql += " ORDER BY COALESCE(o.delivered_at,o.updated_at,o.created_at) DESC,o.id DESC"
+        else:
+            sql += " ORDER BY CASE WHEN o.expected_delivery_date<? AND o.status NOT IN ('Acertado','Problema','Cancelado','Agendado') THEN 0 ELSE 1 END, o.expected_delivery_date ASC, o.id DESC"
+            p.append(today())
         with conn() as db: return db.execute(sql,p).fetchall()
 
     def order_next_action(self, r, u=None):
@@ -5340,7 +5387,7 @@ document.addEventListener('DOMContentLoaded', function(){
                 dup_doc=db.execute('SELECT id,name FROM drivers WHERE document=? LIMIT 1',(doc,)).fetchone()
                 if dup_doc:
                     raise ValueError(f'Documento duplicado: já existe no motorista {dup_doc["name"]}.')
-            db.execute('INSERT INTO drivers(name,phone,document,vehicle_default,active,updated_at,version) VALUES(?,?,?,?,1,?,1)',(name,phone,doc,(d.get('vehicle_default') or '').strip(),now())); audit(db,u,'Criou motorista','Motoristas',name); db.commit()
+            db.execute('INSERT INTO drivers(name,phone,document,vehicle_default,active,updated_at,version,password_hash,must_change_password) VALUES(?,?,?,?,1,?,1,?,1)',(name,phone,doc,(d.get('vehicle_default') or '').strip(),now(),hash_driver_password(DEFAULT_DRIVER_PASSWORD))); audit(db,u,'Criou motorista','Motoristas',name,notes='Senha inicial temporária definida; troca obrigatória no primeiro acesso.'); db.commit()
         self.redirect('/drivers')
     def post_driver_update(self,u,did):
         d=self.post_data(); name=(d.get('name') or '').strip()

@@ -7,6 +7,8 @@ import http.cookiejar
 import threading
 import time
 import os
+import tempfile
+from unittest.mock import patch
 
 import app
 
@@ -14,8 +16,30 @@ import app
 class TestHttpErpRoutes(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.port = 8991
-        cls.server = app.SafeThreadingHTTPServer(('127.0.0.1', cls.port), app.App)
+        cls.db_fd, cls.db_path = tempfile.mkstemp(suffix=".sqlite3")
+        cls.old_db_target = app.DB_TARGET
+        cls.old_db_path = app.DB_PATH
+        app.DB_PATH = cls.db_path
+        app.DB_TARGET = app.RuntimeDatabaseTarget(
+            backend="sqlite",
+            database_url=f"sqlite:///{cls.db_path}",
+            sqlite_path=cls.db_path,
+        )
+        app.init_db()
+
+        # Este teste valida as rotas HTTP, não a infraestrutura ERP. Impede
+        # conexões externas e torna o resultado independente do .env local.
+        cls.erp_patchers = [
+            patch.object(app._erp_connector, "check_connectivity", return_value={"ok": False, "message": "ERP de teste desabilitado"}),
+            patch.object(app._erp_connector, "get_sync_status", return_value={"running": False, "progress_pct": 0, "cache_pedidos_count": 0}),
+            patch.object(app._erp_connector, "sync_erp_cache", return_value={"ok": True}),
+            patch.object(app, "sync_pending_invoiced_orders_to_logistica", return_value=None),
+        ]
+        for patcher in cls.erp_patchers:
+            patcher.start()
+
+        cls.server = app.SafeThreadingHTTPServer(('127.0.0.1', 0), app.App)
+        cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
         time.sleep(0.5)
@@ -27,11 +51,16 @@ class TestHttpErpRoutes(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=3)
+        for patcher in reversed(cls.erp_patchers):
+            patcher.stop()
+        app.DB_TARGET = cls.old_db_target
+        app.DB_PATH = cls.old_db_path
+        os.close(cls.db_fd)
         try:
-            with app.conn() as db:
-                db.execute("DELETE FROM users WHERE id=999")
-                db.commit()
-        except Exception:
+            os.remove(cls.db_path)
+        except OSError:
             pass
 
     def _login_god(self):

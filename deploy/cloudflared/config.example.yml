@@ -1,0 +1,14 @@
+# Copie para o perfil da conta de serviço e substitua somente os marcadores.
+# Nunca versione o arquivo <TUNNEL-UUID>.json.
+tunnel: <TUNNEL-UUID>
+credentials-file: C:\Windows\System32\config\systemprofile\.cloudflared\<TUNNEL-UUID>.json
+
+ingress:
+  - hostname: logistica.seudominio.com.br
+    service: http://127.0.0.1:3000
+    originRequest:
+      connectTimeout: 10s
+  - service: http_status:404
+
+logfile: C:\Cloudflared\cloudflared.log
+loglevel: info

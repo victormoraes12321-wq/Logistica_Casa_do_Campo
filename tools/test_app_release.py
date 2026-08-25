@@ -28,10 +28,10 @@ def run_release_tests():
     if result.wasSuccessful():
         print("\n" + "=" * 70)
         print(" [OK] TODOS OS TESTES DE INTEGRACAO DO APP PASSARAM COM 100% SUCESSO!")
-        print("    - Cadastro de Motoristas via App: OK")
-        print("    - Listagem Global de Motoristas do Banco: OK")
-        print("    - Envio & Persistência de Fotos de Comprovante no Banco: OK")
-        print("    - Auto-Acerto Automático de Cargas: OK")
+        print("    - Login por hash, troca inicial, sessão e logout: OK")
+        print("    - Isolamento de cargas por driver_id: OK")
+        print("    - Entrega/problema transacional e idempotente: OK")
+        print("    - Comprovante, rollback e fechamento automático: OK")
         print("=" * 70)
         return True
     else:

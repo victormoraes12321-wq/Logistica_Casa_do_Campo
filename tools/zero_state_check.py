@@ -158,6 +158,7 @@ def main():
 
     tmpdir = Path(tempfile.mkdtemp(prefix="zero_state_"))
     db_path = tmpdir / "zero.sqlite3"
+    created_backup_files = []
     shutil.copy2(SOURCE_DB, db_path)
     ensure_admin_login(db_path, "admin123")
 
@@ -309,7 +310,12 @@ def main():
         c, _, _ = admin.post(f"/load-settlement/{rid2}/finish", payload)
         push(results, "cycle_finish_settlement", c in (200, 302), f"code={c}; route={rname}")
 
+        backup_dir = ROOT / "backups"
+        backups_before = {path.resolve() for path in backup_dir.glob("*.sqlite3")}
         c, _, _ = admin.post("/backup/create", {})
+        created_backup_files = [
+            path.resolve() for path in backup_dir.glob("*.sqlite3") if path.resolve() not in backups_before
+        ]
         push(results, "cycle_backup_create", c in (200, 302), f"code={c}")
 
         failed = [r for r in results if not r[1]]
@@ -323,6 +329,13 @@ def main():
             proc.wait(timeout=5)
         except Exception:
             proc.kill()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        for backup_file in created_backup_files:
+            try:
+                if backup_file.parent == (ROOT / "backups").resolve():
+                    backup_file.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

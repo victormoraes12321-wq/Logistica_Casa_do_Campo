@@ -2,9 +2,41 @@
 from __future__ import annotations
 import unittest
 import sqlite3
-from app import conn, today
+import os
+import tempfile
+
+import app
+
+
+def conn():
+    return app.conn()
+
+
+def today():
+    return app.today()
 
 class DriverReportFixTests(unittest.TestCase):
+    def setUp(self):
+        self.db_fd, self.db_path = tempfile.mkstemp(suffix=".sqlite3")
+        self.old_db_target = app.DB_TARGET
+        self.old_db_path = app.DB_PATH
+        app.DB_PATH = self.db_path
+        app.DB_TARGET = app.RuntimeDatabaseTarget(
+            backend="sqlite",
+            database_url=f"sqlite:///{self.db_path}",
+            sqlite_path=self.db_path,
+        )
+        app.init_db()
+
+    def tearDown(self):
+        app.DB_TARGET = self.old_db_target
+        app.DB_PATH = self.old_db_path
+        os.close(self.db_fd)
+        try:
+            os.remove(self.db_path)
+        except OSError:
+            pass
+
     def test_driver_resolved_from_route_in_reports(self):
         # 1. Setup: Criar motorista, veículo, cliente, pedido e carga no banco de dados.
         with conn() as db:

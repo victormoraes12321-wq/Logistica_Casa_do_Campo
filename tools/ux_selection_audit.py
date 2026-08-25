@@ -350,6 +350,7 @@ def main():
             proc.wait(timeout=5)
         except Exception:
             proc.kill()
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 if __name__ == "__main__":

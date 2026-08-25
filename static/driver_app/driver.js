@@ -1,846 +1,665 @@
-/**
- * driver.js — Lógica do Aplicativo Android do Motorista 'Logística Casa do Campo'
- * Câmera, Assinatura Digital Touch, QR Code Server & Order Scanner, Perfil, Troca de Senha & Logout
- */
+'use strict';
 
 const DriverApp = {
-    currentDriver: null,
-    currentRoute: null,
-    selectedOrder: null,
-    compressedPhotoBase64: '',
-    signatureBase64: '',
-    isDrawing: false,
-    signatureCtx: null,
-    html5QrScanner: null,
-
-    init: function() {
-        this.bindNetworkEvents();
-        this.loadDriverList();
-        this.initSignatureCanvas();
-
-        const savedUser = localStorage.getItem('driver_user');
-        if (savedUser) {
-            try {
-                this.currentDriver = JSON.parse(savedUser);
-                this.updateUserUI();
-                this.showScreen('screenRoutes');
-                this.loadRoutes();
-            } catch(e) {
-                localStorage.removeItem('driver_user');
-            }
-        }
-    },
-
-    updateUserUI: function() {
-        if (!this.currentDriver) return;
-        const loggedEl = document.getElementById('loggedDriverName');
-        const profNameEl = document.getElementById('profDriverName');
-        const profDetailsEl = document.getElementById('profDriverDetails');
-        const btnLogoutHeader = document.getElementById('btnLogoutHeader');
-
-        if (loggedEl) loggedEl.innerText = this.currentDriver.name;
-        if (profNameEl) profNameEl.innerText = this.currentDriver.name;
-        if (profDetailsEl) profDetailsEl.innerText = `Motorista Ativo • Logística Casa do Campo`;
-        if (btnLogoutHeader) btnLogoutHeader.style.display = 'inline-flex';
-    },
-
-    logout: function() {
-        if (!confirm('Deseja realmente sair da sua conta de motorista?')) return;
-        localStorage.removeItem('driver_user');
-        this.currentDriver = null;
-        this.currentRoute = null;
-
-        const btnLogoutHeader = document.getElementById('btnLogoutHeader');
-        if (btnLogoutHeader) btnLogoutHeader.style.display = 'none';
-
-        this.closeProfileModal();
-        this.showScreen('screenLogin');
-        this.loadDriverList();
-    },
-
-    getServerUrl: function() {
-        return localStorage.getItem('custom_server_url') || '';
-    },
-
-    saveServerUrlValue: function(url) {
-        let cleanUrl = url.trim();
-        if (cleanUrl && !cleanUrl.startsWith('http://') && !cleanUrl.startsWith('https://')) {
-            cleanUrl = 'https://' + cleanUrl;
-        }
-        if (cleanUrl) {
-            localStorage.setItem('custom_server_url', cleanUrl);
-            alert('⚙️ Conexão do Servidor atualizada com sucesso!\nURL: ' + cleanUrl);
-        } else {
-            localStorage.removeItem('custom_server_url');
-            alert('⚙️ Usando conexão automática padrão.');
-        }
-        this.loadDriverList();
-        if (this.currentDriver) this.loadRoutes();
-    },
-
-    openProfileModal: function() {
-        if (this.currentDriver) this.updateUserUI();
-        document.getElementById('inputServerUrl').value = this.getServerUrl();
-        document.getElementById('inputNewPin').value = '';
-        document.getElementById('modalProfile').style.display = 'block';
-    },
-
-    closeProfileModal: function() {
-        document.getElementById('modalProfile').style.display = 'none';
-    },
-
-    submitChangePassword: async function() {
-        if (!this.currentDriver) {
-            alert('Você precisa estar logado para alterar a senha.');
-            return;
-        }
-        const newPin = document.getElementById('inputNewPin').value.trim();
-        if (!newPin) {
-            alert('Por favor, informe a nova senha ou PIN.');
-            return;
-        }
-
-        try {
-            const baseUrl = this.getServerUrl();
-            const res = await fetch(`${baseUrl}/api/v1/driver/change_password`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    driver_name: this.currentDriver.name,
-                    new_pin: newPin
-                })
-            });
-            const data = await res.json();
-            if (!data.ok) {
-                alert('Erro ao alterar senha: ' + data.message);
-                return;
-            }
-            alert('🔑 ' + data.message);
-            document.getElementById('inputNewPin').value = '';
-        } catch(e) {
-            alert('Erro de conexão ao alterar senha: ' + e);
-        }
-    },
-
-    saveServerConfig: function() {
-        const url = document.getElementById('inputServerUrl').value;
-        this.saveServerUrlValue(url);
-        this.closeProfileModal();
-    },
-
-    /* ---- 📷 LEITOR DE QR CODE ---- */
-    openQrScannerForServer: function() {
-        this.startQrScanner('Escanear QR Code de Conexão do Servidor', (decodedText) => {
-            console.log('QR Code Servidor lido:', decodedText);
-            this.saveServerUrlValue(decodedText);
-            this.closeQrScannerModal();
-        });
-    },
-
-    openQrScannerForOrder: function() {
-        this.startQrScanner('Escanear QR Code do Pedido / Endereço', (decodedText) => {
-            console.log('QR Code Pedido lido:', decodedText);
-            const searchInput = document.getElementById('orderSearchInput');
-            if (searchInput) {
-                searchInput.value = decodedText;
-                this.filterOrders();
-            }
-            this.closeQrScannerModal();
-        });
-    },
-
-    startQrScanner: function(title, onSuccessCallback) {
-        document.getElementById('qrScannerTitle').innerText = `📷 ${title}`;
-        document.getElementById('modalQrScanner').style.display = 'block';
-
-        if (this.html5QrScanner) {
-            try { this.html5QrScanner.clear(); } catch(e) {}
-        }
-
-        this.html5QrScanner = new Html5Qrcode("qrReaderContainer");
-        const config = { fps: 10, qrbox: { width: 220, height: 220 } };
-
-        this.html5QrScanner.start(
-            { facingMode: "environment" },
-            config,
-            (decodedText) => {
-                try {
-                    this.html5QrScanner.stop().then(() => {
-                        onSuccessCallback(decodedText);
-                    }).catch(() => {
-                        onSuccessCallback(decodedText);
-                    });
-                } catch(e) {
-                    onSuccessCallback(decodedText);
-                }
-            },
-            () => {}
-        ).catch(err => {
-            alert('Não foi possível iniciar a câmera para o QR Code: ' + err);
-            this.closeQrScannerModal();
-        });
-    },
-
-    closeQrScannerModal: function() {
-        if (this.html5QrScanner) {
-            try {
-                this.html5QrScanner.stop().then(() => {
-                    this.html5QrScanner.clear();
-                    this.html5QrScanner = null;
-                }).catch(() => { this.html5QrScanner = null; });
-            } catch(e) { this.html5QrScanner = null; }
-        }
-        document.getElementById('modalQrScanner').style.display = 'none';
-    },
-
-    toggleHighContrast: function() {
-        document.body.classList.toggle('high-contrast');
-    },
-
-    initSignatureCanvas: function() {
-        const canvas = document.getElementById('signatureCanvas');
-        if (!canvas) return;
-
-        this.signatureCtx = canvas.getContext('2d');
-        canvas.width = canvas.offsetWidth || 300;
-        canvas.height = canvas.offsetHeight || 150;
-
-        this.signatureCtx.strokeStyle = '#1b4d3e';
-        this.signatureCtx.lineWidth = 3;
-        this.signatureCtx.lineCap = 'round';
-
-        const getPos = (e) => {
-            const rect = canvas.getBoundingClientRect();
-            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-            const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-            return { x: clientX - rect.left, y: clientY - rect.top };
-        };
-
-        const startDraw = (e) => {
-            this.isDrawing = true;
-            const pos = getPos(e);
-            this.signatureCtx.beginPath();
-            this.signatureCtx.moveTo(pos.x, pos.y);
-        };
-
-        const draw = (e) => {
-            if (!this.isDrawing) return;
-            e.preventDefault();
-            const pos = getPos(e);
-            this.signatureCtx.lineTo(pos.x, pos.y);
-            this.signatureCtx.stroke();
-        };
-
-        const stopDraw = () => {
-            if (this.isDrawing) {
-                this.isDrawing = false;
-                this.signatureBase64 = canvas.toDataURL('image/png');
-            }
-        };
-
-        canvas.addEventListener('mousedown', startDraw);
-        canvas.addEventListener('mousemove', draw);
-        canvas.addEventListener('mouseup', stopDraw);
-
-        canvas.addEventListener('touchstart', startDraw, { passive: false });
-        canvas.addEventListener('touchmove', draw, { passive: false });
-        canvas.addEventListener('touchend', stopDraw);
-    },
-
-    clearSignature: function() {
-        const canvas = document.getElementById('signatureCanvas');
-        if (canvas && this.signatureCtx) {
-            this.signatureCtx.clearRect(0, 0, canvas.width, canvas.height);
-            this.signatureBase64 = '';
-        }
-    },
-
-    bindNetworkEvents: function() {
-        const updateStatus = () => {
-            const online = navigator.onLine;
-            const badge = document.getElementById('netStatus');
-            const banner = document.getElementById('offlineBanner');
-            if (online) {
-                badge.innerHTML = '<span>🟢</span> <span>Online</span>';
-                badge.style.background = 'rgba(16,185,129,0.2)';
-                banner.style.display = 'none';
-                this.syncOfflineQueue();
-            } else {
-                badge.innerHTML = '<span>🔴</span> <span>Offline</span>';
-                badge.style.background = 'rgba(239,68,68,0.3)';
-                banner.style.display = 'block';
-            }
-        };
-        window.addEventListener('online', updateStatus);
-        window.addEventListener('offline', updateStatus);
-        updateStatus();
-    },
-
-    showScreen: function(screenId) {
-        ['screenLogin', 'screenRoutes', 'screenRouteDetail'].forEach(id => {
-            const el = document.getElementById(id);
-            if (el) el.style.display = (id === screenId) ? 'block' : 'none';
-        });
-    },
-
-    loadDriverList: async function() {
-        const select = document.getElementById('driverSelect');
-        select.innerHTML = '<option value="">Buscando motoristas cadastrados...</option>';
-
-        try {
-            const baseUrl = this.getServerUrl();
-            const res = await fetch(`${baseUrl}/api/v1/driver/all_drivers`);
-            const data = await res.json();
-            
-            select.innerHTML = '<option value="">-- Selecione seu nome --</option>';
-
-            if (data.ok && data.drivers && data.drivers.length > 0) {
-                data.drivers.forEach(d => {
-                    select.innerHTML += `<option value="${d.name}">${d.name} ${d.vehicle_default ? ' (' + d.vehicle_default + ')' : ''}</option>`;
-                });
-            } else {
-                select.innerHTML += '<option value="Motorista Padrao">Motorista Geral</option>';
-            }
-        } catch(e) {
-            console.warn('Erro ao carregar lista de motoristas do banco:', e);
-            select.innerHTML = '<option value="">-- Erro ao carregar (Cadastre abaixo) --</option>';
-        }
-    },
-
-    openRegisterDriverModal: function() {
-        document.getElementById('regDriverName').value = '';
-        document.getElementById('regDriverPhone').value = '';
-        document.getElementById('regDriverDoc').value = '';
-        document.getElementById('regDriverVehicle').value = '';
-        document.getElementById('modalRegisterDriver').style.display = 'block';
-    },
-
-    closeRegisterDriverModal: function() {
-        document.getElementById('modalRegisterDriver').style.display = 'none';
-    },
-
-    submitRegisterDriver: async function() {
-        const name = document.getElementById('regDriverName').value.trim();
-        const phone = document.getElementById('regDriverPhone').value.trim();
-        const doc = document.getElementById('regDriverDoc').value.trim();
-        const vehicle = document.getElementById('regDriverVehicle').value.trim();
-
-        if (!name) {
-            alert('Por favor, informe seu nome completo.');
-            return;
-        }
-
-        try {
-            const baseUrl = this.getServerUrl();
-            const res = await fetch(`${baseUrl}/api/v1/driver/register`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    name: name,
-                    phone: phone,
-                    document: doc,
-                    vehicle_default: vehicle
-                })
-            });
-            const data = await res.json();
-
-            if (!data.ok) {
-                alert('Erro ao cadastrar motorista: ' + data.message);
-                return;
-            }
-
-            alert('✅ ' + data.message);
-            this.closeRegisterDriverModal();
-
-            await this.loadDriverList();
-            const select = document.getElementById('driverSelect');
-            select.value = name;
-        } catch(e) {
-            alert('Erro de conexão ao cadastrar motorista: ' + e);
-        }
-    },
-
-    login: function() {
-        const name = document.getElementById('driverSelect').value;
-        const pin = document.getElementById('driverPin').value;
-        if (!name) {
-            alert('Por favor, selecione seu nome na lista ou cadastre-se no botão acima.');
-            return;
-        }
-        this.currentDriver = { name: name, pin: pin };
-        localStorage.setItem('driver_user', JSON.stringify(this.currentDriver));
-        
-        this.updateUserUI();
-        this.showScreen('screenRoutes');
-        this.loadRoutes();
-    },
-
-    loadAllCompanyRoutes: function() {
-        this.loadRoutes(true);
-    },
-
-    loadRoutes: async function(showAll) {
-        const listEl = document.getElementById('routesList');
-        listEl.innerHTML = '<div style="text-align:center; padding:30px; color:var(--text-muted);">Buscando cargas ativas...</div>';
-        try {
-            const driverName = (showAll || !this.currentDriver) ? '' : this.currentDriver.name;
-            const baseUrl = this.getServerUrl();
-            const res = await fetch(`${baseUrl}/api/v1/driver/routes?driver_name=${encodeURIComponent(driverName)}`);
-            const data = await res.json();
-            
-            if (!data.routes || data.routes.length === 0) {
-                listEl.innerHTML = `
-                    <div class="card" style="text-align:center; padding:30px;">
-                        <div style="font-size:2.5rem; margin-bottom:10px;">🚚</div>
-                        <h4 style="color:var(--primary); font-weight:700;">Nenhuma carga pendente</h4>
-                        <p style="font-size:0.85rem; color:var(--text-muted); margin-top:4px;">Não há cargas ativas designadas no momento.</p>
-                        <button class="btn btn-outline btn-sm" style="margin-top:12px;" onclick="DriverApp.loadAllCompanyRoutes()">🌐 Ver Todas da Empresa</button>
-                    </div>
-                `;
-                return;
-            }
-
-            listEl.innerHTML = '';
-            data.routes.forEach(r => {
-                const total = r.total_orders || 0;
-                const delivered = r.delivered_orders || 0;
-                const pct = total > 0 ? Math.round((delivered / total) * 100) : 0;
-                const isPlanejada = (r.status === 'Planejada');
-
-                listEl.innerHTML += `
-                    <div class="card" style="border-left: 6px solid var(--primary); cursor:pointer;" onclick="DriverApp.openRoute(${r.id})">
-                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                            <span style="font-weight:800; font-size:1.1rem; color:var(--primary);">${r.name}</span>
-                            <span class="badge ${isPlanejada ? 'badge-pendente' : 'badge-entregue'}">${r.status}</span>
-                        </div>
-                        
-                        <div style="font-size:0.86rem; color:var(--text-muted); margin-bottom:10px;">
-                            <strong>Motorista:</strong> ${r.driver_name || 'N/A'}<br>
-                            <strong>Veículo:</strong> ${r.vehicle_name || ''} ${r.plate ? '(' + r.plate + ')' : ''}
-                        </div>
-
-                        <div style="display:flex; justify-content:space-between; font-size:0.8rem; font-weight:600; color:var(--text-dark);">
-                            <span>Entregas Concluídas: ${delivered} de ${total}</span>
-                            <span>${pct}%</span>
-                        </div>
-                        <div class="progress-container">
-                            <div class="progress-bar" style="width: ${pct}%;"></div>
-                        </div>
-
-                        <button class="btn btn-primary" style="margin-top:12px; font-size:0.9rem;">
-                            📋 Abrir Carga e Ver Pedidos
-                        </button>
-                    </div>
-                `;
-            });
-        } catch(e) {
-            listEl.innerHTML = '<div class="card" style="color:var(--danger); text-align:center; padding:20px;">Erro de conexão ao carregar cargas.</div>';
-        }
-    },
-
-    openRoute: async function(routeId) {
-        this.showScreen('screenRouteDetail');
-        const ordersList = document.getElementById('ordersList');
-        ordersList.innerHTML = '<div style="text-align:center; padding:30px; color:var(--text-muted);">Carregando pedidos da carga...</div>';
-        
-        try {
-            const baseUrl = this.getServerUrl();
-            const res = await fetch(`${baseUrl}/api/v1/driver/route/${routeId}`);
-            const data = await res.json();
-            if (!data.ok || !data.route) {
-                alert('Erro ao carregar detalhes da carga.');
-                return;
-            }
-
-            this.currentRoute = data.route;
-            document.getElementById('routeTitle').innerText = data.route.name;
-            document.getElementById('routeSub').innerText = `Veículo: ${data.route.vehicle_name || ''} ${data.route.plate ? '(' + data.route.plate + ')' : ''} | Motorista: ${data.route.driver_name || ''}`;
-
-            const startBtnContainer = document.getElementById('btnStartRouteContainer');
-            if (data.route.status === 'Planejada') {
-                startBtnContainer.style.display = 'block';
-            } else {
-                startBtnContainer.style.display = 'none';
-            }
-
-            const orders = data.route.orders || [];
-            const totalOrders = orders.length;
-            const deliveredOrders = orders.filter(o => o.order_status === 'Acertado' || o.route_order_status === 'Entregue').length;
-            const pendingCount = totalOrders - deliveredOrders;
-            const pct = totalOrders > 0 ? Math.round((deliveredOrders / totalOrders) * 100) : 0;
-
-            let remainingW = 0;
-            orders.forEach(o => {
-                if (o.order_status !== 'Acertado' && o.route_order_status !== 'Entregue') {
-                    remainingW += (o.weight_kg || 0);
-                }
-            });
-
-            document.getElementById('statPendingOrders').innerText = `${pendingCount} pedido(s)`;
-            document.getElementById('statRemainingWeight').innerText = `${remainingW.toFixed(1)} kg`;
-
-            document.getElementById('routeProgressText').innerText = `${deliveredOrders}/${totalOrders} (${pct}%)`;
-            document.getElementById('routeProgressBar').style.width = `${pct}%`;
-
-            this.renderOrders(orders);
-        } catch(e) {
-            ordersList.innerHTML = '<div class="card" style="color:var(--danger); text-align:center;">Erro ao carregar pedidos da carga.</div>';
-        }
-    },
-
-    startRoute: async function() {
-        if (!this.currentRoute) return;
-        
-        if (!confirm('Deseja marcar a saída desta carga? O status será alterado no sistema da empresa em tempo real para "Em Rota".')) {
-            return;
-        }
-
-        try {
-            const baseUrl = this.getServerUrl();
-            const res = await fetch(`${baseUrl}/api/v1/driver/start_route`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ route_id: this.currentRoute.id })
-            });
-            const data = await res.json();
-            if (!data.ok) {
-                alert('Erro ao marcar saída: ' + data.message);
-                return;
-            }
-
-            alert('🚀 ' + data.message);
-            document.getElementById('btnStartRouteContainer').style.display = 'none';
-            this.openRoute(this.currentRoute.id);
-        } catch(e) {
-            alert('Erro de conexão ao marcar saída da carga.');
-        }
-    },
-
-    renderOrders: function(orders) {
-        const ordersList = document.getElementById('ordersList');
-        ordersList.innerHTML = '';
-
-        if (!orders || orders.length === 0) {
-            ordersList.innerHTML = '<div class="card" style="text-align:center; color:var(--text-muted);">Nenhum pedido encontrado.</div>';
-            return;
-        }
-
-        orders.forEach(o => {
-            const isEntregue = (o.order_status === 'Acertado' || o.route_order_status === 'Entregue');
-            const isProblema = (o.order_status === 'Problema' || o.route_order_status === 'Com problema');
-
-            let statusClass = 'pendente';
-            let statusLabel = 'Pendente';
-            if (isEntregue) { statusClass = 'entregue'; statusLabel = 'Entregue 100%'; }
-            if (isProblema) { statusClass = 'problema'; statusLabel = 'Com Problema'; }
-
-            let receiptHtml = '';
-            if (o.has_receipt_photo) {
-                receiptHtml = `<div style="color:var(--success); font-weight:700; font-size:0.8rem; margin-top:4px;">📷 Canhoto Salvo no Banco de Dados!</div>`;
-            }
-
-            const rawPhone = (o.client_phone || '').trim();
-            const rawWa = (o.client_whatsapp || o.client_phone || '').trim();
-            const cleanPhone = rawPhone.replace(/\D/g, '');
-            const cleanWa = rawWa.replace(/\D/g, '');
-
-            let contactButtons = '';
-            if (cleanPhone) {
-                contactButtons += `<a href="tel:${cleanPhone}" class="btn btn-outline btn-sm" style="padding:4px 8px; font-size:0.8rem; text-decoration:none; color:var(--text-dark);">📞 Ligar (${rawPhone})</a> `;
-            }
-            if (cleanWa) {
-                contactButtons += `<a href="https://wa.me/55${cleanWa}" target="_blank" class="btn btn-outline btn-sm" style="padding:4px 8px; font-size:0.8rem; text-decoration:none; color:#25D366; border-color:#25D366;">💬 WhatsApp</a> `;
-            }
-
-            const fullAddress = o.delivery_address || o.client_full_address || `${o.farm_name || ''} ${o.city || ''}`;
-            const mapQuery = encodeURIComponent(fullAddress);
-            const gpsUrl = o.location_link || `https://www.google.com/maps/search/?api=1&query=${mapQuery}`;
-
-            let itemsHtml = '';
-            if (o.items && o.items.length > 0) {
-                let rowsStr = '';
-                o.items.forEach(it => {
-                    rowsStr += `
-                        <tr>
-                            <td><strong>${it.product_name}</strong></td>
-                            <td style="text-align:center;">${it.quantity} ${it.unit || 'un'}</td>
-                            <td style="text-align:right;">${(it.weight_kg || 0).toFixed(1)} kg</td>
-                        </tr>
-                    `;
-                });
-                itemsHtml = `
-                    <div class="items-accordion" id="items-${o.order_id}" style="display:none;">
-                        <table>
-                            <thead>
-                                <tr>
-                                    <th>Produto</th>
-                                    <th style="text-align:center;">Qtde</th>
-                                    <th style="text-align:right;">Peso</th>
-                                </tr>
-                            </thead>
-                            <tbody>${rowsStr}</tbody>
-                        </table>
-                    </div>
-                `;
-            }
-
-            ordersList.innerHTML += `
-                <div class="order-card ${statusClass}" data-search="${(o.client_name + ' ' + o.farm_name + ' ' + o.order_number + ' ' + fullAddress).toLowerCase()}">
-                    <div class="order-header-row">
-                        <span class="order-num">Pedido #${o.order_number}</span>
-                        <span class="badge badge-${statusClass}">${statusLabel}</span>
-                    </div>
-                    <div class="client-name">${o.client_name || 'Cliente Casa do Campo'}</div>
-                    <div class="order-info-line">📍 ${fullAddress}</div>
-                    <div class="order-info-line">🏡 Fazenda/Local: ${o.farm_name || 'N/A'} ${o.reference_point ? '(' + o.reference_point + ')' : ''}</div>
-                    
-                    <div style="font-size:0.85rem; color:var(--text-dark); margin-top:8px; display:flex; justify-content:space-between; background:#f8fafc; padding:8px 12px; border-radius:8px;">
-                        <span>Peso Carga: <strong>${(o.weight_kg || 0).toFixed(1)} kg</strong></span>
-                    </div>
-
-                    <div style="display:flex; flex-wrap:wrap; gap:6px; margin-top:10px;">
-                        ${contactButtons}
-                        <a href="${gpsUrl}" target="_blank" class="btn btn-outline btn-sm" style="padding:4px 8px; font-size:0.8rem; text-decoration:none; color:#0284c7; border-color:#0284c7;">🗺️ GPS Waze/Maps</a>
-                        ${o.items && o.items.length > 0 ? `
-                            <button class="btn btn-outline btn-sm" style="padding:4px 8px; font-size:0.8rem;" onclick="DriverApp.toggleItems(${o.order_id})">📦 Ver ${o.items.length} Produto(s)</button>
-                        ` : ''}
-                    </div>
-
-                    ${itemsHtml}
-                    ${receiptHtml}
-
-                    <div class="action-row">
-                        ${!isEntregue ? `
-                            <button class="btn btn-primary" onclick="DriverApp.openDeliverModal(${o.order_id})">
-                                📷 Fotografar / Assinar Canhoto
-                            </button>
-                        ` : `
-                            <button class="btn btn-outline" style="font-size:0.85rem; color:var(--success); border-color:var(--success);" onclick="DriverApp.openDeliverModal(${o.order_id})">
-                                🔄 Atualizar Comprovante / Foto
-                            </button>
-                        `}
-                    </div>
-                </div>
-            `;
-        });
-    },
-
-    toggleItems: function(orderId) {
-        const el = document.getElementById(`items-${orderId}`);
-        if (el) el.style.display = (el.style.display === 'none') ? 'block' : 'none';
-    },
-
-    filterOrders: function() {
-        const term = document.getElementById('orderSearchInput').value.toLowerCase().trim();
-        const cards = document.querySelectorAll('.order-card');
-        cards.forEach(card => {
-            const dataSearch = card.getAttribute('data-search') || '';
-            if (!term || dataSearch.includes(term)) {
-                card.style.display = 'block';
-            } else {
-                card.style.display = 'none';
-            }
-        });
-    },
-
-    openDeliverModal: function(orderId) {
-        if (!this.currentRoute || !this.currentRoute.orders) return;
-        this.selectedOrder = this.currentRoute.orders.find(o => o.order_id === orderId);
-        if (!this.selectedOrder) return;
-
-        document.getElementById('modalOrderTitle').innerText = `📷 Baixa do Pedido #${this.selectedOrder.order_number}`;
-        document.getElementById('inputRecebedor').value = '';
-        document.getElementById('inputDoc').value = '';
-        document.getElementById('inputNotes').value = '';
-        document.getElementById('inputProblemNotes').value = '';
-        document.getElementById('cameraInput').value = '';
-        
-        const previewEl = document.getElementById('photoPreview');
-        if (previewEl) previewEl.style.display = 'none';
-        
-        const statusEl = document.getElementById('photoStatusText');
-        if (statusEl) statusEl.style.display = 'none';
-        
-        document.getElementById('problemSection').style.display = 'none';
-        this.compressedPhotoBase64 = '';
-        this.clearSignature();
-
-        document.getElementById('modalDeliver').style.display = 'block';
-        setTimeout(() => this.initSignatureCanvas(), 200);
-    },
-
-    closeModal: function() {
-        document.getElementById('modalDeliver').style.display = 'none';
-    },
-
-    previewPhoto: function(event) {
-        const file = event.target && event.target.files && event.target.files[0];
-        if (!file) return;
-
-        const reader = new FileReader();
-        reader.onload = (e) => {
-            const img = new Image();
-            img.onload = () => {
-                const canvas = document.createElement('canvas');
-                const maxDim = 1280;
-                let width = img.width;
-                let height = img.height;
-
-                if (width > height && width > maxDim) {
-                    height = Math.round((height * maxDim) / width);
-                    width = maxDim;
-                } else if (height > maxDim) {
-                    width = Math.round((width * maxDim) / height);
-                    height = maxDim;
-                }
-
-                canvas.width = width;
-                canvas.height = height;
-                const ctx = canvas.getContext('2d');
-                ctx.drawImage(img, 0, 0, width, height);
-
-                this.compressedPhotoBase64 = canvas.toDataURL('image/jpeg', 0.75);
-
-                const previewEl = document.getElementById('photoPreview');
-                if (previewEl) {
-                    previewEl.src = this.compressedPhotoBase64;
-                    previewEl.style.display = 'block';
-                }
-
-                const statusEl = document.getElementById('photoStatusText');
-                if (statusEl) {
-                    statusEl.innerText = `✅ Foto capturada (${file.name || 'comprovante.jpg'})!`;
-                    statusEl.style.display = 'block';
-                }
-            };
-            img.onerror = () => {
-                alert('Erro ao processar a imagem da foto. Tente novamente.');
-            };
-            img.src = e.target.result;
-        };
-        reader.onerror = () => {
-            alert('Erro ao carregar o arquivo da câmera.');
-        };
-        reader.readAsDataURL(file);
-    },
-
-    toggleProblemForm: function() {
-        const sec = document.getElementById('problemSection');
-        sec.style.display = (sec.style.display === 'none') ? 'block' : 'none';
-    },
-
-    submitDelivery: async function(isProblem) {
-        if (!this.selectedOrder) return;
-
-        if (!isProblem && !this.compressedPhotoBase64 && !this.signatureBase64) {
-            alert('Por favor, tire a foto do canhoto assinado ou recolha a assinatura digital no celular.');
-            return;
-        }
-
-        const problemNotes = document.getElementById('inputProblemNotes').value.trim();
-        const generalNotes = document.getElementById('inputNotes').value.trim();
-
-        if (isProblem && !problemNotes) {
-            alert('Por favor, digite a observação/motivo detalhado do porque a entrega não foi realizada.');
-            return;
-        }
-
-        const payload = {
-            order_id: this.selectedOrder.order_id,
-            route_id: this.currentRoute ? this.currentRoute.id : null,
-            delivered_to: document.getElementById('inputRecebedor').value,
-            delivered_document: document.getElementById('inputDoc').value,
-            payment_method: '',
-            final_notes: isProblem ? problemNotes : generalNotes,
-            receipt_photo: this.compressedPhotoBase64,
-            digital_signature: this.signatureBase64,
-            is_problem: isProblem,
-            problem_type: document.getElementById('selectProblemType').value
-        };
-
-        if (!navigator.onLine) {
-            this.saveToOfflineQueue(payload);
-            alert('⚡ Modo Offline: Entrega, foto e assinatura salvas no celular! Serão enviadas automaticamente quando o 4G voltar.');
-            this.closeModal();
-            return;
-        }
-
-        const btn = document.getElementById('btnConfirmDeliver');
-        btn.disabled = true;
-        btn.innerText = 'Enviando dados para o banco do sistema...';
-
-        try {
-            const baseUrl = this.getServerUrl();
-            const res = await fetch(`${baseUrl}/api/v1/driver/deliver`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            const data = await res.json();
-            btn.disabled = false;
-            btn.innerText = '✅ Confirmar Entrega 100% OK';
-
-            if (!data.ok) {
-                alert('Erro ao registrar baixa: ' + data.message);
-                return;
-            }
-
-            this.closeModal();
-
-            if (isProblem) {
-                alert('⚠️ O problema/recusa de entrega foi registrado no sistema com a sua observação!');
-            } else if (data.route_auto_settled) {
-                alert('🎉 PARABÉNS! Todas as entregas desta carga foram concluídas 100%! O acerto de carga foi finalizado automaticamente pelo sistema!');
-            } else {
-                alert('✅ Entrega registrada com sucesso! Comprovante salvo no banco de dados.');
-            }
-
-            if (this.currentRoute) {
-                this.openRoute(this.currentRoute.id);
-            }
-        } catch(e) {
-            btn.disabled = false;
-            btn.innerText = '✅ Confirmar Entrega 100% OK';
-            this.saveToOfflineQueue(payload);
-            alert('Sinal fraco ou indisponível. O registro foi salvo no aparelho para auto-envio.');
-            this.closeModal();
-        }
-    },
-
-    saveToOfflineQueue: function(payload) {
-        const queue = JSON.parse(localStorage.getItem('offline_deliveries') || '[]');
-        queue.push(payload);
-        localStorage.setItem('offline_deliveries', JSON.stringify(queue));
-    },
-
-    syncOfflineQueue: async function() {
-        const queue = JSON.parse(localStorage.getItem('offline_deliveries') || '[]');
-        if (queue.length === 0) return;
-
-        console.log(`Sincronizando ${queue.length} entregas offline pendentes...`);
-        const remaining = [];
-        const baseUrl = this.getServerUrl();
-
-        for (let item of queue) {
-            try {
-                const res = await fetch(`${baseUrl}/api/v1/driver/deliver`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(item)
-                });
-                const data = await res.json();
-                if (!data.ok) remaining.push(item);
-            } catch(e) {
-                remaining.push(item);
-            }
-        }
-
-        localStorage.setItem('offline_deliveries', JSON.stringify(remaining));
-        if (remaining.length === 0 && queue.length > 0) {
-            alert('🟢 Todas as suas entregas offline pendentes foram sincronizadas com o banco de dados do sistema!');
-            if (this.currentRoute) this.openRoute(this.currentRoute.id);
-        }
+  API_BASE: window.location.origin,
+  SESSION_KEY: 'driver_session_v2',
+  DB_NAME: 'logistica_driver_offline_v2',
+  DB_VERSION: 2,
+  db: null,
+  session: null,
+  routes: [],
+  currentRoute: null,
+  selectedOrder: null,
+  photoData: '',
+  signatureData: '',
+  signatureDirty: false,
+  drawing: false,
+  confirmResolve: null,
+  serverReachable: true,
+  syncInProgress: false,
+  operationInProgress: false,
+  queuedKeys: new Set(),
+
+  el(id) { return document.getElementById(id); },
+  escape(value) {
+    return String(value ?? '').replace(/[&<>'"]/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
+  },
+  safeHttpUrl(value, fallback = '') {
+    if (!String(value || '').trim()) return fallback;
+    try {
+      const url = new URL(String(value || ''), window.location.origin);
+      return ['http:', 'https:'].includes(url.protocol) ? url.href : fallback;
+    } catch (_) { return fallback; }
+  },
+  uuid() {
+    if (crypto.randomUUID) return crypto.randomUUID();
+    return `${Date.now()}-${Math.random().toString(16).slice(2)}-${Math.random().toString(16).slice(2)}`;
+  },
+  setBusy(button, busy, label) {
+    if (!button) return;
+    if (!button.dataset.label) button.dataset.label = button.textContent;
+    button.disabled = busy;
+    button.textContent = busy ? label : button.dataset.label;
+  },
+  toast(message, type = '') {
+    const item = document.createElement('div');
+    item.className = `toast ${type}`;
+    item.textContent = message;
+    this.el('toastStack').appendChild(item);
+    setTimeout(() => item.remove(), 4500);
+  },
+  showError(id, message = '') {
+    const box = this.el(id);
+    box.textContent = message;
+    box.classList.toggle('hidden', !message);
+  },
+  ask(title, message, acceptLabel = 'Confirmar') {
+    this.el('confirmTitle').textContent = title;
+    this.el('confirmMessage').textContent = message;
+    this.el('confirmAccept').textContent = acceptLabel;
+    this.el('confirmDialog').showModal();
+    return new Promise(resolve => { this.confirmResolve = resolve; });
+  },
+
+  async init() {
+    this.bindEvents();
+    await this.openDatabase();
+    await this.recoverInterruptedOperations();
+    await this.cleanupSentOperations();
+    this.restoreSession();
+    await this.updateQueueCounters();
+    this.updateConnectionStatus();
+    if (!this.session?.token || this.sessionExpired()) await this.loadDrivers();
+    if (this.session?.must_change_password) this.showScreen('passwordScreen');
+    else if (this.session?.token && !this.sessionExpired()) {
+      this.showScreen('dashboardScreen');
+      await this.loadRoutes();
+      this.syncQueue();
+    } else {
+      this.clearSession();
+      this.showScreen('loginScreen');
     }
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('/static/driver_app/sw.js').catch(() => {});
+    setInterval(() => { if (navigator.onLine && this.session?.token) this.syncQueue(); }, 30000);
+  },
+
+  bindEvents() {
+    this.el('loginForm').addEventListener('submit', event => { event.preventDefault(); this.login(); });
+    this.el('passwordForm').addEventListener('submit', event => { event.preventDefault(); this.changePassword(); });
+    this.el('refreshButton').addEventListener('click', () => this.loadRoutes());
+    this.el('syncButton').addEventListener('click', () => this.syncQueue(true));
+    this.el('navSync').addEventListener('click', () => this.syncQueue(true));
+    this.el('navHome').addEventListener('click', () => { this.showScreen('dashboardScreen'); this.loadRoutes(); });
+    this.el('navLogout').addEventListener('click', () => this.logout());
+    this.el('backButton').addEventListener('click', () => { this.showScreen('dashboardScreen'); this.loadRoutes(); });
+    this.el('startRouteButton').addEventListener('click', () => this.startRoute());
+    this.el('orderSearch').addEventListener('input', () => this.filterOrders());
+    this.el('closeDelivery').addEventListener('click', () => this.el('deliveryDialog').close());
+    this.el('photoInput').addEventListener('change', event => this.processPhoto(event));
+    this.el('removePhoto').addEventListener('click', () => this.removePhoto());
+    this.el('openSignature').addEventListener('click', () => this.openSignature());
+    this.el('closeSignature').addEventListener('click', () => this.closeSignature(false));
+    this.el('clearSignature').addEventListener('click', () => this.clearSignature());
+    this.el('saveSignature').addEventListener('click', () => this.closeSignature(true));
+    this.el('submitDelivery').addEventListener('click', () => this.submitOperation(false));
+    this.el('submitProblem').addEventListener('click', () => this.submitOperation(true));
+    this.el('confirmCancel').addEventListener('click', () => this.finishConfirm(false));
+    this.el('confirmAccept').addEventListener('click', () => this.finishConfirm(true));
+    window.addEventListener('online', () => { this.updateConnectionStatus(); this.toast('Conexão restabelecida. Sincronizando…', 'ok'); this.syncQueue(); });
+    window.addEventListener('offline', () => { this.updateConnectionStatus(); this.toast('Sem internet. Novos registros ficarão no aparelho.'); });
+    window.addEventListener('resize', () => { if (this.el('signatureDialog').open) this.resizeSignatureCanvas(true); });
+    window.addEventListener('orientationchange', () => setTimeout(() => { if (this.el('signatureDialog').open) this.resizeSignatureCanvas(true); }, 250));
+    document.addEventListener('visibilitychange', () => { if (!document.hidden && navigator.onLine) this.syncQueue(); });
+  },
+
+  finishConfirm(value) {
+    this.el('confirmDialog').close();
+    if (this.confirmResolve) this.confirmResolve(value);
+    this.confirmResolve = null;
+  },
+  updateConnectionStatus() {
+    const node = this.el('connectionStatus');
+    const online = navigator.onLine && this.serverReachable;
+    node.classList.toggle('offline', !online);
+    node.querySelector('span:last-child').textContent = online ? 'Online' : 'Offline';
+  },
+  showScreen(id) {
+    ['loginScreen','passwordScreen','dashboardScreen','routeScreen'].forEach(screen => this.el(screen).classList.toggle('hidden', screen !== id));
+    const authenticated = id === 'dashboardScreen' || id === 'routeScreen';
+    this.el('bottomNav').classList.toggle('hidden', !authenticated);
+    this.el('navHome').classList.toggle('active', id === 'dashboardScreen');
+    window.scrollTo(0, 0);
+  },
+
+  restoreSession() {
+    try { this.session = JSON.parse(localStorage.getItem(this.SESSION_KEY) || 'null'); }
+    catch (_) { this.session = null; }
+  },
+  saveSession(data) {
+    this.session = data;
+    localStorage.setItem(this.SESSION_KEY, JSON.stringify(data));
+  },
+  clearSession() {
+    this.session = null;
+    localStorage.removeItem(this.SESSION_KEY);
+  },
+  sessionExpired() {
+    return !this.session?.expires_at || new Date(this.session.expires_at).getTime() <= Date.now();
+  },
+
+  async api(path, options = {}) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), options.timeout || 15000);
+    const headers = {'Accept':'application/json', ...(options.headers || {})};
+    if (options.body && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
+    if (this.session?.token && options.auth !== false) headers.Authorization = `Bearer ${this.session.token}`;
+    try {
+      const response = await fetch(`${this.API_BASE}${path}`, {...options, headers, signal: controller.signal});
+      this.serverReachable = true;
+      this.updateConnectionStatus();
+      let data = {};
+      try { data = await response.json(); } catch (_) { data = {ok:false, message:'Resposta inválida do servidor.'}; }
+      if (response.status === 401 && options.auth !== false) {
+        this.clearSession();
+        this.showScreen('loginScreen');
+        this.toast(data.message || 'Sessão encerrada. Entre novamente.', 'bad');
+      }
+      if (data.code === 'password_change_required') {
+        if (this.session) { this.session.must_change_password = true; this.saveSession(this.session); }
+        this.showScreen('passwordScreen');
+      }
+      if (!response.ok) {
+        const error = new Error(data.message || `Falha HTTP ${response.status}`);
+        error.status = response.status;
+        error.data = data;
+        throw error;
+      }
+      return data;
+    } catch (error) {
+      if (!error.status) {
+        this.serverReachable = false;
+        this.updateConnectionStatus();
+      }
+      throw error;
+    } finally { clearTimeout(timer); }
+  },
+
+  async loadDrivers() {
+    const select = this.el('driverSelect');
+    try {
+      const data = await this.api('/api/v1/driver/all_drivers', {auth:false});
+      select.innerHTML = '<option value="">Selecione seu nome</option>' + data.drivers.map(driver => `<option value="${Number(driver.id)}">${this.escape(driver.name)}</option>`).join('');
+      if (!data.drivers.length) select.innerHTML = '<option value="">Nenhum motorista ativo</option>';
+    } catch (_) {
+      select.innerHTML = '<option value="">Servidor indisponível</option>';
+      this.showError('loginError', 'Não foi possível carregar os motoristas. Verifique a conexão e tente novamente.');
+    }
+  },
+  async login() {
+    const driverId = Number(this.el('driverSelect').value);
+    const password = this.el('passwordInput').value;
+    this.showError('loginError');
+    if (!driverId || !password) return this.showError('loginError', 'Selecione o motorista e informe a senha.');
+    const button = this.el('loginButton');
+    this.setBusy(button, true, 'Entrando…');
+    try {
+      const data = await this.api('/api/v1/driver/login', {method:'POST', auth:false, body:JSON.stringify({driver_id:driverId, password})});
+      this.el('passwordInput').value = '';
+      this.saveSession({token:data.token, expires_at:data.expires_at, driver:data.driver, must_change_password:data.must_change_password});
+      this.el('welcomeName').textContent = `Olá, ${data.driver.name}`;
+      if (data.must_change_password) this.showScreen('passwordScreen');
+      else { this.showScreen('dashboardScreen'); await this.loadRoutes(); this.syncQueue(); }
+    } catch (error) { this.showError('loginError', error.message || 'Falha ao entrar.'); }
+    finally { this.setBusy(button, false); }
+  },
+  async changePassword() {
+    const password = this.el('newPassword').value;
+    const confirmation = this.el('confirmPassword').value;
+    this.showError('passwordError');
+    if (password.trim().length < 8) return this.showError('passwordError', 'Use pelo menos 8 caracteres.');
+    if (password !== confirmation) return this.showError('passwordError', 'As senhas não coincidem.');
+    try {
+      await this.api('/api/v1/driver/change_password', {method:'POST', body:JSON.stringify({new_password:password})});
+      this.session.must_change_password = false;
+      this.saveSession(this.session);
+      this.el('newPassword').value = '';
+      this.el('confirmPassword').value = '';
+      this.toast('Nova senha salva.', 'ok');
+      this.showScreen('dashboardScreen');
+      await this.loadRoutes();
+    } catch (error) { this.showError('passwordError', error.message); }
+  },
+  async logout() {
+    if (!(await this.ask('Sair do aplicativo', 'Os registros offline permanecerão neste aparelho. Deseja encerrar a sessão?', 'Sair'))) return;
+    try { await this.api('/api/v1/driver/logout', {method:'POST', body:'{}'}); } catch (_) {}
+    this.clearSession();
+    this.currentRoute = null;
+    this.showScreen('loginScreen');
+    this.toast('Sessão encerrada.');
+  },
+
+  async loadRoutes() {
+    if (!this.session?.token) return;
+    this.el('welcomeName').textContent = `Olá, ${this.session.driver.name}`;
+    this.el('routesList').innerHTML = '<div class="skeleton"></div><div class="skeleton"></div>';
+    try {
+      const data = await this.api('/api/v1/driver/routes');
+      this.routes = data.routes || [];
+      await this.putSnapshot(`routes:${Number(this.session.driver.id)}`, this.routes);
+      this.renderRoutes();
+    } catch (error) {
+      const cached = error.status === 401 ? null : await this.getSnapshot(`routes:${Number(this.session.driver.id)}`);
+      if (Array.isArray(cached)) {
+        this.routes = cached;
+        this.renderRoutes();
+        this.toast('Exibindo cargas salvas no aparelho.', 'ok');
+      } else {
+        this.el('routesList').innerHTML = `<div class="card empty">${this.escape(error.message || 'Não foi possível carregar suas cargas.')}</div>`;
+      }
+    }
+  },
+  renderRoutes() {
+    const total = this.routes.reduce((sum, route) => sum + Number(route.total_orders || 0), 0);
+    const delivered = this.routes.reduce((sum, route) => sum + Number(route.delivered_orders || 0), 0);
+    const problems = this.routes.reduce((sum, route) => sum + Number(route.problem_orders || 0), 0);
+    const done = delivered + problems;
+    this.el('statRoutes').textContent = this.routes.length;
+    this.el('statStops').textContent = Math.max(0, total - done);
+    this.el('statProgress').textContent = `${total ? Math.round(done * 100 / total) : 0}%`;
+    if (!this.routes.length) {
+      this.el('routesList').innerHTML = '<div class="card empty"><b>Nenhuma carga ativa.</b><br>Quando uma carga for atribuída a você, ela aparecerá aqui.</div>';
+      return;
+    }
+    this.el('routesList').innerHTML = this.routes.map(route => {
+      const totalOrders = Number(route.total_orders || 0);
+      const done = Number(route.delivered_orders || 0) + Number(route.problem_orders || 0);
+      const pct = totalOrders ? Math.round(done * 100 / totalOrders) : 0;
+      const badge = route.status === 'Planejada' ? 'badge-planned' : 'badge-route';
+      return `<article class="card route-card" data-route-id="${Number(route.id)}"><div class="route-top"><div><h3>${this.escape(route.name)}</h3><span class="muted">${this.escape(route.vehicle_name || 'Veículo não informado')} ${route.plate ? `• ${this.escape(route.plate)}` : ''}</span></div><span class="badge ${badge}">${this.escape(route.status)}</span></div><div class="progress"><i style="width:${pct}%"></i></div><div class="route-meta"><span>${done} de ${totalOrders} paradas concluídas</span><b>${pct}%</b></div></article>`;
+    }).join('');
+    this.el('routesList').querySelectorAll('[data-route-id]').forEach(card => card.addEventListener('click', () => this.openRoute(Number(card.dataset.routeId))));
+  },
+
+  async openRoute(routeId) {
+    this.showScreen('routeScreen');
+    this.el('ordersList').innerHTML = '<div class="skeleton"></div><div class="skeleton"></div>';
+    try {
+      const data = await this.api(`/api/v1/driver/route/${routeId}`);
+      this.currentRoute = data.route;
+      await this.putSnapshot(`route:${Number(this.session.driver.id)}:${Number(routeId)}`, this.currentRoute);
+      this.renderRoute();
+    } catch (error) {
+      const cached = error.status === 401 ? null : await this.getSnapshot(`route:${Number(this.session.driver.id)}:${Number(routeId)}`);
+      if (cached) {
+        this.currentRoute = cached;
+        this.renderRoute();
+        this.toast('Exibindo paradas salvas no aparelho.', 'ok');
+      } else {
+        this.el('ordersList').innerHTML = `<div class="card empty">${this.escape(error.message)}</div>`;
+      }
+    }
+  },
+  renderRoute() {
+    const route = this.currentRoute;
+    const orders = route.orders || [];
+    const done = orders.filter(order => ['Acertado','Problema'].includes(order.order_status) || ['Entregue','Com problema'].includes(order.route_order_status)).length;
+    const pending = orders.length - done;
+    const remainingWeight = orders.filter(order => !['Acertado','Problema'].includes(order.order_status)).reduce((sum, order) => sum + Number(order.weight_kg || 0), 0);
+    const pct = orders.length ? Math.round(done * 100 / orders.length) : 0;
+    this.el('routeTitle').textContent = route.name;
+    this.el('routeSubtitle').textContent = `${route.vehicle_name || 'Veículo não informado'}${route.plate ? ` • ${route.plate}` : ''}`;
+    this.el('routeStatus').textContent = route.status;
+    this.el('routeStatus').className = `badge ${route.status === 'Planejada' ? 'badge-planned' : 'badge-route'}`;
+    this.el('routePending').textContent = pending;
+    this.el('routeWeight').textContent = `${remainingWeight.toFixed(1)} kg`;
+    this.el('routeProgress').textContent = `${pct}%`;
+    this.el('startRouteButton').classList.toggle('hidden', route.status !== 'Planejada');
+    this.renderOrders(orders);
+  },
+  renderOrders(orders) {
+    if (!orders.length) { this.el('ordersList').innerHTML = '<div class="card empty">Esta carga não possui pedidos.</div>'; return; }
+    this.el('ordersList').innerHTML = orders.map(order => {
+      const done = order.order_status === 'Acertado' || order.route_order_status === 'Entregue';
+      const problem = order.order_status === 'Problema' || order.route_order_status === 'Com problema';
+      const queued = this.queuedKeys.has(`${Number(this.currentRoute.id)}:${Number(order.order_id)}`);
+      const fullAddress = order.delivery_address || order.client_full_address || `${order.farm_name || ''} ${order.city || ''}`.trim();
+      const phone = String(order.client_phone || '').replace(/\D/g, '');
+      let whatsapp = String(order.client_whatsapp || order.client_phone || '').replace(/\D/g, '');
+      if (whatsapp && !whatsapp.startsWith('55')) whatsapp = `55${whatsapp}`;
+      const mapsFallback = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(fullAddress)}`;
+      const maps = this.safeHttpUrl(order.location_link, mapsFallback);
+      const search = `${order.client_name || ''} ${order.farm_name || ''} ${order.order_number || ''} ${fullAddress}`.toLowerCase();
+      const items = (order.items || []).map(item => `<li>${this.escape(item.product_name)} — ${Number(item.quantity || 0)} ${this.escape(item.unit || 'un')} (${Number(item.weight_kg || 0).toFixed(1)} kg)</li>`).join('');
+      const badge = queued ? '<span class="badge badge-planned">Aguardando sincronização</span>' : problem ? '<span class="badge badge-problem">Com problema</span>' : done ? '<span class="badge badge-ok">Entregue</span>' : '<span class="badge badge-planned">Pendente</span>';
+      return `<article class="card order-card ${done ? 'done' : ''} ${problem ? 'problem' : ''}" data-search="${this.escape(search)}"><div class="order-top"><div><h3>Pedido ${this.escape(order.order_number)}</h3><b>${this.escape(order.client_name || 'Cliente')}</b></div>${badge}</div><div class="address">📍 ${this.escape(fullAddress || 'Endereço não informado')}<br>${order.reference_point ? `Referência: ${this.escape(order.reference_point)}` : ''}</div><div class="contact-row">${phone ? `<a class="btn btn-secondary btn-small" href="tel:${phone}">📞 Ligar</a>` : ''}${whatsapp ? `<a class="btn btn-secondary btn-small" href="https://wa.me/${whatsapp}" target="_blank" rel="noopener">WhatsApp</a>` : ''}<a class="btn btn-secondary btn-small" href="${this.escape(maps)}" target="_blank" rel="noopener">🗺️ Abrir mapa</a></div>${items ? `<details class="items"><summary>Ver produtos (${order.items.length})</summary><ul>${items}</ul></details>` : ''}<div class="order-actions">${!queued && !done && !problem && this.currentRoute.status === 'Em rota' ? `<button class="btn btn-primary" data-order-id="${Number(order.order_id)}">Finalizar esta parada</button>` : ''}</div></article>`;
+    }).join('');
+    this.el('ordersList').querySelectorAll('[data-order-id]').forEach(button => button.addEventListener('click', () => this.openDelivery(Number(button.dataset.orderId))));
+  },
+  filterOrders() {
+    const term = this.el('orderSearch').value.toLowerCase().trim();
+    this.el('ordersList').querySelectorAll('[data-search]').forEach(card => { card.style.display = !term || card.dataset.search.includes(term) ? '' : 'none'; });
+  },
+  async startRoute() {
+    if (!this.currentRoute || !(await this.ask('Registrar saída', 'A carga e seus pedidos passarão para “Em rota / Saiu para entrega”.', 'Registrar saída'))) return;
+    const button = this.el('startRouteButton');
+    this.setBusy(button, true, 'Registrando…');
+    try {
+      await this.api('/api/v1/driver/start_route', {method:'POST', body:JSON.stringify({route_id:this.currentRoute.id})});
+      this.toast('Saída da carga registrada.', 'ok');
+      await this.openRoute(this.currentRoute.id);
+    } catch (error) { this.toast(error.message, 'bad'); }
+    finally { this.setBusy(button, false); }
+  },
+
+  openDelivery(orderId) {
+    this.selectedOrder = (this.currentRoute?.orders || []).find(order => Number(order.order_id) === orderId);
+    if (!this.selectedOrder) return;
+    this.photoData = '';
+    this.signatureData = '';
+    this.signatureDirty = false;
+    this.el('deliveryTitle').textContent = `Pedido ${this.selectedOrder.order_number}`;
+    ['deliveredTo','deliveredDocument','deliveryNotes','problemNotes'].forEach(id => { this.el(id).value = ''; });
+    this.el('problemType').selectedIndex = 0;
+    this.removePhoto();
+    this.el('signatureStatus').textContent = 'Assinatura ainda não coletada.';
+    this.el('deliveryDialog').showModal();
+  },
+  async processPhoto(event) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      this.removePhoto();
+      return this.toast('Selecione uma imagem válida.', 'bad');
+    }
+    try {
+      const source = await createImageBitmap(file);
+      const max = 1600;
+      const scale = Math.min(1, max / Math.max(source.width, source.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(source.width * scale));
+      canvas.height = Math.max(1, Math.round(source.height * scale));
+      canvas.getContext('2d').drawImage(source, 0, 0, canvas.width, canvas.height);
+      source.close?.();
+      this.photoData = canvas.toDataURL('image/jpeg', 0.8);
+      const bytes = Math.round(this.photoData.length * 0.75);
+      this.el('photoPreview').src = this.photoData;
+      this.el('photoPreview').classList.remove('hidden');
+      this.el('removePhoto').classList.remove('hidden');
+      this.el('photoQuality').textContent = `Foto pronta: ${canvas.width}×${canvas.height}, aproximadamente ${(bytes / 1024).toFixed(0)} KB.`;
+    } catch (_) {
+      this.removePhoto();
+      this.toast('Não foi possível processar a foto. Tente novamente.', 'bad');
+    }
+  },
+  removePhoto() {
+    this.photoData = '';
+    this.el('photoInput').value = '';
+    this.el('photoPreview').src = '';
+    this.el('photoPreview').classList.add('hidden');
+    this.el('removePhoto').classList.add('hidden');
+    this.el('photoQuality').textContent = '';
+  },
+
+  openSignature() {
+    this.el('signatureDialog').showModal();
+    requestAnimationFrame(() => { this.resizeSignatureCanvas(false); this.bindCanvas(); });
+  },
+  bindCanvas() {
+    const canvas = this.el('signatureCanvas');
+    if (canvas.dataset.bound) return;
+    canvas.dataset.bound = '1';
+    const position = event => {
+      const rect = canvas.getBoundingClientRect();
+      return {x:(event.clientX - rect.left) * canvas.width / rect.width, y:(event.clientY - rect.top) * canvas.height / rect.height};
+    };
+    canvas.addEventListener('pointerdown', event => { this.drawing = true; canvas.setPointerCapture(event.pointerId); const p=position(event); const ctx=canvas.getContext('2d'); ctx.beginPath(); ctx.moveTo(p.x,p.y); event.preventDefault(); });
+    canvas.addEventListener('pointermove', event => { if (!this.drawing) return; const p=position(event); const ctx=canvas.getContext('2d'); ctx.lineTo(p.x,p.y); ctx.stroke(); this.signatureDirty=true; event.preventDefault(); });
+    ['pointerup','pointercancel','pointerleave'].forEach(name => canvas.addEventListener(name, () => { this.drawing=false; }));
+  },
+  resizeSignatureCanvas(preserve) {
+    const canvas = this.el('signatureCanvas');
+    const saved = preserve && this.signatureDirty && canvas.width ? canvas.toDataURL('image/png') : this.signatureData;
+    const rect = canvas.getBoundingClientRect();
+    const ratio = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = Math.max(300, Math.round(rect.width * ratio));
+    canvas.height = Math.max(180, Math.round(rect.height * ratio));
+    const ctx = canvas.getContext('2d');
+    ctx.lineWidth = 3 * ratio;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = '#111';
+    if (saved) { const image = new Image(); image.onload = () => ctx.drawImage(image,0,0,canvas.width,canvas.height); image.src = saved; this.signatureDirty=true; }
+  },
+  clearSignature() {
+    const canvas = this.el('signatureCanvas');
+    canvas.getContext('2d').clearRect(0,0,canvas.width,canvas.height);
+    this.signatureDirty = false;
+    this.signatureData = '';
+  },
+  closeSignature(save) {
+    if (save) {
+      if (!this.signatureDirty) return this.toast('Peça ao recebedor para assinar antes de continuar.', 'bad');
+      this.signatureData = this.el('signatureCanvas').toDataURL('image/png');
+      this.el('signatureStatus').textContent = '✅ Assinatura coletada e pronta para envio.';
+    }
+    this.el('signatureDialog').close();
+  },
+
+  buildPayload(isProblem) {
+    return {
+      idempotency_key: this.uuid(),
+      order_id: this.selectedOrder.order_id,
+      route_id: this.currentRoute.id,
+      delivered_to: this.el('deliveredTo').value.trim(),
+      delivered_document: this.el('deliveredDocument').value.trim(),
+      final_notes: isProblem ? this.el('problemNotes').value.trim() : this.el('deliveryNotes').value.trim(),
+      receipt_photo: isProblem ? '' : this.photoData,
+      digital_signature: isProblem ? '' : this.signatureData,
+      is_problem: isProblem,
+      problem_type: this.el('problemType').value,
+    };
+  },
+  async submitOperation(isProblem) {
+    if (!this.selectedOrder || !this.currentRoute) return;
+    if (this.operationInProgress) return this.toast('Já existe uma confirmação em andamento. Aguarde.');
+    if (!isProblem && !this.photoData && !this.signatureData) return this.toast('Inclua uma foto ou assinatura.', 'bad');
+    if (isProblem && !this.el('problemNotes').value.trim()) return this.toast('Descreva o problema antes de registrar.', 'bad');
+    const button = isProblem ? this.el('submitProblem') : this.el('submitDelivery');
+    this.operationInProgress = true;
+    try {
+      if (await this.hasUnresolvedOperation(this.currentRoute.id, this.selectedOrder.order_id)) {
+        return this.toast('Este pedido já possui um registro aguardando sincronização.', 'bad');
+      }
+      const title = isProblem ? 'Registrar problema' : 'Confirmar entrega';
+      const message = isProblem ? 'O pedido ficará com problema. Confirma o registro?' : 'Confirma que a mercadoria foi entregue ao recebedor?';
+      if (!(await this.ask(title, message, 'Confirmar'))) return;
+      const payload = this.buildPayload(isProblem);
+      this.setBusy(button, true, 'Processando…');
+      this.el(isProblem ? 'submitDelivery' : 'submitProblem').disabled = true;
+      if (!navigator.onLine) {
+        await this.enqueue(payload);
+        this.el('deliveryDialog').close();
+        this.toast('Registro salvo no aparelho. Será enviado quando a conexão voltar.', 'ok');
+        return;
+      }
+      try {
+        const result = await this.api('/api/v1/driver/deliver', {method:'POST', headers:{'Idempotency-Key':payload.idempotency_key}, body:JSON.stringify(payload), timeout:30000});
+        this.el('deliveryDialog').close();
+        this.toast(result.message, 'ok');
+        if (result.route_status === 'Acertada' || result.route_status === 'Com problema') { this.showScreen('dashboardScreen'); await this.loadRoutes(); }
+        else await this.openRoute(this.currentRoute.id);
+      } catch (error) {
+        if (!error.status || error.status >= 500 || error.status === 429) {
+          await this.enqueue(payload, error.message);
+          this.el('deliveryDialog').close();
+          this.toast('Servidor indisponível. Registro guardado para reenvio automático.', 'ok');
+        } else throw error;
+      }
+    } catch (error) { this.toast(error.message || 'Não foi possível concluir.', 'bad'); }
+    finally {
+      this.operationInProgress = false;
+      this.setBusy(button, false);
+      this.el(isProblem ? 'submitDelivery' : 'submitProblem').disabled = false;
+      await this.updateQueueCounters();
+    }
+  },
+
+  openDatabase() {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(this.DB_NAME, this.DB_VERSION);
+      request.onupgradeneeded = event => {
+        const db = event.target.result;
+        const upgradeTransaction = event.target.transaction;
+        const store = db.objectStoreNames.contains('operations')
+          ? upgradeTransaction.objectStore('operations')
+          : db.createObjectStore('operations', {keyPath:'id'});
+        if (!store.indexNames.contains('idempotency_key')) store.createIndex('idempotency_key', 'idempotency_key', {unique:true});
+        if (!store.indexNames.contains('status')) store.createIndex('status', 'status');
+        if (!store.indexNames.contains('next_retry_at')) store.createIndex('next_retry_at', 'next_retry_at');
+        if (!db.objectStoreNames.contains('snapshots')) db.createObjectStore('snapshots', {keyPath:'key'});
+      };
+      request.onsuccess = () => {
+        this.db = request.result;
+        this.db.onversionchange = () => this.db.close();
+        resolve();
+      };
+      request.onerror = () => reject(request.error);
+      request.onblocked = () => reject(new Error('Atualização do armazenamento bloqueada por outra janela.'));
+    });
+  },
+  tx(mode = 'readonly') { return this.db.transaction('operations', mode).objectStore('operations'); },
+  dbRequest(request) { return new Promise((resolve,reject) => { request.onsuccess=()=>resolve(request.result); request.onerror=()=>reject(request.error); }); },
+  async enqueue(payload, error = '') {
+    if (await this.hasUnresolvedOperation(payload.route_id, payload.order_id)) return false;
+    const record = {
+      id: this.uuid(), idempotency_key: payload.idempotency_key,
+      order_id: payload.order_id, route_id: payload.route_id,
+      owner_driver_id: Number(this.session?.driver?.id || 0),
+      created_at: new Date().toISOString(), attempts: 0,
+      next_retry_at: Date.now(), status: 'pending', last_error: error, payload,
+    };
+    try { await this.dbRequest(this.tx('readwrite').add(record)); }
+    catch (dbError) { if (dbError.name !== 'ConstraintError') throw dbError; }
+    await this.updateQueueCounters();
+    if (this.currentRoute && Number(this.currentRoute.id) === Number(payload.route_id)) this.renderRoute();
+    return true;
+  },
+  async allOperations() { return this.dbRequest(this.tx().getAll()); },
+  async putOperation(record) { return this.dbRequest(this.tx('readwrite').put(record)); },
+  async getSnapshot(key) {
+    if (!this.db) return null;
+    const row = await this.dbRequest(this.db.transaction('snapshots').objectStore('snapshots').get(key));
+    return row?.value ?? null;
+  },
+  async putSnapshot(key, value) {
+    if (!this.db) return;
+    await this.dbRequest(this.db.transaction('snapshots', 'readwrite').objectStore('snapshots').put({key, value, saved_at:new Date().toISOString()}));
+  },
+  async hasUnresolvedOperation(routeId, orderId) {
+    if (!this.db) return false;
+    const owner = Number(this.session?.driver?.id || 0);
+    return (await this.allOperations()).some(row =>
+      Number(row.route_id) === Number(routeId) && Number(row.order_id) === Number(orderId) &&
+      ['pending','syncing','failed'].includes(row.status) &&
+      (!Number(row.owner_driver_id || 0) || Number(row.owner_driver_id) === owner)
+    );
+  },
+  async recoverInterruptedOperations() {
+    if (!this.db) return;
+    const records = await this.allOperations();
+    for (const record of records.filter(row => row.status === 'syncing')) {
+      record.status = 'pending';
+      record.next_retry_at = Date.now();
+      record.last_error = 'Envio interrompido pelo fechamento do aplicativo; será reenviado com a mesma chave.';
+      await this.putOperation(record);
+    }
+  },
+  async updateQueueCounters() {
+    if (!this.db) return;
+    const owner = Number(this.session?.driver?.id || 0);
+    const records = (await this.allOperations()).filter(row =>
+      owner && (!Number(row.owner_driver_id || 0) || Number(row.owner_driver_id) === owner)
+    );
+    this.queuedKeys = new Set(
+      records.filter(row => ['pending','syncing','failed'].includes(row.status))
+        .map(row => `${Number(row.route_id)}:${Number(row.order_id)}`)
+    );
+    this.el('queuePending').textContent = records.filter(row => ['pending','syncing'].includes(row.status)).length;
+    this.el('queueSent').textContent = records.filter(row => row.status === 'sent').length;
+    this.el('queueFailed').textContent = records.filter(row => row.status === 'failed').length;
+  },
+  async cleanupSentOperations() {
+    if (!this.db) return;
+    const cutoff = Date.now() - 7 * 86400000;
+    const records = await this.allOperations();
+    const store = this.tx('readwrite');
+    records.filter(row => row.status === 'sent' && new Date(row.sent_at || row.created_at).getTime() < cutoff).forEach(row => store.delete(row.id));
+  },
+  async syncQueue(manual = false) {
+    if (this.syncInProgress) {
+      if (manual) this.toast('A sincronização já está em andamento.');
+      return;
+    }
+    if (!this.db || !navigator.onLine || !this.session?.token || this.session.must_change_password) {
+      if (manual) this.toast('Não é possível sincronizar agora. Verifique a conexão e o login.');
+      return;
+    }
+    this.syncInProgress = true;
+    try {
+      const now = Date.now();
+      const owner = Number(this.session.driver?.id || 0);
+      const records = (await this.allOperations()).filter(row =>
+        (row.status === 'pending' || (manual && row.status === 'failed')) &&
+        Number(row.next_retry_at || 0) <= now &&
+        (!Number(row.owner_driver_id || 0) || Number(row.owner_driver_id) === owner)
+      );
+      if (!records.length) { if (manual) this.toast('Nenhum registro pronto para sincronizar.'); await this.updateQueueCounters(); return; }
+      let sentNow = 0;
+      for (const record of records) {
+      record.status = 'syncing';
+      await this.putOperation(record);
+      try {
+        await this.api('/api/v1/driver/deliver', {method:'POST', headers:{'Idempotency-Key':record.idempotency_key}, body:JSON.stringify(record.payload), timeout:30000});
+        record.status = 'sent';
+        sentNow += 1;
+        record.sent_at = new Date().toISOString();
+        record.last_error = '';
+        record.payload = null;
+      } catch (error) {
+        record.attempts = Number(record.attempts || 0) + 1;
+        record.last_error = String(error.message || 'Falha de sincronização').slice(0,500);
+        const code = String(error.data?.code || '');
+        const retryable = !error.status || error.status >= 500 || error.status === 429 ||
+          error.status === 401 || code === 'password_change_required' || code === 'operation_in_progress';
+        record.status = retryable ? 'pending' : 'failed';
+        const delay = Math.min(30 * 60 * 1000, 15000 * (2 ** Math.min(record.attempts, 7)));
+        record.next_retry_at = retryable ? Date.now() + delay : 0;
+      }
+      await this.putOperation(record);
+      await this.updateQueueCounters();
+      }
+      const after = (await this.allOperations()).filter(row =>
+        !Number(row.owner_driver_id || 0) || Number(row.owner_driver_id) === owner
+      );
+      const failed = after.filter(row => row.status === 'failed').length;
+      const pending = after.filter(row => row.status === 'pending').length;
+      if (failed) this.toast(`${failed} registro(s) exigem revisão. Toque em Sincronizar para tentar novamente.`, 'bad');
+      else if (pending) this.toast(`${pending} registro(s) aguardam nova tentativa automática.`);
+      else this.toast('Sincronização concluída.', 'ok');
+      if (sentNow > 0) {
+        if (this.currentRoute && !this.el('routeScreen').classList.contains('hidden')) await this.openRoute(this.currentRoute.id);
+        else await this.loadRoutes();
+      }
+    } finally {
+      this.syncInProgress = false;
+    }
+  },
 };
 
-window.addEventListener('DOMContentLoaded', () => DriverApp.init());
+window.addEventListener('DOMContentLoaded', () => DriverApp.init().catch(error => {
+  console.error('Falha ao iniciar aplicativo', error);
+  document.body.insertAdjacentHTML('beforeend', '<div class="error-box" style="position:fixed;inset:auto 12px 100px;z-index:99">Não foi possível iniciar o armazenamento offline. Reinicie o aplicativo.</div>');
+  const boxes = document.querySelectorAll('.error-box');
+  const box = boxes[boxes.length - 1];
+  if (box && error?.name) box.textContent += ` (${error.name})`;
+}));

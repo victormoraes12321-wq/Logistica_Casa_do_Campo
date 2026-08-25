@@ -16,14 +16,37 @@ from unittest.mock import MagicMock, patch, PropertyMock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 
-class TestErpConfig(unittest.TestCase):
-    """Testa a leitura de configuração do ERP via variáveis de ambiente."""
+class _IsolatedErpConfigTestCase(unittest.TestCase):
+    """Isola cada teste das credenciais reais e do leitor global do app."""
 
     def setUp(self):
-        # Limpa o cache de configuração entre testes
         import app_core.erp_connector as mod
+
+        self._saved_erp_env = {
+            key: value for key, value in os.environ.items() if key.startswith("ERP_")
+        }
+        for key in self._saved_erp_env:
+            os.environ.pop(key, None)
+        self._saved_db_reader = mod._DB_SETTINGS_READER
+        mod._DB_SETTINGS_READER = None
         with mod._config_lock:
             mod._cfg = None
+            mod._cfg_loaded_at = 0.0
+
+    def tearDown(self):
+        import app_core.erp_connector as mod
+
+        for key in [key for key in os.environ if key.startswith("ERP_")]:
+            os.environ.pop(key, None)
+        os.environ.update(self._saved_erp_env)
+        mod._DB_SETTINGS_READER = self._saved_db_reader
+        with mod._config_lock:
+            mod._cfg = None
+            mod._cfg_loaded_at = 0.0
+
+
+class TestErpConfig(_IsolatedErpConfigTestCase):
+    """Testa a leitura de configuração do ERP via variáveis de ambiente."""
 
     def test_disabled_by_default(self):
         """ERP_ENABLED deve ser False por padrão (seguro para deploy)."""
@@ -133,7 +156,7 @@ class TestErpConfig(unittest.TestCase):
             self.assertEqual(cfg.port, 1433)
 
 
-class TestLookupOrderDisabled(unittest.TestCase):
+class TestLookupOrderDisabled(_IsolatedErpConfigTestCase):
     """Testa que lookup retorna None quando ERP está desabilitado."""
 
     def test_lookup_returns_none_when_disabled(self):
@@ -165,7 +188,7 @@ class TestLookupOrderDisabled(unittest.TestCase):
             self.assertIsNone(result)
 
 
-class TestCheckConnectivityDisabled(unittest.TestCase):
+class TestCheckConnectivityDisabled(_IsolatedErpConfigTestCase):
     """Testa check_connectivity quando ERP está desabilitado."""
 
     def test_returns_not_ok_when_disabled(self):

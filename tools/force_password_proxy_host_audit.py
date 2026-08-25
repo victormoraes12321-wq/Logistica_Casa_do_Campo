@@ -203,6 +203,7 @@ def main() -> int:
             proc.kill()
         except Exception:
             pass
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 if __name__ == "__main__":
