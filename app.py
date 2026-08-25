@@ -945,6 +945,12 @@ def ensure_schema_migrations(db):
     ensure_column(db, 'delivery_receipts', 'delivered_to', 'delivered_to TEXT')
     ensure_column(db, 'delivery_receipts', 'delivered_document', 'delivered_document TEXT')
     ensure_column(db, 'delivery_receipts', 'notes', 'notes TEXT')
+    ensure_column(db, 'delivery_receipts', 'latitude', 'latitude REAL')
+    ensure_column(db, 'delivery_receipts', 'longitude', 'longitude REAL')
+    ensure_column(db, 'delivery_receipts', 'delivery_location_link', 'delivery_location_link TEXT')
+    ensure_column(db, 'orders', 'delivery_latitude', 'delivery_latitude REAL')
+    ensure_column(db, 'orders', 'delivery_longitude', 'delivery_longitude REAL')
+    ensure_column(db, 'orders', 'delivery_location_link', 'delivery_location_link TEXT')
     ensure_column(db, 'delivery_problems', 'route_id', 'route_id INTEGER')
     ensure_column(db, 'routes', 'status', 'status TEXT DEFAULT "Planejada"')
     ensure_column(db, 'routes', 'route_name', 'route_name TEXT')
@@ -3760,9 +3766,15 @@ document.addEventListener('DOMContentLoaded', function(){
         r_delivered_at = r['delivered_at'] if 'delivered_at' in r.keys() else None
         r_final_notes = r['final_notes'] if 'final_notes' in r.keys() else None
 
+        lat = receipt['latitude'] if (receipt and 'latitude' in receipt.keys() and receipt['latitude']) else (r['delivery_latitude'] if 'delivery_latitude' in r.keys() else None)
+        lng = receipt['longitude'] if (receipt and 'longitude' in receipt.keys() and receipt['longitude']) else (r['delivery_longitude'] if 'delivery_longitude' in r.keys() else None)
+        loc_link = receipt['delivery_location_link'] if (receipt and 'delivery_location_link' in receipt.keys() and receipt['delivery_location_link']) else (r['delivery_location_link'] if 'delivery_location_link' in r.keys() else None)
+        if not loc_link and lat is not None and lng is not None:
+            loc_link = f"https://www.google.com/maps?q={lat:.6f},{lng:.6f}"
+
         has_receipt_photo = bool(receipt and receipt['image_data']) or bool(r_receipt_photo)
         has_signature = bool(receipt and receipt['digital_signature'])
-        if has_receipt_photo or has_signature or r_delivered_to:
+        if has_receipt_photo or has_signature or r_delivered_to or loc_link:
             rec_to = esc(receipt['delivered_to'] if receipt and receipt['delivered_to'] else (r_delivered_to or '—'))
             rec_doc = esc(receipt['delivered_document'] if receipt and receipt['delivered_document'] else (r_delivered_doc or ''))
             rec_date = brdate(receipt['created_at']) if receipt and receipt['created_at'] else brdate(r_delivered_at)
@@ -3782,12 +3794,15 @@ document.addEventListener('DOMContentLoaded', function(){
                 </a>
             </div>''' if has_signature else ''
 
+            gps_html = f'''<p><b>Localização GPS</b><a href="{esc(loc_link)}" target="_blank" class="btn small ghost" style="color:#0369a1; border-color:#0369a1; font-weight:700; display:inline-flex; align-items:center; gap:4px;">🌐 Ver no Google Maps ({lat:.4f}, {lng:.4f})</a></p>''' if (loc_link and lat is not None and lng is not None) else (f'''<p><b>Localização GPS</b><a href="{esc(loc_link)}" target="_blank" class="btn small ghost" style="color:#0369a1; border-color:#0369a1; font-weight:700; display:inline-flex; align-items:center; gap:4px;">🌐 Abrir Mapa no Google Maps</a></p>''' if loc_link else '<p><b>Localização GPS</b><span class="muted">Não capturada</span></p>')
+
             receipt_panel = f'''<section class="panel" style="border-left:5px solid #10b981;">
                 <h2 style="color:#065f46;">📷 Comprovante e Assinatura da Entrega (App do Motorista)</h2>
                 <div class="info-grid">
                     <p><b>Recebido por</b>{rec_to} {f"({rec_doc})" if rec_doc else ""}</p>
                     <p><b>Data Registro</b>{rec_date}</p>
                     <p><b>Observação Motorista</b>{rec_notes}</p>
+                    {gps_html}
                 </div>
                 <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:14px;">
                     {photo_html}
@@ -4679,7 +4694,12 @@ document.addEventListener('DOMContentLoaded', function(){
         with conn() as db:
             r=db.execute("SELECT r.*,d.name driver,v.name vehicle,v.plate FROM routes r LEFT JOIN drivers d ON d.id=r.driver_id LEFT JOIN vehicles v ON v.id=r.vehicle_id WHERE r.id=?",(rid,)).fetchone()
             target_route = str(r['route_name'] or '').strip() if r else ''
-            ros=db.execute("SELECT ro.*,o.order_number,o.seller_name,o.status,o.weight_kg,o.city,o.route_name,o.expected_delivery_date,o.receipt_photo,c.name client, (SELECT COUNT(*) FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.image_data IS NOT NULL) has_photo, (SELECT COUNT(*) FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.digital_signature IS NOT NULL) has_sig FROM route_orders ro JOIN orders o ON o.id=ro.order_id LEFT JOIN clients c ON c.id=o.client_id WHERE ro.route_id=? ORDER BY ro.delivery_order,ro.id",(rid,)).fetchall()
+            ros=db.execute("""SELECT ro.*,o.order_number,o.seller_name,o.status,o.weight_kg,o.city,o.route_name,
+                                     o.expected_delivery_date,o.receipt_photo,o.delivery_location_link,c.name client,
+                                     (SELECT COUNT(*) FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.image_data IS NOT NULL) has_photo,
+                                     (SELECT COUNT(*) FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.digital_signature IS NOT NULL) has_sig,
+                                     (SELECT delivery_location_link FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.delivery_location_link IS NOT NULL AND dr.delivery_location_link!='' LIMIT 1) dr_loc_link
+                              FROM route_orders ro JOIN orders o ON o.id=ro.order_id LEFT JOIN clients c ON c.id=o.client_id WHERE ro.route_id=? ORDER BY ro.delivery_order,ro.id""",(rid,)).fetchall()
             if target_route.lower().strip() == 'mista':
                 available=db.execute("""SELECT o.id,o.order_number,o.seller_name,c.name client,o.city,o.route_name,o.weight_kg
                                         FROM orders o
@@ -4719,7 +4739,7 @@ document.addEventListener('DOMContentLoaded', function(){
         can_settle_routes = self.has_perm(u,'settle_routes')
         settlement_link = f"<a class='btn small ghost' href='/load-settlement?q={quote(r['name'])}'>Acerto da carga</a>" if can_settle_routes else "<span class='muted'>Sem permissão para acerto</span>"
         pct=(float(r['total_weight'] or 0)/float(r['capacity'] or 1))*100
-        rows=''.join(f"""<tr><td><input form='seqForm' type='number' name='seq_{ro['id']}' value='{ro['delivery_order']}' class='seq' {'readonly' if not can_edit else ''}></td><td><a href='/orders/{ro['order_id']}'><b>{esc(ro['order_number'])}</b></a><br><small>{esc(ro['client'] or '')} · Vendedor: {esc(ro['seller_name'] or 'Não informado')}</small></td><td>{esc(ro['city'] or '')}<br><small>{esc(ro['route_name'] or '')}</small></td><td>{badge(ro['status'])}{f'<br><a href="/orders/{ro["order_id"]}/receipt-image" target="_blank" class="btn small ghost" style="color:#059669; border-color:#059669; padding:1px 4px; font-size:0.75rem; margin-top:3px; display:inline-block;">📷 Canhoto</a>' if (ro['has_photo'] or ro['receipt_photo']) else ''}{f'<a href="/orders/{ro["order_id"]}/signature-image" target="_blank" class="btn small ghost" style="color:#0284c7; border-color:#0284c7; padding:1px 4px; font-size:0.75rem; margin-top:3px; display:inline-block;">✍️ Assinatura</a>' if ro['has_sig'] else ''}</td><td>{deadline_pill(ro['expected_delivery_date'],ro['status'])}</td><td>{fmt_num(ro['weight_kg'])} kg</td><td><div class='route-actions'>{f"<form method='post' action='/routes/{rid}/remove/{ro['id']}' class='inline-mini'><button class='danger-btn'>Remover</button></form>" if can_edit else "<span class='muted'>Carga finalizada</span>"}</div></td></tr>""" for ro in ros)
+        rows=''.join(f"""<tr><td><input form='seqForm' type='number' name='seq_{ro['id']}' value='{ro['delivery_order']}' class='seq' {'readonly' if not can_edit else ''}></td><td><a href='/orders/{ro['order_id']}'><b>{esc(ro['order_number'])}</b></a><br><small>{esc(ro['client'] or '')} · Vendedor: {esc(ro['seller_name'] or 'Não informado')}</small></td><td>{esc(ro['city'] or '')}<br><small>{esc(ro['route_name'] or '')}</small></td><td>{badge(ro['status'])}{f'<br><a href="/orders/{ro["order_id"]}/receipt-image" target="_blank" class="btn small ghost" style="color:#059669; border-color:#059669; padding:1px 4px; font-size:0.75rem; margin-top:3px; display:inline-block;">📷 Canhoto</a>' if (ro['has_photo'] or ro['receipt_photo']) else ''}{f'<a href="/orders/{ro["order_id"]}/signature-image" target="_blank" class="btn small ghost" style="color:#0284c7; border-color:#0284c7; padding:1px 4px; font-size:0.75rem; margin-top:3px; display:inline-block;">✍️ Assinatura</a>' if ro['has_sig'] else ''}{f'<br><a href="{esc(ro["dr_loc_link"] or ro["delivery_location_link"])}" target="_blank" class="btn small ghost" style="color:#0369a1; border-color:#0369a1; padding:1px 4px; font-size:0.75rem; margin-top:3px; display:inline-block;">📍 Mapa</a>' if (("dr_loc_link" in ro.keys() and ro["dr_loc_link"]) or ("delivery_location_link" in ro.keys() and ro["delivery_location_link"])) else ""}</td><td>{deadline_pill(ro['expected_delivery_date'],ro['status'])}</td><td>{fmt_num(ro['weight_kg'])} kg</td><td><div class='route-actions'>{f"<form method='post' action='/routes/{rid}/remove/{ro['id']}' class='inline-mini'><button class='danger-btn'>Remover</button></form>" if can_edit else "<span class='muted'>Carga finalizada</span>"}</div></td></tr>""" for ro in ros)
         add_opts=''.join(f"<option value='{a['id']}'>{esc(a['order_number'])} - {esc(a['client'] or '')} - Vendedor: {esc(a['seller_name'] or 'Não informado')} - {esc(a['city'] or '')} - {fmt_num(a['weight_kg'])}kg</option>" for a in available)
         lock_notice = '<div class="alert info">Carga finalizada: edição de pedidos e sequência está bloqueada para preservar o histórico.</div>' if not can_edit else ''
         dispatch_action = f"<form method='post' action='/routes/{rid}/dispatch'><button>1. Marcar saída</button></form>" if can_dispatch else "<span class='muted'>Saída já registrada</span>"
@@ -4952,7 +4972,13 @@ document.addEventListener('DOMContentLoaded', function(){
                             ORDER BY r.id DESC LIMIT 1""",(q,q,f'%{q}%')).fetchone()
             if not r:
                 return self.send_html(layout(u,'Acerto de carga',search_box+'<div class="alert danger">Carga não encontrada. Confira o código/nome e tente novamente.</div>','Fechamento operacional da carga e baixa final das entregas'))
-            rows=db.execute("""SELECT ro.*,o.id order_id,o.order_number,o.seller_name,o.status,o.weight_kg,o.total_value,o.payment_method,o.delivered_at,o.final_notes,o.city,o.route_name,o.receipt_photo,c.name client,c.farm_name, (SELECT COUNT(*) FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.image_data IS NOT NULL) has_photo, (SELECT COUNT(*) FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.digital_signature IS NOT NULL) has_sig FROM route_orders ro JOIN orders o ON o.id=ro.order_id LEFT JOIN clients c ON c.id=o.client_id WHERE ro.route_id=? ORDER BY ro.delivery_order,ro.id""",(r['id'],)).fetchall()
+            rows=db.execute("""SELECT ro.*,o.id order_id,o.order_number,o.seller_name,o.status,o.weight_kg,o.total_value,
+                                      o.payment_method,o.delivered_at,o.final_notes,o.city,o.route_name,o.receipt_photo,
+                                      o.delivery_location_link,c.name client,c.farm_name,
+                                      (SELECT COUNT(*) FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.image_data IS NOT NULL) has_photo,
+                                      (SELECT COUNT(*) FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.digital_signature IS NOT NULL) has_sig,
+                                      (SELECT delivery_location_link FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.delivery_location_link IS NOT NULL AND dr.delivery_location_link!='' LIMIT 1) dr_loc_link
+                               FROM route_orders ro JOIN orders o ON o.id=ro.order_id LEFT JOIN clients c ON c.id=o.client_id WHERE ro.route_id=? ORDER BY ro.delivery_order,ro.id""",(r['id'],)).fetchall()
         route_status = normalize_route_status(r['status'])
         if not rows:
             body='<div class="empty">Esta carga não possui pedidos vinculados.</div>'
@@ -4961,7 +4987,9 @@ document.addEventListener('DOMContentLoaded', function(){
             for ro in rows:
                 photo_btn = f"<a class='btn small ghost' style='color:#059669; border-color:#059669; font-weight:700;' href='/orders/{ro['order_id']}/receipt-image' target='_blank'>📷 Ver Foto do Canhoto</a>" if (ro['has_photo'] or ro['receipt_photo']) else ""
                 sig_btn = f"<a class='btn small ghost' style='color:#0284c7; border-color:#0284c7; font-weight:700;' href='/orders/{ro['order_id']}/signature-image' target='_blank'>✍️ Ver Assinatura Digital</a>" if ro['has_sig'] else ""
-                btns_html = f"<div class='full' style='display:flex;gap:10px;margin-top:6px;'>{photo_btn}{sig_btn}</div>" if (photo_btn or sig_btn) else ""
+                loc_url = ro['dr_loc_link'] if ('dr_loc_link' in ro.keys() and ro['dr_loc_link']) else (ro['delivery_location_link'] if 'delivery_location_link' in ro.keys() else None)
+                map_btn = f"<a class='btn small ghost' style='color:#0369a1; border-color:#0369a1; font-weight:700;' href='{esc(loc_url)}' target='_blank'>🌐 Ver Mapa no Google Maps</a>" if loc_url else ""
+                btns_html = f"<div class='full' style='display:flex;gap:10px;margin-top:6px;flex-wrap:wrap;'>{photo_btn}{sig_btn}{map_btn}</div>" if (photo_btn or sig_btn or map_btn) else ""
                 cards_list.append(
                     f"<article class='settlement-order'><div class='settlement-main'><div><b>{esc(ro['order_number'])}</b><small>{esc(ro['client'] or '')} · {esc(ro['city'] or '')} · Vendedor: {esc(ro['seller_name'] or 'Não informado')} · {fmt_num(ro['weight_kg'])} kg · {money_visible(can_view_financial, ro['total_value'])}</small></div>{badge(ro['status'])}</div><div class='settlement-fields'><label>Método pagamento<input value='{esc(ro['payment_method'] or 'Não informado')}' readonly></label><label>Data entrega/ocorrência<input value='{esc(brdate(ro['delivered_at']))}' readonly></label><label class='full'>Observação final<textarea readonly>{esc(ro['final_notes'] or 'Sem observação')}</textarea></label>{btns_html}</div></article>"
                 )
@@ -4973,7 +5001,9 @@ document.addEventListener('DOMContentLoaded', function(){
                 delivered_date=(ro['delivered_at'] or today())[:10]
                 photo_btn = f"<a class='btn small ghost' style='color:#059669; border-color:#059669; font-weight:700;' href='/orders/{ro['order_id']}/receipt-image' target='_blank'>📷 Ver Foto do Canhoto</a>" if (ro['has_photo'] or ro['receipt_photo']) else ""
                 sig_btn = f"<a class='btn small ghost' style='color:#0284c7; border-color:#0284c7; font-weight:700;' href='/orders/{ro['order_id']}/signature-image' target='_blank'>✍️ Ver Assinatura Digital</a>" if ro['has_sig'] else ""
-                rec_btns = f"<div class='full' style='display:flex;gap:10px;margin-top:6px;'>{photo_btn}{sig_btn}</div>" if (photo_btn or sig_btn) else ""
+                loc_url = ro['dr_loc_link'] if ('dr_loc_link' in ro.keys() and ro['dr_loc_link']) else (ro['delivery_location_link'] if 'delivery_location_link' in ro.keys() else None)
+                map_btn = f"<a class='btn small ghost' style='color:#0369a1; border-color:#0369a1; font-weight:700;' href='{esc(loc_url)}' target='_blank'>🌐 Ver Mapa no Google Maps</a>" if loc_url else ""
+                rec_btns = f"<div class='full' style='display:flex;gap:10px;margin-top:6px;flex-wrap:wrap;'>{photo_btn}{sig_btn}{map_btn}</div>" if (photo_btn or sig_btn or map_btn) else ""
                 trs += f"""<article class='settlement-order'><div class='settlement-main'><label class='settlement-check'><input type='checkbox' name='ok_{ro['order_id']}' class='settlement-ok' required> <span>Checklist conferido</span></label><div><b>{esc(ro['order_number'])}</b><small>{esc(ro['client'] or '')} · {esc(ro['city'] or '')} · Vendedor: {esc(ro['seller_name'] or 'Não informado')} · {fmt_num(ro['weight_kg'])} kg · {money_visible(can_view_financial, ro['total_value'])}</small></div>{badge(ro['status'])}</div><div class='settlement-fields'><label>Resultado<select name='result_{ro['order_id']}' class='settlement-result'><option value='entregue'>Entregue</option><option value='problema'>Registrar problema</option></select></label><label>Data entrega/ocorrência<input type='date' name='date_{ro['order_id']}' value='{esc(delivered_date)}' required></label><label>Método pagamento<select name='pay_{ro['order_id']}'>{payment_method_options(ro['payment_method'] or '')}</select></label><label>Tipo de problema<select name='ptype_{ro['order_id']}'>{option(PROBLEM_TYPES,'Outro motivo')}</select></label><label class='full'>Observação do acerto<textarea name='obs_{ro['order_id']}' placeholder='Recebedor, divergência, comprovante ou descrição do problema...'>{esc(ro['final_notes'] or '')}</textarea></label>{rec_btns}</div></article>"""
             body=f"""<form method='post' action='/load-settlement/{r['id']}/finish' class='settlement-form needs-confirm' data-confirm-text='Confirma concluir a carga? A baixa será aplicada em todos os pedidos conferidos.'><section class='route-hero settlement-hero'><div><h2>{esc(r['name'])}</h2><p>Carga #{r['id']} · {brdate(r['date'])} · {esc(r['route_name'] or 'Rota livre')} · {esc(r['driver'] or 'Sem motorista')} · {esc((r['vehicle'] or '')+' '+(r['plate'] or ''))}</p></div><div>{badge(r['status'])}<b>{fmt_num(r['total_weight'])} kg</b></div></section><div class='settlement-tools'><div style='display: flex; align-items: center; gap: 15px; flex-wrap: wrap;'><label class='settlement-check'><input type='checkbox' id='markAllDelivered'> <span>Marcar todos como entregues</span></label><button type='button' id='btnSetDateSelected' class='btn' style='font-size: 13px; padding: 6px 12px; height: auto;'>Definir Data para Selecionados</button></div><small class='muted'>Se houver problema em algum pedido, troque o resultado para <b>Registrar problema</b>.</small></div><div class='alert info'>Marque todos os checklists para liberar a conclusão. Ao concluir, cada pedido será baixado como <b>entregue</b> ou <b>problema</b> conforme selecionado.</div><div class='settlement-list'>{trs}</div><div class='form-actions sticky-actions'><button class='success-btn'>Concluir Carga</button><a class='btn ghost' href='/routes/{r['id']}'>Voltar para operação da carga</a></div></form>
             <div class='settlement-date-overlay' id='settlementDateOverlay'>

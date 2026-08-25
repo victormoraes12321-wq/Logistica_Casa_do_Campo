@@ -445,7 +445,40 @@ const DriverApp = {
     this.el('signatureDialog').close();
   },
 
-  buildPayload(isProblem) {
+  async getGpsCoords() {
+    if (!('geolocation' in navigator)) return { latitude: null, longitude: null };
+    return new Promise(resolve => {
+      let resolved = false;
+      const timeoutTimer = setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          resolve({ latitude: null, longitude: null });
+        }
+      }, 5000);
+      navigator.geolocation.getCurrentPosition(
+        pos => {
+          if (!resolved) {
+            resolved = true;
+            clearTimeout(timeoutTimer);
+            resolve({
+              latitude: pos.coords.latitude,
+              longitude: pos.coords.longitude
+            });
+          }
+        },
+        err => {
+          if (!resolved) {
+            resolved = true;
+            clearTimeout(timeoutTimer);
+            resolve({ latitude: null, longitude: null });
+          }
+        },
+        { enableHighAccuracy: true, timeout: 5000, maximumAge: 60000 }
+      );
+    });
+  },
+
+  buildPayload(isProblem, coords) {
     return {
       idempotency_key: this.uuid(),
       order_id: this.selectedOrder.order_id,
@@ -457,6 +490,8 @@ const DriverApp = {
       digital_signature: isProblem ? '' : this.signatureData,
       is_problem: isProblem,
       problem_type: this.el('problemType').value,
+      latitude: coords ? coords.latitude : null,
+      longitude: coords ? coords.longitude : null,
     };
   },
   async submitOperation(isProblem) {
@@ -473,7 +508,9 @@ const DriverApp = {
       const title = isProblem ? 'Registrar problema' : 'Confirmar entrega';
       const message = isProblem ? 'O pedido ficará com problema. Confirma o registro?' : 'Confirma que a mercadoria foi entregue ao recebedor?';
       if (!(await this.ask(title, message, 'Confirmar'))) return;
-      const payload = this.buildPayload(isProblem);
+      this.setBusy(button, true, 'Capturando GPS…');
+      const coords = await this.getGpsCoords();
+      const payload = this.buildPayload(isProblem, coords);
       this.setBusy(button, true, 'Processando…');
       this.el(isProblem ? 'submitDelivery' : 'submitProblem').disabled = true;
       if (!navigator.onLine) {

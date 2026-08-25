@@ -317,6 +317,26 @@ def _deliver(handler: Any, driver: dict[str, Any]) -> bool:
     problem_type = str(data.get("problem_type") or "Outro").strip()[:120]
     delivered_to = str(data.get("delivered_to") or "").strip()[:200]
     delivered_doc = str(data.get("delivered_document") or "").strip()[:80]
+    lat_val = data.get("latitude")
+    lng_val = data.get("longitude")
+    latitude = None
+    longitude = None
+    location_link = ""
+    try:
+        if lat_val is not None and str(lat_val).strip() != "":
+            latitude = float(lat_val)
+        if lng_val is not None and str(lng_val).strip() != "":
+            longitude = float(lng_val)
+        if latitude is not None and longitude is not None and -90 <= latitude <= 90 and -180 <= longitude <= 180:
+            location_link = f"https://www.google.com/maps?q={latitude:.6f},{longitude:.6f}"
+        else:
+            latitude = None
+            longitude = None
+            location_link = ""
+    except (ValueError, TypeError):
+        latitude = None
+        longitude = None
+        location_link = ""
     if is_problem and not notes:
         return handler.send_json({"ok": False, "message": "Descreva o motivo do problema."}, 400)
     try:
@@ -385,7 +405,11 @@ def _deliver(handler: Any, driver: dict[str, Any]) -> bool:
             )
             operation_id = cursor.lastrowid
             if is_problem:
-                db.execute("UPDATE orders SET status='Problema',final_notes=?,updated_at=?,version=COALESCE(version,1)+1 WHERE id=?", (notes, now_ts, order_id))
+                db.execute(
+                    """UPDATE orders SET status='Problema',final_notes=?,delivery_latitude=?,delivery_longitude=?,
+                              delivery_location_link=?,updated_at=?,version=COALESCE(version,1)+1 WHERE id=?""",
+                    (notes, latitude, longitude, location_link, now_ts, order_id),
+                )
                 db.execute("UPDATE route_orders SET status='Com problema' WHERE route_id=? AND order_id=?", (route_id, order_id))
                 db.execute("INSERT INTO delivery_problems(order_id,route_id,problem_type,description,created_at) VALUES(?,?,?,?,?)", (order_id, route_id, problem_type, notes, now_ts))
                 status = "Problema"
@@ -397,15 +421,16 @@ def _deliver(handler: Any, driver: dict[str, Any]) -> bool:
             else:
                 db.execute(
                     """UPDATE orders SET status='Acertado',delivered_to=?,delivered_document=?,delivered_at=?,
-                              final_notes=?,receipt_photo_at=?,updated_at=?,version=COALESCE(version,1)+1 WHERE id=?""",
-                    (delivered_to, delivered_doc, now_ts, notes, now_ts, now_ts, order_id),
+                              final_notes=?,receipt_photo_at=?,delivery_latitude=?,delivery_longitude=?,
+                              delivery_location_link=?,updated_at=?,version=COALESCE(version,1)+1 WHERE id=?""",
+                    (delivered_to, delivered_doc, now_ts, notes, now_ts, latitude, longitude, location_link, now_ts, order_id),
                 )
                 db.execute("UPDATE route_orders SET status='Entregue' WHERE route_id=? AND order_id=?", (route_id, order_id))
                 db.execute("DELETE FROM delivery_receipts WHERE route_id=? AND order_id=?", (route_id, order_id))
                 db.execute(
                     """INSERT INTO delivery_receipts(order_id,route_id,image_data,mime_type,digital_signature,
-                              delivered_to,delivered_document,notes,created_at) VALUES(?,?,?,?,?,?,?,?,?)""",
-                    (order_id, route_id, photo, photo_mime or "image/jpeg", signature, delivered_to, delivered_doc, notes, now_ts),
+                              delivered_to,delivered_document,notes,latitude,longitude,delivery_location_link,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (order_id, route_id, photo, photo_mime or "image/jpeg", signature, delivered_to, delivered_doc, notes, latitude, longitude, location_link, now_ts),
                 )
                 status = "Acertado"
                 _order_history(

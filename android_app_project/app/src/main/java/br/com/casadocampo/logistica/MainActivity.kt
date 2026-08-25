@@ -128,6 +128,10 @@ class MainActivity : AppCompatActivity() {
                 request?.deny()
             }
 
+            override fun onGeolocationPermissionsShowPrompt(origin: String?, callback: android.webkit.GeolocationPermissions.Callback?) {
+                callback?.invoke(origin, true, false)
+            }
+
             override fun onShowFileChooser(
                 view: WebView?,
                 callback: ValueCallback<Array<Uri>>?,
