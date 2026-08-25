@@ -401,35 +401,12 @@ def _deliver(handler: Any, driver: dict[str, Any]) -> bool:
                     (delivered_to, delivered_doc, now_ts, notes, now_ts, now_ts, order_id),
                 )
                 db.execute("UPDATE route_orders SET status='Entregue' WHERE route_id=? AND order_id=?", (route_id, order_id))
-                try:
-                    db.execute("DELETE FROM delivery_receipts WHERE route_id=? AND order_id=?", (route_id, order_id))
-                    db.execute(
-                        """INSERT INTO delivery_receipts(order_id,route_id,image_data,mime_type,digital_signature,
-                                  delivered_to,delivered_document,notes,created_at) VALUES(?,?,?,?,?,?,?,?,?)""",
-                        (order_id, route_id, photo, photo_mime or "image/jpeg", signature, delivered_to, delivered_doc, notes, now_ts),
-                    )
-                except Exception:
-                    try:
-                        db.execute("""CREATE TABLE IF NOT EXISTS delivery_receipts (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            order_id INTEGER NOT NULL,
-                            route_id INTEGER,
-                            image_data TEXT NOT NULL,
-                            mime_type TEXT DEFAULT 'image/jpeg',
-                            digital_signature TEXT,
-                            delivered_to TEXT,
-                            delivered_document TEXT,
-                            notes TEXT,
-                            created_at TEXT NOT NULL
-                        )""")
-                        db.execute("DELETE FROM delivery_receipts WHERE route_id=? AND order_id=?", (route_id, order_id))
-                        db.execute(
-                            """INSERT INTO delivery_receipts(order_id,route_id,image_data,mime_type,digital_signature,
-                                      delivered_to,delivered_document,notes,created_at) VALUES(?,?,?,?,?,?,?,?,?)""",
-                            (order_id, route_id, photo, photo_mime or "image/jpeg", signature, delivered_to, delivered_doc, notes, now_ts),
-                        )
-                    except Exception:
-                        pass
+                db.execute("DELETE FROM delivery_receipts WHERE route_id=? AND order_id=?", (route_id, order_id))
+                db.execute(
+                    """INSERT INTO delivery_receipts(order_id,route_id,image_data,mime_type,digital_signature,
+                              delivered_to,delivered_document,notes,created_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (order_id, route_id, photo, photo_mime or "image/jpeg", signature, delivered_to, delivered_doc, notes, now_ts),
+                )
                 status = "Acertado"
                 _order_history(
                     db, driver, order_id, str(linked["order_status"] or ""), status,

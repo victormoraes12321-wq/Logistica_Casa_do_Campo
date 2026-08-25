@@ -7,6 +7,20 @@ def handle_get(handler, path: str, user) -> bool:
             return True
         handler.handle_erp_lookup(user)
         return True
+    if path.startswith("/orders/") and path.endswith("/receipt-image"):
+        if not handler.require_perm(user, "view_orders", "Sem permissão para visualizar comprovantes."):
+            return True
+        parts = path.split("/")
+        oid = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        handler.get_receipt_image(user, oid)
+        return True
+    if path.startswith("/orders/") and path.endswith("/signature-image"):
+        if not handler.require_perm(user, "view_orders", "Sem permissão para visualizar assinaturas."):
+            return True
+        parts = path.split("/")
+        oid = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        handler.get_signature_image(user, oid)
+        return True
     if path.startswith("/orders/") and path.endswith("/edit"):
         if not handler.require_perm(user, "edit_orders", "Sem permissão para editar pedidos."):
             return True

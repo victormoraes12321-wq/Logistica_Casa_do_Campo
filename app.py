@@ -6,7 +6,7 @@ expedição, cargas, rotas, entregas, gargalos, relatórios e backup.
 Roda com Python padrão + SQLite.
 Acesse: http://localhost:3000
 """
-import os, html, sqlite3, hashlib, secrets, csv, json, re, time, hmac, traceback, threading, shutil
+import os, html, sqlite3, hashlib, secrets, csv, json, re, time, hmac, traceback, threading, shutil, base64
 import socket
 from datetime import datetime, date, timedelta
 from http import cookies
@@ -3647,6 +3647,67 @@ document.addEventListener('DOMContentLoaded', function(){
             db.commit()
         self.redirect(f'/orders/{oid}')
 
+    def get_receipt_image(self, u, oid):
+        with conn() as db:
+            row = db.execute("SELECT image_data, mime_type FROM delivery_receipts WHERE order_id=? ORDER BY id DESC LIMIT 1", (oid,)).fetchone()
+            if not row or not row['image_data']:
+                order = db.execute("SELECT receipt_photo FROM orders WHERE id=?", (oid,)).fetchone()
+                if order and order['receipt_photo']:
+                    data_val = order['receipt_photo']
+                    mime_val = 'image/jpeg'
+                else:
+                    self.send_error(404)
+                    return
+            else:
+                data_val = row['image_data']
+                mime_val = row['mime_type'] or 'image/jpeg'
+
+        if isinstance(data_val, (bytes, bytearray)):
+            content = bytes(data_val)
+        else:
+            s = str(data_val or '')
+            if ',' in s:
+                s = s.split(',', 1)[1]
+            try:
+                content = base64.b64decode(s)
+            except Exception:
+                self.send_error(404)
+                return
+
+        self.send_response(200)
+        self.send_header('Content-Type', mime_val)
+        self.send_header('Content-Length', str(len(content)))
+        self.send_header('Cache-Control', 'private, max-age=86400')
+        self.end_headers()
+        self.wfile.write(content)
+
+    def get_signature_image(self, u, oid):
+        with conn() as db:
+            row = db.execute("SELECT digital_signature FROM delivery_receipts WHERE order_id=? ORDER BY id DESC LIMIT 1", (oid,)).fetchone()
+            if not row or not row['digital_signature']:
+                self.send_error(404)
+                return
+            data_val = row['digital_signature']
+
+        if isinstance(data_val, (bytes, bytearray)):
+            content = bytes(data_val)
+        else:
+            s = str(data_val or '')
+            if ',' in s:
+                s = s.split(',', 1)[1]
+            try:
+                content = base64.b64decode(s)
+            except Exception:
+                self.send_error(404)
+                return
+
+        self.send_response(200)
+        self.send_header('Content-Type', 'image/png')
+        self.send_header('Content-Length', str(len(content)))
+        self.send_header('Cache-Control', 'private, max-age=86400')
+        self.end_headers()
+        self.wfile.write(content)
+
     def order_detail(self,u,oid):
         with conn() as db:
             r=db.execute('''SELECT o.*,c.name client,c.document,c.phone,c.whatsapp,c.farm_name,c.address,c.reference_point,c.city client_city,u.name seller,
@@ -3689,7 +3750,44 @@ document.addEventListener('DOMContentLoaded', function(){
             if not r:
                 return self.fail(u,'Não encontrado','Pedido não encontrado.',404)
             items=db.execute('SELECT * FROM order_items WHERE order_id=?',(oid,)).fetchall(); hist=db.execute('SELECT h.*,u.name user FROM order_history h LEFT JOIN users u ON u.id=h.user_id WHERE h.order_id=? ORDER BY h.id ASC',(oid,)).fetchall(); probs=db.execute('SELECT * FROM delivery_problems WHERE order_id=? ORDER BY id DESC',(oid,)).fetchall()
+            receipt=db.execute('SELECT * FROM delivery_receipts WHERE order_id=? ORDER BY id DESC LIMIT 1',(oid,)).fetchone()
             route_info=self.order_route_info(db,oid)
+
+        receipt_panel = ''
+        has_receipt_photo = bool(receipt and receipt['image_data']) or bool(r.get('receipt_photo'))
+        has_signature = bool(receipt and receipt['digital_signature'])
+        if has_receipt_photo or has_signature or r.get('delivered_to'):
+            rec_to = esc(receipt['delivered_to'] if receipt and receipt['delivered_to'] else (r.get('delivered_to') or '—'))
+            rec_doc = esc(receipt['delivered_document'] if receipt and receipt['delivered_document'] else (r.get('delivered_document') or ''))
+            rec_date = brdate(receipt['created_at']) if receipt and receipt['created_at'] else brdate(r.get('delivered_at'))
+            rec_notes = esc(receipt['notes'] if receipt and receipt['notes'] else (r.get('final_notes') or '—'))
+
+            photo_html = f'''<div style="flex:1; min-width:240px; background:#f8fafc; border:1px solid #cbd5e1; border-radius:8px; padding:12px; text-align:center;">
+                <h4 style="margin:0 0 8px 0; font-size:0.9rem; color:#166534; font-weight:700;">📷 Foto do Canhoto / Comprovante</h4>
+                <a href="/orders/{oid}/receipt-image" target="_blank" title="Clique para abrir imagem inteira">
+                    <img src="/orders/{oid}/receipt-image" alt="Foto do Canhoto" style="max-width:100%; max-height:260px; border-radius:6px; border:2px solid #10b981; object-fit:contain;" onerror="this.parentNode.innerHTML='<span class=\\'muted\\'>Sem foto disponível</span>'">
+                </a>
+            </div>''' if has_receipt_photo else ''
+
+            sig_html = f'''<div style="flex:1; min-width:240px; background:#f8fafc; border:1px solid #cbd5e1; border-radius:8px; padding:12px; text-align:center;">
+                <h4 style="margin:0 0 8px 0; font-size:0.9rem; color:#1e3a8a; font-weight:700;">✍️ Assinatura Digital do Motorista</h4>
+                <a href="/orders/{oid}/signature-image" target="_blank" title="Clique para abrir assinatura inteira">
+                    <img src="/orders/{oid}/signature-image" alt="Assinatura Digital" style="max-width:100%; max-height:260px; border-radius:6px; border:2px solid #3b82f6; background:#fff; object-fit:contain;" onerror="this.parentNode.innerHTML='<span class=\\'muted\\'>Sem assinatura disponível</span>'">
+                </a>
+            </div>''' if has_signature else ''
+
+            receipt_panel = f'''<section class="panel" style="border-left:5px solid #10b981;">
+                <h2 style="color:#065f46;">📷 Comprovante e Assinatura da Entrega (App do Motorista)</h2>
+                <div class="info-grid">
+                    <p><b>Recebido por</b>{rec_to} {f"({rec_doc})" if rec_doc else ""}</p>
+                    <p><b>Data Registro</b>{rec_date}</p>
+                    <p><b>Observação Motorista</b>{rec_notes}</p>
+                </div>
+                <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:14px;">
+                    {photo_html}
+                    {sig_html}
+                </div>
+            </section>'''
 
         # --- Linha do tempo visual usando order_history real ---
         flow_steps = [
@@ -3761,7 +3859,7 @@ document.addEventListener('DOMContentLoaded', function(){
             if route_info and normalize_route_status(route_info['route_status']) == 'Em rota':
                 reopen_targets.insert(0,'Saiu para entrega')
             reopen_form = f"""<section class='panel no-print'><h2>Reabertura controlada</h2><form method='post' action='/orders/{oid}/reopen' class='form compact needs-confirm' data-confirm-text='Confirma reabrir este pedido finalizado?'><div class='grid3'><label>Destino<select name='target_status'>{option(reopen_targets,'Faturado')}</select></label><label class='full'>Motivo obrigatório<textarea name='reason' required placeholder='Descreva o motivo operacional da reabertura...'></textarea></label></div><button class='danger-btn'>Reabrir pedido</button></form></section>"""
-        content=f'''<section class="order-hero"><div><span>{esc(r['order_number'])}</span><h2>{esc(r['client'] or 'Cliente não informado')}</h2><p>{esc(r['farm_name'] or r['delivery_address'] or '')}</p></div><div>{badge(r['status'])}{deadline_pill(r['expected_delivery_date'],r['status'])}</div></section>{assisted}{actions}
+        content=f'''<section class="order-hero"><div><span>{esc(r['order_number'])}</span><h2>{esc(r['client'] or 'Cliente não informado')}</h2><p>{esc(r['farm_name'] or r['delivery_address'] or '')}</p></div><div>{badge(r['status'])}{deadline_pill(r['expected_delivery_date'],r['status'])}</div></section>{assisted}{actions}{receipt_panel}
         <section class="panel"><h2>Linha do Tempo</h2><div class="order-timeline">{timeline_steps}</div></section>
         <div class="detail-grid"><section class="panel"><h2>Dados do pedido</h2><div class="info-grid"><p><b>Documento fiscal</b>{esc(r['invoice_number'] or 'Pendente')}</p><p><b>Venda</b>{brdate(r['sale_date'])}</p><p><b>Prazo limite</b>{brdate(r['expected_delivery_date'])}</p><p><b>Peso</b>{fmt_num(r['weight_kg'])} kg</p>{value_info}<p><b>Vendedor</b>{esc(r['seller_name'] or 'Não informado')}</p><p><b>Cadastrante</b>{esc(r['seller'] or '—')}</p></div></section><section class="panel"><h2>Entrega</h2><div class="info-grid"><p><b>Cidade</b>{esc(r['city'] or r['client_city'] or '—')}</p><p><b>Rota</b>{esc(r['route_name'] or '—')}</p><p><b>Motorista</b>{esc(r['driver'] or '—')}</p><p><b>Veículo</b>{esc((r['vehicle'] or '')+' '+(r['plate'] or ''))}</p><p><b>Recebido por</b>{esc(r['delivered_to'] or '—')}</p><p><b>Entrega em</b>{brdate(r['delivered_at'])}</p></div></section></div><section class="panel"><h2>Itens</h2><table><thead><tr><th>Código</th><th>Produto</th><th>Qtd</th><th>Peso</th><th>Obs.</th></tr></thead><tbody>{item_rows}</tbody></table></section><div class="detail-grid"><section class="panel"><h2>Histórico completo</h2><ul class="timeline-list">{hist_rows}</ul></section><section class="panel"><h2>Problemas registrados</h2><ul class="problems">{prob_rows}</ul></section></div>{problem_form}{schedule_form}{reopen_form}'''
         return self.send_html(layout(u,f'Pedido {r["order_number"]}',content,'Acompanhamento completo do pedido'))
@@ -4575,7 +4673,7 @@ document.addEventListener('DOMContentLoaded', function(){
         with conn() as db:
             r=db.execute("SELECT r.*,d.name driver,v.name vehicle,v.plate FROM routes r LEFT JOIN drivers d ON d.id=r.driver_id LEFT JOIN vehicles v ON v.id=r.vehicle_id WHERE r.id=?",(rid,)).fetchone()
             target_route = str(r['route_name'] or '').strip() if r else ''
-            ros=db.execute("SELECT ro.*,o.order_number,o.seller_name,o.status,o.weight_kg,o.city,o.route_name,o.expected_delivery_date,c.name client FROM route_orders ro JOIN orders o ON o.id=ro.order_id LEFT JOIN clients c ON c.id=o.client_id WHERE ro.route_id=? ORDER BY ro.delivery_order,ro.id",(rid,)).fetchall()
+            ros=db.execute("SELECT ro.*,o.order_number,o.seller_name,o.status,o.weight_kg,o.city,o.route_name,o.expected_delivery_date,o.receipt_photo,c.name client, (SELECT COUNT(*) FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.image_data IS NOT NULL) has_photo, (SELECT COUNT(*) FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.digital_signature IS NOT NULL) has_sig FROM route_orders ro JOIN orders o ON o.id=ro.order_id LEFT JOIN clients c ON c.id=o.client_id WHERE ro.route_id=? ORDER BY ro.delivery_order,ro.id",(rid,)).fetchall()
             if target_route.lower().strip() == 'mista':
                 available=db.execute("""SELECT o.id,o.order_number,o.seller_name,c.name client,o.city,o.route_name,o.weight_kg
                                         FROM orders o
@@ -4615,7 +4713,7 @@ document.addEventListener('DOMContentLoaded', function(){
         can_settle_routes = self.has_perm(u,'settle_routes')
         settlement_link = f"<a class='btn small ghost' href='/load-settlement?q={quote(r['name'])}'>Acerto da carga</a>" if can_settle_routes else "<span class='muted'>Sem permissão para acerto</span>"
         pct=(float(r['total_weight'] or 0)/float(r['capacity'] or 1))*100
-        rows=''.join(f"""<tr><td><input form='seqForm' type='number' name='seq_{ro['id']}' value='{ro['delivery_order']}' class='seq' {'readonly' if not can_edit else ''}></td><td><a href='/orders/{ro['order_id']}'><b>{esc(ro['order_number'])}</b></a><br><small>{esc(ro['client'] or '')} · Vendedor: {esc(ro['seller_name'] or 'Não informado')}</small></td><td>{esc(ro['city'] or '')}<br><small>{esc(ro['route_name'] or '')}</small></td><td>{badge(ro['status'])}</td><td>{deadline_pill(ro['expected_delivery_date'],ro['status'])}</td><td>{fmt_num(ro['weight_kg'])} kg</td><td><div class='route-actions'>{f"<form method='post' action='/routes/{rid}/remove/{ro['id']}' class='inline-mini'><button class='danger-btn'>Remover</button></form>" if can_edit else "<span class='muted'>Carga finalizada</span>"}</div></td></tr>""" for ro in ros)
+        rows=''.join(f"""<tr><td><input form='seqForm' type='number' name='seq_{ro['id']}' value='{ro['delivery_order']}' class='seq' {'readonly' if not can_edit else ''}></td><td><a href='/orders/{ro['order_id']}'><b>{esc(ro['order_number'])}</b></a><br><small>{esc(ro['client'] or '')} · Vendedor: {esc(ro['seller_name'] or 'Não informado')}</small></td><td>{esc(ro['city'] or '')}<br><small>{esc(ro['route_name'] or '')}</small></td><td>{badge(ro['status'])}{f'<br><a href="/orders/{ro["order_id"]}/receipt-image" target="_blank" class="btn small ghost" style="color:#059669; border-color:#059669; padding:1px 4px; font-size:0.75rem; margin-top:3px; display:inline-block;">📷 Canhoto</a>' if (ro.get('has_photo') or ro.get('receipt_photo')) else ''}{f'<a href="/orders/{ro["order_id"]}/signature-image" target="_blank" class="btn small ghost" style="color:#0284c7; border-color:#0284c7; padding:1px 4px; font-size:0.75rem; margin-top:3px; display:inline-block;">✍️ Assinatura</a>' if ro.get('has_sig') else ''}</td><td>{deadline_pill(ro['expected_delivery_date'],ro['status'])}</td><td>{fmt_num(ro['weight_kg'])} kg</td><td><div class='route-actions'>{f"<form method='post' action='/routes/{rid}/remove/{ro['id']}' class='inline-mini'><button class='danger-btn'>Remover</button></form>" if can_edit else "<span class='muted'>Carga finalizada</span>"}</div></td></tr>""" for ro in ros)
         add_opts=''.join(f"<option value='{a['id']}'>{esc(a['order_number'])} - {esc(a['client'] or '')} - Vendedor: {esc(a['seller_name'] or 'Não informado')} - {esc(a['city'] or '')} - {fmt_num(a['weight_kg'])}kg</option>" for a in available)
         lock_notice = '<div class="alert info">Carga finalizada: edição de pedidos e sequência está bloqueada para preservar o histórico.</div>' if not can_edit else ''
         dispatch_action = f"<form method='post' action='/routes/{rid}/dispatch'><button>1. Marcar saída</button></form>" if can_dispatch else "<span class='muted'>Saída já registrada</span>"
@@ -4848,21 +4946,29 @@ document.addEventListener('DOMContentLoaded', function(){
                             ORDER BY r.id DESC LIMIT 1""",(q,q,f'%{q}%')).fetchone()
             if not r:
                 return self.send_html(layout(u,'Acerto de carga',search_box+'<div class="alert danger">Carga não encontrada. Confira o código/nome e tente novamente.</div>','Fechamento operacional da carga e baixa final das entregas'))
-            rows=db.execute("""SELECT ro.*,o.id order_id,o.order_number,o.seller_name,o.status,o.weight_kg,o.total_value,o.payment_method,o.delivered_at,o.final_notes,o.city,o.route_name,c.name client,c.farm_name FROM route_orders ro JOIN orders o ON o.id=ro.order_id LEFT JOIN clients c ON c.id=o.client_id WHERE ro.route_id=? ORDER BY ro.delivery_order,ro.id""",(r['id'],)).fetchall()
+            rows=db.execute("""SELECT ro.*,o.id order_id,o.order_number,o.seller_name,o.status,o.weight_kg,o.total_value,o.payment_method,o.delivered_at,o.final_notes,o.city,o.route_name,o.receipt_photo,c.name client,c.farm_name, (SELECT COUNT(*) FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.image_data IS NOT NULL) has_photo, (SELECT COUNT(*) FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.digital_signature IS NOT NULL) has_sig FROM route_orders ro JOIN orders o ON o.id=ro.order_id LEFT JOIN clients c ON c.id=o.client_id WHERE ro.route_id=? ORDER BY ro.delivery_order,ro.id""",(r['id'],)).fetchall()
         route_status = normalize_route_status(r['status'])
         if not rows:
             body='<div class="empty">Esta carga não possui pedidos vinculados.</div>'
         elif route_status != 'Em rota':
-            cards = ''.join(
-                f"<article class='settlement-order'><div class='settlement-main'><div><b>{esc(ro['order_number'])}</b><small>{esc(ro['client'] or '')} · {esc(ro['city'] or '')} · Vendedor: {esc(ro['seller_name'] or 'Não informado')} · {fmt_num(ro['weight_kg'])} kg · {money_visible(can_view_financial, ro['total_value'])}</small></div>{badge(ro['status'])}</div><div class='settlement-fields'><label>Método pagamento<input value='{esc(ro['payment_method'] or 'Não informado')}' readonly></label><label>Data entrega/ocorrência<input value='{esc(brdate(ro['delivered_at']))}' readonly></label><label class='full'>Observação final<textarea readonly>{esc(ro['final_notes'] or 'Sem observação')}</textarea></label></div></article>"
-                for ro in rows
-            )
+            cards_list = []
+            for ro in rows:
+                photo_btn = f"<a class='btn small ghost' style='color:#059669; border-color:#059669; font-weight:700;' href='/orders/{ro['order_id']}/receipt-image' target='_blank'>📷 Ver Foto do Canhoto</a>" if (ro.get('has_photo') or ro.get('receipt_photo')) else ""
+                sig_btn = f"<a class='btn small ghost' style='color:#0284c7; border-color:#0284c7; font-weight:700;' href='/orders/{ro['order_id']}/signature-image' target='_blank'>✍️ Ver Assinatura Digital</a>" if ro.get('has_sig') else ""
+                btns_html = f"<div class='full' style='display:flex;gap:10px;margin-top:6px;'>{photo_btn}{sig_btn}</div>" if (photo_btn or sig_btn) else ""
+                cards_list.append(
+                    f"<article class='settlement-order'><div class='settlement-main'><div><b>{esc(ro['order_number'])}</b><small>{esc(ro['client'] or '')} · {esc(ro['city'] or '')} · Vendedor: {esc(ro['seller_name'] or 'Não informado')} · {fmt_num(ro['weight_kg'])} kg · {money_visible(can_view_financial, ro['total_value'])}</small></div>{badge(ro['status'])}</div><div class='settlement-fields'><label>Método pagamento<input value='{esc(ro['payment_method'] or 'Não informado')}' readonly></label><label>Data entrega/ocorrência<input value='{esc(brdate(ro['delivered_at']))}' readonly></label><label class='full'>Observação final<textarea readonly>{esc(ro['final_notes'] or 'Sem observação')}</textarea></label>{btns_html}</div></article>"
+                )
+            cards = ''.join(cards_list)
             body=f"""<section class='panel'><div class='alert info'>Carga já finalizada em status <b>{esc(route_status)}</b>. Edição bloqueada para preservar o histórico.</div><section class='route-hero settlement-hero'><div><h2>{esc(r['name'])}</h2><p>Carga #{r['id']} · {brdate(r['date'])} · {esc(r['route_name'] or 'Rota livre')} · {esc(r['driver'] or 'Sem motorista')} · {esc((r['vehicle'] or '')+' '+(r['plate'] or ''))}</p></div><div>{badge(r['status'])}<b>{fmt_num(r['total_weight'])} kg</b></div></section><div class='settlement-list'>{cards}</div><div class='form-actions'><a class='btn ghost' href='/load-settlement/{r['id']}/print-report'>Relatório compacto (1 página)</a><a class='btn ghost' href='/routes/{r['id']}'>Voltar para operação da carga</a></div></section>"""
         else:
             trs=''
             for ro in rows:
                 delivered_date=(ro['delivered_at'] or today())[:10]
-                trs += f"""<article class='settlement-order'><div class='settlement-main'><label class='settlement-check'><input type='checkbox' name='ok_{ro['order_id']}' class='settlement-ok' required> <span>Checklist conferido</span></label><div><b>{esc(ro['order_number'])}</b><small>{esc(ro['client'] or '')} · {esc(ro['city'] or '')} · Vendedor: {esc(ro['seller_name'] or 'Não informado')} · {fmt_num(ro['weight_kg'])} kg · {money_visible(can_view_financial, ro['total_value'])}</small></div>{badge(ro['status'])}</div><div class='settlement-fields'><label>Resultado<select name='result_{ro['order_id']}' class='settlement-result'><option value='entregue'>Entregue</option><option value='problema'>Registrar problema</option></select></label><label>Data entrega/ocorrência<input type='date' name='date_{ro['order_id']}' value='{esc(delivered_date)}' required></label><label>Método pagamento<select name='pay_{ro['order_id']}'>{payment_method_options(ro['payment_method'] or '')}</select></label><label>Tipo de problema<select name='ptype_{ro['order_id']}'>{option(PROBLEM_TYPES,'Outro motivo')}</select></label><label class='full'>Observação do acerto<textarea name='obs_{ro['order_id']}' placeholder='Recebedor, divergência, comprovante ou descrição do problema...'>{esc(ro['final_notes'] or '')}</textarea></label></div></article>"""
+                photo_btn = f"<a class='btn small ghost' style='color:#059669; border-color:#059669; font-weight:700;' href='/orders/{ro['order_id']}/receipt-image' target='_blank'>📷 Ver Foto do Canhoto</a>" if (ro.get('has_photo') or ro.get('receipt_photo')) else ""
+                sig_btn = f"<a class='btn small ghost' style='color:#0284c7; border-color:#0284c7; font-weight:700;' href='/orders/{ro['order_id']}/signature-image' target='_blank'>✍️ Ver Assinatura Digital</a>" if ro.get('has_sig') else ""
+                rec_btns = f"<div class='full' style='display:flex;gap:10px;margin-top:6px;'>{photo_btn}{sig_btn}</div>" if (photo_btn or sig_btn) else ""
+                trs += f"""<article class='settlement-order'><div class='settlement-main'><label class='settlement-check'><input type='checkbox' name='ok_{ro['order_id']}' class='settlement-ok' required> <span>Checklist conferido</span></label><div><b>{esc(ro['order_number'])}</b><small>{esc(ro['client'] or '')} · {esc(ro['city'] or '')} · Vendedor: {esc(ro['seller_name'] or 'Não informado')} · {fmt_num(ro['weight_kg'])} kg · {money_visible(can_view_financial, ro['total_value'])}</small></div>{badge(ro['status'])}</div><div class='settlement-fields'><label>Resultado<select name='result_{ro['order_id']}' class='settlement-result'><option value='entregue'>Entregue</option><option value='problema'>Registrar problema</option></select></label><label>Data entrega/ocorrência<input type='date' name='date_{ro['order_id']}' value='{esc(delivered_date)}' required></label><label>Método pagamento<select name='pay_{ro['order_id']}'>{payment_method_options(ro['payment_method'] or '')}</select></label><label>Tipo de problema<select name='ptype_{ro['order_id']}'>{option(PROBLEM_TYPES,'Outro motivo')}</select></label><label class='full'>Observação do acerto<textarea name='obs_{ro['order_id']}' placeholder='Recebedor, divergência, comprovante ou descrição do problema...'>{esc(ro['final_notes'] or '')}</textarea></label>{rec_btns}</div></article>"""
             body=f"""<form method='post' action='/load-settlement/{r['id']}/finish' class='settlement-form needs-confirm' data-confirm-text='Confirma concluir a carga? A baixa será aplicada em todos os pedidos conferidos.'><section class='route-hero settlement-hero'><div><h2>{esc(r['name'])}</h2><p>Carga #{r['id']} · {brdate(r['date'])} · {esc(r['route_name'] or 'Rota livre')} · {esc(r['driver'] or 'Sem motorista')} · {esc((r['vehicle'] or '')+' '+(r['plate'] or ''))}</p></div><div>{badge(r['status'])}<b>{fmt_num(r['total_weight'])} kg</b></div></section><div class='settlement-tools'><div style='display: flex; align-items: center; gap: 15px; flex-wrap: wrap;'><label class='settlement-check'><input type='checkbox' id='markAllDelivered'> <span>Marcar todos como entregues</span></label><button type='button' id='btnSetDateSelected' class='btn' style='font-size: 13px; padding: 6px 12px; height: auto;'>Definir Data para Selecionados</button></div><small class='muted'>Se houver problema em algum pedido, troque o resultado para <b>Registrar problema</b>.</small></div><div class='alert info'>Marque todos os checklists para liberar a conclusão. Ao concluir, cada pedido será baixado como <b>entregue</b> ou <b>problema</b> conforme selecionado.</div><div class='settlement-list'>{trs}</div><div class='form-actions sticky-actions'><button class='success-btn'>Concluir Carga</button><a class='btn ghost' href='/routes/{r['id']}'>Voltar para operação da carga</a></div></form>
             <div class='settlement-date-overlay' id='settlementDateOverlay'>
               <div class='settlement-date-modal' role='dialog' aria-modal='true' aria-labelledby='settlementDateTitle'>
