@@ -39,6 +39,7 @@ from app_core.repositories.user_repository import (
 from app_core.repositories.order_repository import find_order_by_id
 from app_core.repositories.route_repository import find_route_by_id, touch_route, update_route_status
 from app_core.services.audit_service import record_audit
+from app_core.services import pdf_report_service
 from app_core.services.backup_service import (
     create_sqlite_backup,
     prune_backup_files,
@@ -2031,6 +2032,8 @@ class App(BaseHTTPRequestHandler):
                 return self.fail(u,'Sistema em manutenção','O sistema está temporariamente em manutenção. Tente novamente em instantes.',503)
             if path == '/api/clients/duplicate-check':
                 return self.get_client_duplicate_check(u)
+            if path == '/settings/reports/generate-now':
+                return self.generate_pdf_report_now(u)
             routes = GET_ROUTE_HANDLERS
             route_permissions = GET_ROUTE_PERMISSIONS
             if orders_dispatch.handle_get(self, path, u):
@@ -6125,26 +6128,40 @@ document.addEventListener('DOMContentLoaded', function(){
         can_manage_users = self.has_perm(u,'manage_users')
         can_manage_permissions = self.has_perm(u,'manage_permissions') and is_admin(u)
         can_view_audit = is_admin(u) and self.has_perm(u,'view_settings')
+        can_manage_reports = self.has_perm(u,'manage_settings') or is_admin(u)
+        can_manage_app_config = is_god(u)
+
         allowed_sections = {'profile'}
         if can_manage_config:
             allowed_sections.add('system')
+        if can_manage_reports:
+            allowed_sections.add('reports')
+        if can_manage_app_config:
+            allowed_sections.add('app_config')
         if can_manage_users:
             allowed_sections.add('users')
         if can_manage_permissions:
             allowed_sections.add('permissions')
         if can_view_audit:
             allowed_sections.add('audit')
+
         if section not in allowed_sections:
             section = 'profile'
+
         tabs = [("profile", "Minha conta", "#settings-profile")]
         if can_manage_config:
             tabs.append(("system", "Parâmetros", "#settings-system"))
+        if can_manage_reports:
+            tabs.append(("reports", "Relatórios PDF", "#settings-reports"))
+        if can_manage_app_config:
+            tabs.append(("app_config", "App Mobile (GOD)", "#settings-app_config"))
         if can_manage_users:
             tabs.append(("users", "Usuários", "#settings-users"))
         if can_manage_permissions:
             tabs.append(("permissions", "Permissões", "#settings-permissions"))
         if can_view_audit:
             tabs.append(("audit", "Auditoria", "#settings-audit"))
+
         tab_links = ''.join(
             f"""<a class='btn small {"ghost" if section!=key else ""}' href='/settings?section={key}{anchor}'>{label}</a>"""
             for key, label, anchor in tabs
@@ -6155,16 +6172,35 @@ document.addEventListener('DOMContentLoaded', function(){
             saved_msg = '<div class="alert success" style="margin-bottom:1rem;">✅ Usuário atualizado com sucesso!</div>'
         elif qs.get('profile_updated'):
             saved_msg = '<div class="alert success" style="margin-bottom:1rem;">✅ Dados da sua conta atualizados com sucesso!</div>'
+        elif qs.get('report_generated'):
+            gen_file = esc(qs.get('filename',['relatório'])[0])
+            saved_msg = f'<div class="alert success" style="margin-bottom:1rem;">⚡ <b>Relatório PDF gerado com sucesso!</b><br>Arquivo salvo em <b>Desktop\\Relatório Logística Casa do Campo\\{gen_file}</b></div>'
 
         if is_restricted_data_entry_user(u):
             profile=f'''<section class="panel settings-panel" id="settings-profile"><h2>Minha conta</h2>{saved_msg if section=="profile" else ""}<form method="post" action="/settings/profile" class="inline-form"><input type="hidden" name="redirect_section" value="profile"><input type="hidden" name="name" value="{esc(u['name'])}"><input type="hidden" name="username" value="{esc(u['username'])}"><input name="password" type="password" placeholder="Nova senha" required><button>Alterar minha senha</button></form><p class="muted">Para seu perfil operacional, esta área permite somente troca de senha.</p><p class="muted">Último acesso: {brdate(u["last_login_at"])} {esc(str(u["last_login_at"] or "")[11:16]) if u["last_login_at"] else "—"}</p></section>'''
         else:
             profile=f'''<section class="panel settings-panel" id="settings-profile"><h2>Minha conta</h2>{saved_msg if section=="profile" else ""}<form method="post" action="/settings/profile" class="inline-form"><input type="hidden" name="redirect_section" value="profile"><input name="name" value="{esc(u['name'])}" placeholder="Nome" required><input name="username" value="{esc(u['username'])}" placeholder="Usuário" required><input name="password" type="password" placeholder="Nova senha opcional"><button>Atualizar minha conta</button></form><p class="muted">Último acesso: {brdate(u["last_login_at"])} {esc(str(u["last_login_at"] or "")[11:16]) if u["last_login_at"] else "—"}</p></section>'''
         content = settings_tabs + profile
-        if not (can_manage_config or can_manage_users or can_manage_permissions or can_view_audit):
+        if not (can_manage_config or can_manage_reports or can_manage_app_config or can_manage_users or can_manage_permissions or can_view_audit):
             return self.send_html(layout(u,'Configurações',content,'Ajustes da sua conta'))
         if can_manage_config:
             content += f'''<section class="panel settings-panel" id="settings-system"><h2>Parâmetros do sistema</h2><form method="post" action="/settings" class="form"><input type="hidden" name="redirect_section" value="system"><fieldset><legend>Identidade e operação</legend><div class="grid3"><label>Nome do sistema<input name="system_name" value="{esc(settings.get('system_name'))}"></label><label>Nome da empresa<input name="company_name" value="{esc(settings.get('company_name'))}"></label><label>Subtítulo<input name="company_subtitle" value="{esc(settings.get('company_subtitle'))}"></label><label>Cor principal<input type="color" name="primary_color" value="{esc(settings.get('primary_color'))}"></label><label>Cor secundária<input type="color" name="secondary_color" value="{esc(settings.get('secondary_color'))}"></label><label>Cor de apoio<input type="color" name="accent_color" value="{esc(settings.get('accent_color'))}"></label><label>Cor fundo<input type="color" name="background_color" value="{esc(settings.get('background_color','#f6f7f2'))}"></label><label>Prazo SLA oficial<input name="sla_limit_days" value="15" readonly><small>Travado em 15 dias corridos conforme regra operacional.</small></label><label>Capacidade padrão kg<input name="load_capacity_kg" value="{esc(settings.get('load_capacity_kg'))}"></label><label>Modo manutenção<select name="maintenance_mode"><option value="off" {'selected' if settings.get('maintenance_mode','off')!='on' else ''}>Desligado</option><option value="on" {'selected' if settings.get('maintenance_mode')=='on' else ''}>Ligado</option></select></label><label class="full">Observação interna<input name="god_note" value="{esc(settings.get('god_note',''))}" placeholder="Ex: revisão feita em..."></label></div></fieldset><button>Salvar configurações globais</button></form></section>'''
+
+        if can_manage_reports:
+            r_enabled = settings.get('pdf_report_enabled', '1')
+            r_days = settings.get('pdf_report_days', 'Mon,Wed,Fri')
+            r_time = settings.get('pdf_report_time', '09:00')
+            r_filter = settings.get('pdf_report_status_filter', 'Todos')
+            content += f'''<section class="panel settings-panel" id="settings-reports"><h2>📊 Agendamento e Preferências de Relatórios em PDF</h2>{saved_msg if section=="reports" else ""}<form method="post" action="/settings" class="form"><input type="hidden" name="redirect_section" value="reports"><fieldset><legend>Agendamento Automático (Salvo no Desktop)</legend><div class="grid3"><label>Status do Agendador<select name="pdf_report_enabled"><option value="1" {"selected" if r_enabled=="1" else ""}>Ativo (Gerar nos horários programados)</option><option value="0" {"selected" if r_enabled=="0" else ""}>Inativo</option></select></label><label>Dias de Execução<select name="pdf_report_days"><option value="Mon,Wed,Fri" {"selected" if r_days=="Mon,Wed,Fri" else ""}>Segunda, Quarta e Sexta</option><option value="ALL" {"selected" if r_days=="ALL" else ""}>Todos os dias (Diário)</option><option value="Mon" {"selected" if r_days=="Mon" else ""}>Apenas Segunda-feira</option><option value="Fri" {"selected" if r_days=="Fri" else ""}>Apenas Sexta-feira</option></select></label><label>Horário de Emissão (24h)<input type="time" name="pdf_report_time" value="{esc(r_time)}" required></label></div><p class="muted">Os relatórios gerados automaticamente serão salvos na pasta <b>Desktop\\Relatório Logística Casa do Campo</b> no computador.</p></fieldset><fieldset style="margin-top:1rem;"><legend>Filtros do Relatório PDF</legend><div class="grid3"><label>Filtrar por Status dos Pedidos<select name="pdf_report_status_filter"><option value="Todos" {"selected" if r_filter=="Todos" else ""}>Todos os Status (Visão Completa)</option><option value="Faturado" {"selected" if r_filter=="Faturado" else ""}>Apenas Faturados</option><option value="Saiu para entrega" {"selected" if r_filter=="Saiu para entrega" else ""}>Apenas Em Rota</option><option value="Acertado" {"selected" if r_filter=="Acertado" else ""}>Apenas Entregues / Acertados</option><option value="Problema" {"selected" if r_filter=="Problema" else ""}>Apenas Com Problema</option></select></label></div></fieldset><div style="display:flex;gap:12px;align-items:center;margin-top:1.2rem;flex-wrap:wrap;"><button class="btn primary">💾 Salvar preferências de relatório</button><a class="btn ghost" href="/settings/reports/generate-now" style="color:#15803d;border-color:#22c55e;font-weight:700;">⚡ Gerar Relatório Agora em PDF (Salvar no Desktop)</a></div></form></section>'''
+
+        if can_manage_app_config:
+            app_title = settings.get('driver_app_title', 'Entregas Casa do Campo')
+            app_req_photo = settings.get('driver_app_require_photo', '0')
+            app_req_sig = settings.get('driver_app_require_signature', '0')
+            app_gps = settings.get('driver_app_gps_mode', 'auto')
+            app_sync = settings.get('driver_app_sync_interval_sec', '30')
+            content += f'''<section class="panel settings-panel" id="settings-app_config"><h2>📱 Parâmetros Globais do Aplicativo Mobile (PWA)</h2><div class="alert info">Acesso restrito exclusivamente a administradores <b>GOD</b>. Altera o comportamento do App do Motorista.</div><form method="post" action="/settings" class="form"><input type="hidden" name="redirect_section" value="app_config"><fieldset><legend>Identidade e Políticas da Entrega Mobile</legend><div class="grid3"><label>Título do aplicativo mobile<input name="driver_app_title" value="{esc(app_title)}"></label><label>Obrigatoriedade de foto do canhoto<select name="driver_app_require_photo"><option value="0" {"selected" if app_req_photo=="0" else ""}>Foto ou Assinatura (Flexível)</option><option value="1" {"selected" if app_req_photo=="1" else ""}>Foto do Canhoto Obrigatória</option></select></label><label>Obrigatoriedade de assinatura digital<select name="driver_app_require_signature"><option value="0" {"selected" if app_req_sig=="0" else ""}>Opcional (Foto ou Assinatura)</option><option value="1" {"selected" if app_req_sig=="1" else ""}>Assinatura Obrigatória</option></select></label><label>Captura de Geolocalização GPS<select name="driver_app_gps_mode"><option value="auto" {"selected" if app_gps=="auto" else ""}>Automática na Confirmação (Recomendado)</option><option value="disabled" {"selected" if app_gps=="disabled" else ""}>Desativada</option></select></label><label>Sincronização em segundo plano (segundos)<input type="number" name="driver_app_sync_interval_sec" value="{esc(app_sync)}" min="5" max="300"></label></div></fieldset><button class="btn primary" style="margin-top:1rem;">💾 Salvar configurações do App Mobile</button></form></section>'''
+
         if can_manage_users:
             userform=f'''<form method="post" action="/settings/user" class="inline-form"><input type="hidden" name="redirect_section" value="users"><input name="name" placeholder="Nome" required><input name="username" placeholder="Usuário" required><select name="role">{option(ROLES)}</select><button>Criar usuário</button></form>
             <div class="alert info">Ao criar usuário, a senha inicial será <b>usuario123</b> (ex.: joao = joao123) com troca obrigatória no primeiro login.</div>
@@ -6231,11 +6267,45 @@ document.addEventListener('DOMContentLoaded', function(){
             ) or '<tr><td colspan="7">Sem auditoria ainda.</td></tr>'
             content += f'<section class="panel settings-panel" id="settings-audit"><h2>Auditoria recente</h2><div class="table-wrap"><table><thead><tr><th>Data</th><th>Usuário</th><th>Módulo</th><th>Ação</th><th>Registro</th><th>IP</th><th>Detalhes técnicos</th></tr></thead><tbody>{logrows}</tbody></table></div></section>'
         return self.send_html(layout(u,'Configurações',content,'Administração do sistema, usuários e permissões'))
+
+    def generate_pdf_report_now(self, u):
+        if not (self.has_perm(u, 'manage_settings') or is_admin(u)):
+            return self.fail(u, 'Sem permissão', 'Você não tem permissão para gerar relatórios.', 403)
+        with conn() as db:
+            settings_map = {r['key']: r['value'] for r in db.execute('SELECT * FROM settings')}
+            filepath = pdf_report_service.generate_orders_pdf_report(db, config=settings_map)
+            filename = os.path.basename(filepath)
+            audit(db, u, 'Gerou relatório PDF manual', 'Relatórios', filename, '', f'Salvo em {filepath}')
+            db.commit()
+        self.redirect(f'/settings?section=reports&report_generated=1&filename={quote(filename)}')
+
     def post_settings(self,u):
+        d=self.post_data()
+        redirect_section=(d.get('redirect_section') or 'system').strip().lower()
+
+        if redirect_section == 'app_config':
+            if not is_god(u):
+                return self.send_html(layout(u,'Acesso negado','<div class="alert danger">Somente perfis GOD alteram configurações do App Mobile.</div>'),403)
+            app_keys=['driver_app_title','driver_app_require_photo','driver_app_require_signature','driver_app_gps_mode','driver_app_sync_interval_sec']
+            with conn() as db:
+                for k in app_keys:
+                    db.execute('INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES(?,?,?)',(k,d.get(k,''),now()))
+                audit(db,u,'Alterou configurações do App Mobile','Configurações'); db.commit()
+            return self.redirect('/settings?section=app_config#settings-app_config')
+
+        if redirect_section == 'reports':
+            if not (self.has_perm(u,'manage_settings') or is_admin(u)):
+                return self.send_html(layout(u,'Acesso negado','<div class="alert danger">Somente perfis autorizados alteram preferências de relatórios.</div>'),403)
+            report_keys=['pdf_report_enabled','pdf_report_days','pdf_report_time','pdf_report_status_filter']
+            with conn() as db:
+                for k in report_keys:
+                    db.execute('INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES(?,?,?)',(k,d.get(k,''),now()))
+                audit(db,u,'Alterou configurações de relatórios PDF','Configurações'); db.commit()
+            return self.redirect('/settings?section=reports#settings-reports')
+
         if not self.has_perm(u,'manage_settings') or not is_admin(u):
             return self.send_html(layout(u,'Acesso negado','<div class="alert danger">Somente perfis autorizados alteram configurações globais.</div>'),403)
-        d=self.post_data(); keys=['system_name','company_name','company_subtitle','primary_color','secondary_color','accent_color','background_color','load_capacity_kg','maintenance_mode','god_note']
-        redirect_section=(d.get('redirect_section') or 'system').strip().lower()
+        keys=['system_name','company_name','company_subtitle','primary_color','secondary_color','accent_color','background_color','load_capacity_kg','maintenance_mode','god_note']
         load_capacity=parse_float(d.get('load_capacity_kg') or 0)
         if load_capacity <= 0:
             raise ValueError('Capacidade padrão deve ser maior que zero.')
@@ -7416,6 +7486,56 @@ def sync_pending_invoiced_orders_to_logistica():
     return updated_count
 
 
+def start_pdf_report_scheduler():
+    def pdf_loop():
+        while True:
+            try:
+                time.sleep(30)
+                now_dt = datetime.now()
+                current_time = now_dt.strftime("%H:%M")
+                weekday = now_dt.strftime("%a")
+                today_str = now_dt.strftime("%Y-%m-%d")
+
+                with conn() as db:
+                    settings_map = {r['key']: r['value'] for r in db.execute('SELECT * FROM settings')}
+                    enabled = settings_map.get('pdf_report_enabled', '1') == '1'
+                    target_time = settings_map.get('pdf_report_time', '09:00').strip()
+                    sched_days_raw = settings_map.get('pdf_report_days', 'Mon,Wed,Fri')
+                    last_run = settings_map.get('pdf_report_last_run', '')
+
+                    if not enabled:
+                        continue
+
+                    day_map = {
+                        'seg': 'Mon', 'mon': 'Mon', 'segunda': 'Mon',
+                        'qua': 'Wed', 'wed': 'Wed', 'quarta': 'Wed',
+                        'sex': 'Fri', 'fri': 'Fri', 'sexta': 'Fri',
+                        'todos': 'ALL', 'all': 'ALL'
+                    }
+                    sched_days = [d.strip() for d in sched_days_raw.split(',') if d.strip()]
+                    normalized_days = set()
+                    for d in sched_days:
+                        d_low = d.lower()
+                        normalized_days.add(day_map.get(d_low, d))
+
+                    is_scheduled_day = ('ALL' in normalized_days) or (weekday in normalized_days)
+                    is_scheduled_time = (current_time == target_time)
+                    already_ran_today = last_run.startswith(today_str)
+
+                    if is_scheduled_day and is_scheduled_time and not already_ran_today:
+                        filepath = pdf_report_service.generate_orders_pdf_report(db, config=settings_map)
+                        filename = os.path.basename(filepath)
+                        now_ts = now()
+                        db.execute("INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES('pdf_report_last_run',?,?)", (f"{today_str} {current_time}", now_ts))
+                        audit(db, {'id': 1, 'username': 'sistema', 'name': 'Agendador Automático', 'role': 'god'}, 'Gerou relatório PDF agendado', 'Relatórios', filename, '', f'Salvo em {filepath}')
+                        db.commit()
+            except Exception as e:
+                log_server_error("pdf_report_scheduler_loop", e)
+
+    t = threading.Thread(target=pdf_loop, name="pdf-report-scheduler", daemon=True)
+    t.start()
+
+
 def _erp_invoice_sync_worker():
     """
     Thread de sincronização de faturamento ERP → Logística.
@@ -7474,6 +7594,10 @@ def _erp_invoice_sync_worker():
 def create_server(host: str = HOST, port: int = PORT) -> SafeThreadingHTTPServer:
     init_db()
     runtime_state_cleanup(force=True)
+    try:
+        start_pdf_report_scheduler()
+    except Exception as _e:
+        pass
     if _ERP_AVAILABLE:
         try:
             _erp_connector.register_db_reader(get_setting)
