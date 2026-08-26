@@ -841,6 +841,52 @@ def order_sla_row_class(limit_date, status=''):
         return 'sla-risk'
     return 'sla-ok'
 
+
+def order_map_info(order_row, receipt_row=None):
+    if not order_row:
+        return ("", False, "")
+    keys = order_row.keys()
+
+    # 1. GPS do comprovante
+    if receipt_row:
+        r_keys = receipt_row.keys()
+        if 'delivery_location_link' in r_keys and receipt_row['delivery_location_link']:
+            return (receipt_row['delivery_location_link'], True, 'GPS')
+        if 'latitude' in r_keys and receipt_row['latitude'] is not None and 'longitude' in r_keys and receipt_row['longitude'] is not None:
+            try:
+                lat, lng = float(receipt_row['latitude']), float(receipt_row['longitude'])
+                return (f"https://www.google.com/maps?q={lat:.6f},{lng:.6f}", True, 'GPS')
+            except (ValueError, TypeError):
+                pass
+
+    # 2. GPS do pedido
+    if 'dr_loc_link' in keys and order_row['dr_loc_link']:
+        return (order_row['dr_loc_link'], True, 'GPS')
+    if 'delivery_location_link' in keys and order_row['delivery_location_link']:
+        return (order_row['delivery_location_link'], True, 'GPS')
+    if 'delivery_latitude' in keys and order_row['delivery_latitude'] is not None and 'delivery_longitude' in keys and order_row['delivery_longitude'] is not None:
+        try:
+            lat, lng = float(order_row['delivery_latitude']), float(order_row['delivery_longitude'])
+            return (f"https://www.google.com/maps?q={lat:.6f},{lng:.6f}", True, 'GPS')
+        except (ValueError, TypeError):
+            pass
+    if 'location_link' in keys and order_row['location_link']:
+        return (order_row['location_link'], True, 'GPS')
+
+    # 3. Fallback de Endereço / Fazenda no Google Maps
+    client = order_row['client'] if 'client' in keys else (order_row['client_name'] if 'client_name' in keys else '')
+    farm = order_row['farm_name'] if 'farm_name' in keys else ''
+    addr = order_row['delivery_address'] if 'delivery_address' in keys else ''
+    city = order_row['city'] if 'city' in keys else (order_row['client_city'] if 'client_city' in keys else '')
+
+    parts = [str(p).strip() for p in (farm, client, addr, city) if p and str(p).strip()]
+    if parts:
+        q_str = quote(" ".join(parts[:3]))
+        return (f"https://www.google.com/maps/search/?api=1&query={q_str}", False, 'Endereço')
+
+    return ("", False, "")
+
+
 def get_setting(key, default=''):
     try:
         with conn() as db:
@@ -3799,15 +3845,13 @@ document.addEventListener('DOMContentLoaded', function(){
         r_delivered_at = r['delivered_at'] if 'delivered_at' in r.keys() else None
         r_final_notes = r['final_notes'] if 'final_notes' in r.keys() else None
 
+        loc_url, is_gps, loc_label = order_map_info(r, receipt)
         lat = receipt['latitude'] if (receipt and 'latitude' in receipt.keys() and receipt['latitude']) else (r['delivery_latitude'] if 'delivery_latitude' in r.keys() else None)
         lng = receipt['longitude'] if (receipt and 'longitude' in receipt.keys() and receipt['longitude']) else (r['delivery_longitude'] if 'delivery_longitude' in r.keys() else None)
-        loc_link = receipt['delivery_location_link'] if (receipt and 'delivery_location_link' in receipt.keys() and receipt['delivery_location_link']) else (r['delivery_location_link'] if 'delivery_location_link' in r.keys() else None)
-        if not loc_link and lat is not None and lng is not None:
-            loc_link = f"https://www.google.com/maps?q={lat:.6f},{lng:.6f}"
 
         has_receipt_photo = bool(receipt and receipt['image_data']) or bool(r_receipt_photo)
         has_signature = bool(receipt and receipt['digital_signature'])
-        if has_receipt_photo or has_signature or r_delivered_to or loc_link:
+        if has_receipt_photo or has_signature or r_delivered_to or loc_url:
             rec_to = esc(receipt['delivered_to'] if receipt and receipt['delivered_to'] else (r_delivered_to or '—'))
             rec_doc = esc(receipt['delivered_document'] if receipt and receipt['delivered_document'] else (r_delivered_doc or ''))
             rec_doc_type = esc(receipt['delivered_document_type'] if (receipt and 'delivered_document_type' in receipt.keys() and receipt['delivered_document_type']) else (r_delivered_doc_type or 'CPF'))
@@ -3828,7 +3872,16 @@ document.addEventListener('DOMContentLoaded', function(){
                 </a>
             </div>''' if has_signature else ''
 
-            gps_html = f'''<p><b>Localização GPS</b><a href="{esc(loc_link)}" target="_blank" rel="noopener" class="btn small primary" style="background:#0284c7; border-color:#0284c7; font-weight:700; display:inline-flex; align-items:center; gap:6px; color:#ffffff; padding:6px 12px; border-radius:6px; margin-top:4px;">📍 Ver Localização Exata no Google Maps ({lat:.4f}, {lng:.4f})</a></p>''' if (loc_link and lat is not None and lng is not None) else (f'''<p><b>Localização GPS</b><a href="{esc(loc_link)}" target="_blank" rel="noopener" class="btn small primary" style="background:#0284c7; border-color:#0284c7; font-weight:700; display:inline-flex; align-items:center; gap:6px; color:#ffffff; padding:6px 12px; border-radius:6px; margin-top:4px;">📍 Abrir Mapa no Google Maps</a></p>''' if loc_link else '<p><b>Localização GPS</b><span class="muted">Não capturada no momento da confirmação</span></p>')
+            if loc_url:
+                if is_gps and lat is not None and lng is not None:
+                    btn_text = f"📍 Ver Localização Exata no Google Maps ({lat:.4f}, {lng:.4f})"
+                elif is_gps:
+                    btn_text = "📍 Ver Localização Exata no Google Maps (GPS)"
+                else:
+                    btn_text = f"📍 Ver Localização no Google Maps ({loc_label})"
+                gps_html = f'''<p><b>Localização no Mapa</b><a href="{esc(loc_url)}" target="_blank" rel="noopener" class="btn small primary" style="background:#0284c7; border-color:#0284c7; font-weight:700; display:inline-flex; align-items:center; gap:6px; color:#ffffff; padding:6px 12px; border-radius:6px; margin-top:4px;">{esc(btn_text)}</a></p>'''
+            else:
+                gps_html = '<p><b>Localização no Mapa</b><span class="muted">Não capturada</span></p>'
 
             receipt_panel = f'''<section class="panel" style="border-left:5px solid #10b981;">
                 <h2 style="color:#065f46;">📷 Comprovante e Assinatura da Entrega (App do Motorista)</h2>
@@ -4762,8 +4815,8 @@ document.addEventListener('DOMContentLoaded', function(){
         with conn() as db:
             r=db.execute("SELECT r.*,d.name driver,v.name vehicle,v.plate FROM routes r LEFT JOIN drivers d ON d.id=r.driver_id LEFT JOIN vehicles v ON v.id=r.vehicle_id WHERE r.id=?",(rid,)).fetchone()
             target_route = str(r['route_name'] or '').strip() if r else ''
-            ros=db.execute("""SELECT ro.*,o.order_number,o.seller_name,o.status,o.weight_kg,o.city,o.route_name,
-                                     o.expected_delivery_date,o.receipt_photo,o.delivery_location_link,c.name client,
+            ros=db.execute("""SELECT ro.*,o.order_number,o.seller_name,o.status,o.weight_kg,o.city,o.route_name,o.delivery_address,
+                                     o.expected_delivery_date,o.receipt_photo,o.delivery_location_link,c.name client,c.farm_name,
                                      (SELECT COUNT(*) FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.image_data IS NOT NULL) has_photo,
                                      (SELECT COUNT(*) FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.digital_signature IS NOT NULL) has_sig,
                                      (SELECT delivery_location_link FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.delivery_location_link IS NOT NULL AND dr.delivery_location_link!='' LIMIT 1) dr_loc_link
@@ -4807,7 +4860,13 @@ document.addEventListener('DOMContentLoaded', function(){
         can_settle_routes = self.has_perm(u,'settle_routes')
         settlement_link = f"<a class='btn small ghost' href='/load-settlement?q={quote(r['name'])}'>Acerto da carga</a>" if can_settle_routes else "<span class='muted'>Sem permissão para acerto</span>"
         pct=(float(r['total_weight'] or 0)/float(r['capacity'] or 1))*100
-        rows=''.join(f"""<tr><td><input form='seqForm' type='number' name='seq_{ro['id']}' value='{ro['delivery_order']}' class='seq' {'readonly' if not can_edit else ''}></td><td><a href='/orders/{ro['order_id']}'><b>{esc(ro['order_number'])}</b></a><br><small>{esc(ro['client'] or '')} · Vendedor: {esc(ro['seller_name'] or 'Não informado')}</small></td><td>{esc(ro['city'] or '')}<br><small>{esc(ro['route_name'] or '')}</small></td><td>{badge(ro['status'])}{f'<br><a href="/orders/{ro["order_id"]}/receipt-image" target="_blank" class="btn small ghost" style="color:#059669; border-color:#059669; padding:1px 4px; font-size:0.75rem; margin-top:3px; display:inline-block;">📷 Canhoto</a>' if (ro['has_photo'] or ro['receipt_photo']) else ''}{f'<a href="/orders/{ro["order_id"]}/signature-image" target="_blank" class="btn small ghost" style="color:#0284c7; border-color:#0284c7; padding:1px 4px; font-size:0.75rem; margin-top:3px; display:inline-block;">✍️ Assinatura</a>' if ro['has_sig'] else ''}{f'<br><a href="{esc(ro["dr_loc_link"] or ro["delivery_location_link"])}" target="_blank" class="btn small ghost" style="color:#0369a1; border-color:#0369a1; padding:1px 4px; font-size:0.75rem; margin-top:3px; display:inline-block;">📍 Mapa</a>' if (("dr_loc_link" in ro.keys() and ro["dr_loc_link"]) or ("delivery_location_link" in ro.keys() and ro["delivery_location_link"])) else ""}</td><td>{deadline_pill(ro['expected_delivery_date'],ro['status'])}</td><td>{fmt_num(ro['weight_kg'])} kg</td><td><div class='route-actions'>{f"<form method='post' action='/routes/{rid}/remove/{ro['id']}' class='inline-mini'><button class='danger-btn'>Remover</button></form>" if can_edit else "<span class='muted'>Carga finalizada</span>"}</div></td></tr>""" for ro in ros)
+        def _render_route_order(ro):
+            loc_url, is_gps, loc_type = order_map_info(ro)
+            map_html = f'<br><a href="{esc(loc_url)}" target="_blank" rel="noopener" class="btn small ghost" style="color:#0369a1; border-color:#0369a1; padding:1px 4px; font-size:0.75rem; margin-top:3px; display:inline-block;">📍 Mapa ({esc(loc_type)})</a>' if loc_url else ''
+            photo_btn = f'<br><a href="/orders/{ro["order_id"]}/receipt-image" target="_blank" class="btn small ghost" style="color:#059669; border-color:#059669; padding:1px 4px; font-size:0.75rem; margin-top:3px; display:inline-block;">📷 Canhoto</a>' if (ro['has_photo'] or ro['receipt_photo']) else ''
+            sig_btn = f'<a href="/orders/{ro["order_id"]}/signature-image" target="_blank" class="btn small ghost" style="color:#0284c7; border-color:#0284c7; padding:1px 4px; font-size:0.75rem; margin-top:3px; display:inline-block;">✍️ Assinatura</a>' if ro['has_sig'] else ''
+            return f"""<tr><td><input form='seqForm' type='number' name='seq_{ro['id']}' value='{ro['delivery_order']}' class='seq' {'readonly' if not can_edit else ''}></td><td><a href='/orders/{ro['order_id']}'><b>{esc(ro['order_number'])}</b></a><br><small>{esc(ro['client'] or '')} · Vendedor: {esc(ro['seller_name'] or 'Não informado')}</small></td><td>{esc(ro['city'] or '')}<br><small>{esc(ro['route_name'] or '')}</small></td><td>{badge(ro['status'])}{photo_btn}{sig_btn}{map_html}</td><td>{deadline_pill(ro['expected_delivery_date'],ro['status'])}</td><td>{fmt_num(ro['weight_kg'])} kg</td><td><div class='route-actions'>{f"<form method='post' action='/routes/{rid}/remove/{ro['id']}' class='inline-mini'><button class='danger-btn'>Remover</button></form>" if can_edit else "<span class='muted'>Carga finalizada</span>"}</div></td></tr>"""
+        rows=''.join(_render_route_order(ro) for ro in ros)
         add_opts=''.join(f"<option value='{a['id']}'>{esc(a['order_number'])} - {esc(a['client'] or '')} - Vendedor: {esc(a['seller_name'] or 'Não informado')} - {esc(a['city'] or '')} - {fmt_num(a['weight_kg'])}kg</option>" for a in available)
         lock_notice = '<div class="alert info">Carga finalizada: edição de pedidos e sequência está bloqueada para preservar o histórico.</div>' if not can_edit else ''
         dispatch_action = f"<form method='post' action='/routes/{rid}/dispatch'><button>1. Marcar saída</button></form>" if can_dispatch else "<span class='muted'>Saída já registrada</span>"

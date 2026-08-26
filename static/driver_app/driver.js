@@ -62,6 +62,7 @@ const DriverApp = {
   },
 
   async init() {
+    this.startGpsTracking();
     this.bindEvents();
     await this.openDatabase();
     await this.recoverInterruptedOperations();
