@@ -7356,10 +7356,18 @@ document.addEventListener('DOMContentLoaded', function() {{
         if not _ERP_AVAILABLE:
             return self.send_json({'ok': False, 'message': 'Módulo ERP indisponível.'}, 503)
 
+        with conn() as db:
+            db.execute("INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES('erp_enabled','1',?)", (now(),))
+            db.execute("INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES('erp_sync_auto_enabled','1',?)", (now(),))
+            db.commit()
+
+        if _ERP_AVAILABLE:
+            _erp_connector.reload_erp_config()
+
         status_info = _erp_connector.get_sync_status()
         if not status_info.get('running'):
             def _run_manual_sync():
-                _erp_connector.sync_erp_cache()
+                _erp_connector.sync_erp_cache(force=True)
                 sync_pending_invoiced_orders_to_logistica()
 
             threading.Thread(target=_run_manual_sync, name='manual-sync-thread', daemon=True).start()

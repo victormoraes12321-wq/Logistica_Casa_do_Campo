@@ -538,7 +538,7 @@ def _update_sync_info(**kwargs) -> None:
         _LAST_SYNC_INFO.update(kwargs)
 
 
-def sync_erp_cache() -> dict[str, Any]:
+def sync_erp_cache(force: bool = False) -> dict[str, Any]:
     """
     Sincroniza dados do ERP para o cache local (últimos N dias).
     Retorna dict com resultado: {'ok': bool, 'records': int, 'message': str}
@@ -547,8 +547,31 @@ def sync_erp_cache() -> dict[str, Any]:
     global _LAST_SYNC_INFO
 
     cfg = get_erp_config()
-    if not cfg.is_ready:
-        return {"ok": False, "records": 0, "message": "ERP não configurado ou desabilitado."}
+    has_credentials = bool(cfg.host) and bool(cfg.database) and bool(cfg.user)
+
+    if not has_credentials:
+        msg = "ERP não configurado (host, banco ou usuário em branco nos Parâmetros ERP)."
+        _update_sync_info(
+            step=f"❌ {msg}",
+            progress_pct=100,
+            status="error",
+            error=msg,
+            running=False,
+            finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
+        return {"ok": False, "records": 0, "message": msg}
+
+    if not force and not cfg.enabled:
+        msg = "Integração ERP desativada nos Parâmetros ERP."
+        _update_sync_info(
+            step=f"❌ {msg}",
+            progress_pct=100,
+            status="error",
+            error=msg,
+            running=False,
+            finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
+        return {"ok": False, "records": 0, "message": msg}
 
     with _SYNC_STATE_LOCK:
         if _LAST_SYNC_INFO.get("running"):
@@ -1108,9 +1131,8 @@ def check_connectivity(config: ErpConfig | None = None) -> dict[str, Any]:
     Retorna dict com 'ok', 'message' e 'views'.
     """
     cfg = config or get_erp_config()
-    if not cfg.enabled:
-        return {"ok": False, "message": "Integração ERP desabilitada.", "views": {}}
-    if not cfg.is_ready:
+    has_credentials = bool(cfg.host) and bool(cfg.database) and bool(cfg.user)
+    if not has_credentials:
         return {"ok": False, "message": "Configuração ERP incompleta. Verifique Host, Banco e Usuário.", "views": {}}
 
     all_views = {
