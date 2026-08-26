@@ -1401,7 +1401,32 @@ def layout(user,title,content,subtitle=None):
     cssvars=f'--primary:{primary};--secondary:{secondary};--accent:{accent};--bg:{bg};'
     new_order_btn = '<a class="btn ghost" href="/orders/new">Novo pedido</a>' if user_can(user,'create_orders') else ''
     help_widget = contextual_help_widget(title)
-    return f'''<!doctype html><html lang="pt-br"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{esc(title)} · {esc(system)}</title><link rel="stylesheet" href="/static/style.css"><script src="/static/app.js" defer></script></head><body style="{cssvars}"><aside class="sidebar"><div class="brand"><img src="{esc(logo)}" alt="Logo"><div><b>{esc(system)}</b><span>{esc(company)}</span></div></div><nav>{nav}</nav><div class="side-foot"><b>{esc(sub)}</b><small>Fluxo: venda → faturado → saiu para entrega → acerto</small></div></aside><main class="main"><header class="topbar"><form class="search" method="get" action="/orders"><input name="q" placeholder="Buscar pedido, NF, cliente, cidade... (Ctrl+K)"></form>{topbar_alerts}<div class="userbox"><div><b>{esc(user['name'])}</b><small>{esc(normalize_role(user['role']))}</small></div><a href="/logout">Sair</a></div></header><section class="content"><div class="page-head"><div><h1>{esc(title)}</h1><p>{esc(subtitle or (company+' · operação logística local'))}</p></div><div class="head-actions">{help_widget}{new_order_btn}<button id="btnPrintPage" class="btn print">Imprimir</button></div></div>{tutorial_for(title)}{content}</section></main>
+    dynamic_css = f'''<style>
+:root {{
+  --primary-color: {primary};
+  --primary: {primary};
+  --green-strong: {primary};
+  --sidebar-bg: {primary};
+  --bg: {bg};
+  --accent: {accent};
+  --secondary: {secondary};
+}}
+body {{ background-color: var(--bg) !important; }}
+.sidebar {{ background-color: var(--primary) !important; }}
+button.primary, .btn.primary {{ background-color: var(--primary) !important; border-color: var(--primary) !important; color: #fff !important; }}
+button.primary:hover, .btn.primary:hover {{ filter: brightness(1.15); transform: translateY(-1px); box-shadow: 0 4px 14px rgba(0,0,0,0.18); }}
+.panel, .card, .stat {{ animation: fadeInUp 0.28s cubic-bezier(0.16, 1, 0.3, 1); transition: transform 0.2s ease, box-shadow 0.2s ease; }}
+.panel:hover, .card:hover {{ box-shadow: 0 8px 24px rgba(0,0,0,0.07); }}
+@keyframes fadeInUp {{ from {{ opacity: 0; transform: translateY(8px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+.badge.pulse {{ animation: badgePulse 2s infinite; }}
+@keyframes badgePulse {{ 0% {{ box-shadow: 0 0 0 0 rgba(220,38,38,0.4); }} 70% {{ box-shadow: 0 0 0 6px rgba(220,38,38,0); }} 100% {{ box-shadow: 0 0 0 0 rgba(220,38,38,0); }} }}
+.perm-card {{ background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px; margin-bottom: 14px; box-shadow: 0 2px 6px rgba(0,0,0,0.03); }}
+.perm-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }}
+.checkbox-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin: 10px 0; }}
+.checkbox-card {{ display: flex; align-items: center; gap: 8px; background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; padding: 10px 12px; cursor: pointer; font-weight: 600; font-size: 0.9rem; }}
+.checkbox-card input[type="checkbox"] {{ width: 18px; height: 18px; accent-color: var(--primary); cursor: pointer; }}
+</style>'''
+    return f'''<!doctype html><html lang="pt-br"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{esc(title)} · {esc(system)}</title><link rel="stylesheet" href="/static/style.css">{dynamic_css}<script src="/static/app.js" defer></script></head><body style="{cssvars}"><aside class="sidebar"><div class="brand"><img src="{esc(logo)}" alt="Logo"><div><b>{esc(system)}</b><span>{esc(company)}</span></div></div><nav>{nav}</nav><div class="side-foot"><b>{esc(sub)}</b><small>Fluxo: venda → faturado → saiu para entrega → acerto</small></div></aside><main class="main"><header class="topbar"><form class="search" method="get" action="/orders"><input name="q" placeholder="Buscar pedido, NF, cliente, cidade... (Ctrl+K)"></form>{topbar_alerts}<div class="userbox"><div><b>{esc(user['name'])}</b><small>{esc(normalize_role(user['role']))}</small></div><a href="/logout">Sair</a></div></header><section class="content"><div class="page-head"><div><h1>{esc(title)}</h1><p>{esc(subtitle or (company+' · operação logística local'))}</p></div><div class="head-actions">{help_widget}{new_order_btn}<button id="btnPrintPage" class="btn print">Imprimir</button></div></div>{tutorial_for(title)}{content}</section></main>
     
     <!-- Drawer Lateral de Faturamento Inline -->
     <div id="invoiceDrawer" class="drawer-overlay">
@@ -3862,9 +3887,14 @@ document.addEventListener('DOMContentLoaded', function(){
         hist_rows=''.join(f'<li><b>{esc(h["action"])}</b> · {esc(h["old_status"] or "—")} → {esc(h["new_status"] or "—")}<br><small>{brdate(h["created_at"])} {esc(str(h["created_at"])[11:16])} · {esc(h["user"] or "Sistema")} · {esc(h["notes"] or "")}</small></li>' for h in reversed(hist)) or '<li>Sem histórico.</li>'
         item_rows=''.join(f'<tr><td>{esc(it["product_code"] or "—")}</td><td>{esc(it["product_name"])}</td><td>{esc(it["quantity"])} {esc(it["unit"] or "")}</td><td>{fmt_num(it["weight_kg"])} kg</td><td>{esc(it["notes"] or "")}</td></tr>' for it in items) or '<tr><td colspan="5">Sem itens cadastrados.</td></tr>'
         prob_rows=''.join(f'<li><b>{esc(p["problem_type"])}</b><br><small>{esc(p["description"])} · {brdate(p["created_at"])}</small></li>' for p in probs) or '<li>Nenhum problema registrado.</li>'
-        delete_action = f"""<form method='post' action='/orders/{oid}/delete' class='inline-form needs-confirm' data-confirm-text='Confirma apagar este pedido definitivamente?'>
-            <button class='danger-btn'>Apagar pedido</button>
-        </form>""" if self.has_perm(u,'cancel_orders') else ''
+        if is_god(u):
+            delete_action = f"""<form method='post' action='/orders/{oid}/delete' class='inline-form needs-confirm' data-confirm-text='⚠️ ATENÇÃO GOD: Confirma apagar definitivamente este pedido #{esc(r["order_number"])} e remover todos os seus vínculos de faturamento e carga?'>
+                <button class='danger-btn' style='background:#dc2626;border-color:#b91c1c;font-weight:800;'>⚡ Excluir Definitivamente (GOD Override)</button>
+            </form>"""
+        else:
+            delete_action = f"""<form method='post' action='/orders/{oid}/delete' class='inline-form needs-confirm' data-confirm-text='Confirma apagar este pedido definitivamente?'>
+                <button class='danger-btn'>Apagar pedido</button>
+            </form>""" if self.has_perm(u,'cancel_orders') else ''
         edit_btn = f'<a class="btn" href="/orders/{oid}/edit">Editar pedido</a>' if self.has_perm(u,'edit_orders') else ''
         actions = f'''<div class="action-strip no-print">{edit_btn}{delete_action}</div>'''
         problem_form=f'''<form method="post" action="/orders/{oid}/problem" class="form compact no-print"><h3>Registrar problema de entrega</h3><div class="grid3"><label>Motivo<select name="problem_type">{option(PROBLEM_TYPES)}</select></label><label class="full">Descrição<textarea name="description" required></textarea></label></div><button class="danger-btn">Registrar problema</button></form>'''
@@ -4032,6 +4062,19 @@ document.addEventListener('DOMContentLoaded', function(){
             if not row:
                 return self.fail(u,'Não encontrado','Pedido não encontrado.',404)
             order_status=normalize_order_status(row['status'])
+
+            # GOD OVERRIDE: GOD pode apagar qualquer pedido em qualquer status
+            if is_god(u):
+                db.execute('DELETE FROM route_orders WHERE order_id=?', (oid,))
+                db.execute('DELETE FROM delivery_receipts WHERE order_id=?', (oid,))
+                db.execute('DELETE FROM delivery_problems WHERE order_id=?', (oid,))
+                db.execute('DELETE FROM order_items WHERE order_id=?', (oid,))
+                db.execute('DELETE FROM order_history WHERE order_id=?', (oid,))
+                db.execute('DELETE FROM orders WHERE id=?', (oid,))
+                audit(db, u, 'Excluiu pedido (GOD Override)', 'Pedidos', row['order_number'], order_status, 'Exclusão forçada GOD')
+                db.commit()
+                return self.redirect('/orders')
+
             if order_status not in ('Venda','Cancelado'):
                 return self.fail(
                     u,
@@ -4109,6 +4152,22 @@ document.addEventListener('DOMContentLoaded', function(){
             if not route:
                 return self.fail(u,'Não encontrado','Carga não encontrada.',404)
             route_status=normalize_route_status(route['status'])
+
+            # GOD OVERRIDE: GOD pode apagar qualquer carga em qualquer status
+            if is_god(u):
+                ros=db.execute("SELECT order_id, status FROM route_orders WHERE route_id=?", (rid,)).fetchall()
+                for ro in ros:
+                    old_order=normalize_order_status(ro['status'])
+                    if old_order == 'Saiu para entrega':
+                        self.ensure_order_status(db, ro['order_id'], 'Faturado')
+                db.execute("DELETE FROM route_orders WHERE route_id=?", (rid,))
+                db.execute("DELETE FROM delivery_receipts WHERE route_id=?", (rid,))
+                db.execute("DELETE FROM delivery_problems WHERE route_id=?", (rid,))
+                db.execute("DELETE FROM routes WHERE id=?", (rid,))
+                audit(db, u, 'Apagou carga (GOD Override)', 'Rotas', route['route_name'] or f"#{rid}", route_status, 'Exclusão forçada GOD')
+                db.commit()
+                return self.redirect('/routes')
+
             if route_status in ('Em rota','Acertada','Com problema'):
                 return self.fail(
                     u,
@@ -4751,7 +4810,12 @@ document.addEventListener('DOMContentLoaded', function(){
         lock_notice = '<div class="alert info">Carga finalizada: edição de pedidos e sequência está bloqueada para preservar o histórico.</div>' if not can_edit else ''
         dispatch_action = f"<form method='post' action='/routes/{rid}/dispatch'><button>1. Marcar saída</button></form>" if can_dispatch else "<span class='muted'>Saída já registrada</span>"
         cancel_action = f"""<form method='post' action='/routes/{rid}/cancel' class='inline-form needs-confirm' data-confirm-text='Confirma cancelar esta carga? Todos pedidos não finalizados voltarão para Faturado.'><input name='reason' placeholder='Motivo do cancelamento' required><button class='danger-btn'>Cancelar carga</button></form>""" if can_cancel else ""
-        delete_action = f"""<form method='post' action='/routes/{rid}/delete' class='inline-form needs-confirm' data-confirm-text='Confirma apagar esta carga definitivamente?'><button class='danger-btn'>Apagar carga</button></form>""" if can_delete else ""
+        if is_god(u):
+            delete_action = f"""<form method='post' action='/routes/{rid}/delete' class='inline-form needs-confirm' data-confirm-text='⚠️ ATENÇÃO GOD: Confirma apagar definitivamente esta carga e desvincular seus pedidos?'>
+                <button class='danger-btn' style='background:#dc2626;border-color:#b91c1c;font-weight:800;'>⚡ Excluir Definitivamente (GOD Override)</button>
+            </form>"""
+        else:
+            delete_action = f"""<form method='post' action='/routes/{rid}/delete' class='inline-form needs-confirm' data-confirm-text='Confirma apagar esta carga definitivamente?'><button class='danger-btn'>Apagar carga</button></form>""" if can_delete else ""
         add_panel = f"<section class='panel no-print'><h2>Adicionar pedido</h2><p class='muted'>Somente pedidos da rota <b>{esc(r['route_name'] or 'não definida')}</b> aparecem na lista.</p><form method='post' action='/routes/{rid}/add' class='inline-form'><select name='order_id' required><option value=''>Pedido faturado sem carga</option>{add_opts}</select><button>Adicionar</button></form></section>" if can_edit else "<section class='panel no-print'><h2>Adicionar pedido</h2><div class='alert info'>Carga finalizada: não é possível adicionar novos pedidos.</div></section>"
         save_seq_btn = "<button form='seqForm' class='btn ghost no-print'>Salvar sequência</button>" if can_edit else "<span class='muted'>Sequência bloqueada</span>"
         assisted=self.route_assisted_block(r, u=u)
@@ -6120,6 +6184,7 @@ document.addEventListener('DOMContentLoaded', function(){
             settings={r['key']:r['value'] for r in db.execute('SELECT * FROM settings')}
             users=db.execute('SELECT * FROM users ORDER BY active DESC, role, name').fetchall()
             logs=db.execute('SELECT * FROM audit_logs ORDER BY id DESC LIMIT 35').fetchall()
+            drivers=db.execute('SELECT * FROM drivers WHERE active=1 ORDER BY name').fetchall()
             edit_target=db.execute('SELECT * FROM users WHERE id=?',(int(edit_uid),)).fetchone() if str(edit_uid).isdigit() else None
             perm_user_target=db.execute('SELECT * FROM users WHERE id=?',(perm_uid,)).fetchone() if perm_uid > 0 else None
             role_perm_rows={r['perm']: int(r['allowed'] or 0) for r in db.execute('SELECT perm,allowed FROM role_permissions WHERE role_name=?',(perm_role,)).fetchall()}
@@ -6176,96 +6241,85 @@ document.addEventListener('DOMContentLoaded', function(){
             gen_file = esc(qs.get('filename',['relatório'])[0])
             saved_msg = f'<div class="alert success" style="margin-bottom:1rem;">⚡ <b>Relatório PDF gerado com sucesso!</b><br>Arquivo salvo em <b>Desktop\\Relatório Logística Casa do Campo\\{gen_file}</b></div>'
 
-        if is_restricted_data_entry_user(u):
-            profile=f'''<section class="panel settings-panel" id="settings-profile"><h2>Minha conta</h2>{saved_msg if section=="profile" else ""}<form method="post" action="/settings/profile" class="inline-form"><input type="hidden" name="redirect_section" value="profile"><input type="hidden" name="name" value="{esc(u['name'])}"><input type="hidden" name="username" value="{esc(u['username'])}"><input name="password" type="password" placeholder="Nova senha" required><button>Alterar minha senha</button></form><p class="muted">Para seu perfil operacional, esta área permite somente troca de senha.</p><p class="muted">Último acesso: {brdate(u["last_login_at"])} {esc(str(u["last_login_at"] or "")[11:16]) if u["last_login_at"] else "—"}</p></section>'''
-        else:
-            profile=f'''<section class="panel settings-panel" id="settings-profile"><h2>Minha conta</h2>{saved_msg if section=="profile" else ""}<form method="post" action="/settings/profile" class="inline-form"><input type="hidden" name="redirect_section" value="profile"><input name="name" value="{esc(u['name'])}" placeholder="Nome" required><input name="username" value="{esc(u['username'])}" placeholder="Usuário" required><input name="password" type="password" placeholder="Nova senha opcional"><button>Atualizar minha conta</button></form><p class="muted">Último acesso: {brdate(u["last_login_at"])} {esc(str(u["last_login_at"] or "")[11:16]) if u["last_login_at"] else "—"}</p></section>'''
-        content = settings_tabs + profile
-        if not (can_manage_config or can_manage_reports or can_manage_app_config or can_manage_users or can_manage_permissions or can_view_audit):
-            return self.send_html(layout(u,'Configurações',content,'Ajustes da sua conta'))
-        if can_manage_config:
-            content += f'''<section class="panel settings-panel" id="settings-system"><h2>Parâmetros do sistema</h2><form method="post" action="/settings" class="form"><input type="hidden" name="redirect_section" value="system"><fieldset><legend>Identidade e operação</legend><div class="grid3"><label>Nome do sistema<input name="system_name" value="{esc(settings.get('system_name'))}"></label><label>Nome da empresa<input name="company_name" value="{esc(settings.get('company_name'))}"></label><label>Subtítulo<input name="company_subtitle" value="{esc(settings.get('company_subtitle'))}"></label><label>Cor principal<input type="color" name="primary_color" value="{esc(settings.get('primary_color'))}"></label><label>Cor secundária<input type="color" name="secondary_color" value="{esc(settings.get('secondary_color'))}"></label><label>Cor de apoio<input type="color" name="accent_color" value="{esc(settings.get('accent_color'))}"></label><label>Cor fundo<input type="color" name="background_color" value="{esc(settings.get('background_color','#f6f7f2'))}"></label><label>Prazo SLA oficial<input name="sla_limit_days" value="15" readonly><small>Travado em 15 dias corridos conforme regra operacional.</small></label><label>Capacidade padrão kg<input name="load_capacity_kg" value="{esc(settings.get('load_capacity_kg'))}"></label><label>Modo manutenção<select name="maintenance_mode"><option value="off" {'selected' if settings.get('maintenance_mode','off')!='on' else ''}>Desligado</option><option value="on" {'selected' if settings.get('maintenance_mode')=='on' else ''}>Ligado</option></select></label><label class="full">Observação interna<input name="god_note" value="{esc(settings.get('god_note',''))}" placeholder="Ex: revisão feita em..."></label></div></fieldset><button>Salvar configurações globais</button></form></section>'''
+        # Renderização do painel da aba ativa (APENAS A SEÇÃO SELECIONADA)
+        content = settings_tabs
 
-        if can_manage_reports:
+        if section == 'profile':
+            if is_restricted_data_entry_user(u):
+                content += f'''<section class="panel settings-panel" id="settings-profile"><h2>Minha conta</h2>{saved_msg}<form method="post" action="/settings/profile" class="inline-form"><input type="hidden" name="redirect_section" value="profile"><input type="hidden" name="name" value="{esc(u['name'])}"><input type="hidden" name="username" value="{esc(u['username'])}"><input name="password" type="password" placeholder="Nova senha" required><button>Alterar minha senha</button></form><p class="muted">Para seu perfil operacional, esta área permite somente troca de senha.</p><p class="muted">Último acesso: {brdate(u["last_login_at"])} {esc(str(u["last_login_at"] or "")[11:16]) if u["last_login_at"] else "—"}</p></section>'''
+            else:
+                content += f'''<section class="panel settings-panel" id="settings-profile"><h2>Minha conta</h2>{saved_msg}<form method="post" action="/settings/profile" class="inline-form"><input type="hidden" name="redirect_section" value="profile"><input name="name" value="{esc(u['name'])}" placeholder="Nome" required><input name="username" value="{esc(u['username'])}" placeholder="Usuário" required><input name="password" type="password" placeholder="Nova senha opcional"><button>Atualizar minha conta</button></form><p class="muted">Último acesso: {brdate(u["last_login_at"])} {esc(str(u["last_login_at"] or "")[11:16]) if u["last_login_at"] else "—"}</p></section>'''
+
+        elif section == 'system' and can_manage_config:
+            content += f'''<section class="panel settings-panel" id="settings-system"><h2>Parâmetros do sistema</h2><form method="post" action="/settings" class="form"><input type="hidden" name="redirect_section" value="system"><fieldset><legend>Identidade e operação</legend><div class="grid3"><label>Nome do sistema<input name="system_name" value="{esc(settings.get('system_name'))}"></label><label>Nome da empresa<input name="company_name" value="{esc(settings.get('company_name'))}"></label><label>Subtítulo<input name="company_subtitle" value="{esc(settings.get('company_subtitle'))}"></label><label>Cor principal<input type="color" name="primary_color" value="{esc(settings.get('primary_color'))}"></label><label>Cor secundária<input type="color" name="secondary_color" value="{esc(settings.get('secondary_color'))}"></label><label>Cor de apoio<input type="color" name="accent_color" value="{esc(settings.get('accent_color'))}"></label><label>Cor fundo<input type="color" name="background_color" value="{esc(settings.get('background_color','#f6f7f2'))}"></label><label>Prazo SLA oficial<input name="sla_limit_days" value="15" readonly><small>Travado em 15 dias corridos conforme regra operacional.</small></label><label>Capacidade padrão kg<input name="load_capacity_kg" value="{esc(settings.get('load_capacity_kg'))}"></label><label>Modo manutenção<select name="maintenance_mode"><option value="off" {'selected' if settings.get('maintenance_mode','off')!='on' else ''}>Desligado</option><option value="on" {'selected' if settings.get('maintenance_mode')=='on' else ''}>Ligado</option></select></label><label class="full">Observação interna<input name="god_note" value="{esc(settings.get('god_note',''))}" placeholder="Ex: revisão feita em..."></label></div></fieldset><button class="btn primary" style="margin-top:1rem;">💾 Salvar configurações globais</button></form></section>'''
+
+        elif section == 'reports' and can_manage_reports:
             r_enabled = settings.get('pdf_report_enabled', '1')
             r_days = settings.get('pdf_report_days', 'Mon,Wed,Fri')
             r_time = settings.get('pdf_report_time', '09:00')
-            r_filter = settings.get('pdf_report_status_filter', 'Todos')
-            content += f'''<section class="panel settings-panel" id="settings-reports"><h2>📊 Agendamento e Preferências de Relatórios em PDF</h2>{saved_msg if section=="reports" else ""}<form method="post" action="/settings" class="form"><input type="hidden" name="redirect_section" value="reports"><fieldset><legend>Agendamento Automático (Salvo no Desktop)</legend><div class="grid3"><label>Status do Agendador<select name="pdf_report_enabled"><option value="1" {"selected" if r_enabled=="1" else ""}>Ativo (Gerar nos horários programados)</option><option value="0" {"selected" if r_enabled=="0" else ""}>Inativo</option></select></label><label>Dias de Execução<select name="pdf_report_days"><option value="Mon,Wed,Fri" {"selected" if r_days=="Mon,Wed,Fri" else ""}>Segunda, Quarta e Sexta</option><option value="ALL" {"selected" if r_days=="ALL" else ""}>Todos os dias (Diário)</option><option value="Mon" {"selected" if r_days=="Mon" else ""}>Apenas Segunda-feira</option><option value="Fri" {"selected" if r_days=="Fri" else ""}>Apenas Sexta-feira</option></select></label><label>Horário de Emissão (24h)<input type="time" name="pdf_report_time" value="{esc(r_time)}" required></label></div><p class="muted">Os relatórios gerados automaticamente serão salvos na pasta <b>Desktop\\Relatório Logística Casa do Campo</b> no computador.</p></fieldset><fieldset style="margin-top:1rem;"><legend>Filtros do Relatório PDF</legend><div class="grid3"><label>Filtrar por Status dos Pedidos<select name="pdf_report_status_filter"><option value="Todos" {"selected" if r_filter=="Todos" else ""}>Todos os Status (Visão Completa)</option><option value="Faturado" {"selected" if r_filter=="Faturado" else ""}>Apenas Faturados</option><option value="Saiu para entrega" {"selected" if r_filter=="Saiu para entrega" else ""}>Apenas Em Rota</option><option value="Acertado" {"selected" if r_filter=="Acertado" else ""}>Apenas Entregues / Acertados</option><option value="Problema" {"selected" if r_filter=="Problema" else ""}>Apenas Com Problema</option></select></label></div></fieldset><div style="display:flex;gap:12px;align-items:center;margin-top:1.2rem;flex-wrap:wrap;"><button class="btn primary">💾 Salvar preferências de relatório</button><a class="btn ghost" href="/settings/reports/generate-now" style="color:#15803d;border-color:#22c55e;font-weight:700;">⚡ Gerar Relatório Agora em PDF (Salvar no Desktop)</a></div></form></section>'''
+            content += f'''<section class="panel settings-panel" id="settings-reports"><h2>📊 Agendamento e Preferências de Relatórios em PDF</h2>{saved_msg}<form method="post" action="/settings" class="form"><input type="hidden" name="redirect_section" value="reports"><fieldset><legend>Agendamento Automático (Salvo no Desktop)</legend><div class="grid3"><label>Status do Agendador<select name="pdf_report_enabled"><option value="1" {"selected" if r_enabled=="1" else ""}>Ativo (Gerar nos horários programados)</option><option value="0" {"selected" if r_enabled=="0" else ""}>Inativo</option></select></label><label>Dias de Execução<select name="pdf_report_days"><option value="Mon,Wed,Fri" {"selected" if r_days=="Mon,Wed,Fri" else ""}>Segunda, Quarta e Sexta</option><option value="ALL" {"selected" if r_days=="ALL" else ""}>Todos os dias (Diário)</option><option value="Mon" {"selected" if r_days=="Mon" else ""}>Apenas Segunda-feira</option><option value="Fri" {"selected" if r_days=="Fri" else ""}>Apenas Sexta-feira</option></select></label><label>Horário de Emissão (24h)<input type="time" name="pdf_report_time" value="{esc(r_time)}" required></label></div><p class="muted">Os relatórios gerados automaticamente serão salvos na pasta <b>Desktop\\Relatório Logística Casa do Campo</b> no computador.</p></fieldset><fieldset style="margin-top:1rem;"><legend>Status a Incluir no Relatório</legend><div class="checkbox-grid"><label class="checkbox-card"><input type="checkbox" name="pdf_report_st_venda" value="1" {"checked" if settings.get('pdf_report_st_venda','1')=='1' else ""}> Venda</label><label class="checkbox-card"><input type="checkbox" name="pdf_report_st_faturado" value="1" {"checked" if settings.get('pdf_report_st_faturado','1')=='1' else ""}> Faturado</label><label class="checkbox-card"><input type="checkbox" name="pdf_report_st_rota" value="1" {"checked" if settings.get('pdf_report_st_rota','1')=='1' else ""}> Saiu para Entrega</label><label class="checkbox-card"><input type="checkbox" name="pdf_report_st_acertado" value="1" {"checked" if settings.get('pdf_report_st_acertado','1')=='1' else ""}> Entregue / Acertado</label><label class="checkbox-card"><input type="checkbox" name="pdf_report_st_problema" value="1" {"checked" if settings.get('pdf_report_st_problema','1')=='1' else ""}> Com Problema</label><label class="checkbox-card"><input type="checkbox" name="pdf_report_st_cancelado" value="1" {"checked" if settings.get('pdf_report_st_cancelado','0')=='1' else ""}> Cancelado</label></div></fieldset><fieldset style="margin-top:1rem;"><legend>Colunas e Informações Visíveis no PDF</legend><div class="checkbox-grid"><label class="checkbox-card"><input type="checkbox" name="pdf_report_col_financial" value="1" {"checked" if settings.get('pdf_report_col_financial','1')=='1' else ""}> Valores R$</label><label class="checkbox-card"><input type="checkbox" name="pdf_report_col_weight" value="1" {"checked" if settings.get('pdf_report_col_weight','1')=='1' else ""}> Pesos kg</label><label class="checkbox-card"><input type="checkbox" name="pdf_report_col_dates" value="1" {"checked" if settings.get('pdf_report_col_dates','1')=='1' else ""}> Datas de Previsão</label><label class="checkbox-card"><input type="checkbox" name="pdf_report_col_seller" value="1" {"checked" if settings.get('pdf_report_col_seller','1')=='1' else ""}> Vendedor</label><label class="checkbox-card"><input type="checkbox" name="pdf_report_col_receiver" value="1" {"checked" if settings.get('pdf_report_col_receiver','1')=='1' else ""}> Recebedor / Obs</label></div></fieldset><div style="display:flex;gap:12px;align-items:center;margin-top:1.2rem;flex-wrap:wrap;"><button class="btn primary">💾 Salvar preferências de relatório</button><a class="btn ghost" href="/settings/reports/generate-now" style="color:#15803d;border-color:#22c55e;font-weight:700;">⚡ Gerar Relatório Agora em PDF (Salvar no Desktop)</a></div></form></section>'''
 
-        if can_manage_app_config:
+        elif section == 'app_config' and can_manage_app_config:
             app_title = settings.get('driver_app_title', 'Entregas Casa do Campo')
             app_req_photo = settings.get('driver_app_require_photo', '0')
             app_req_sig = settings.get('driver_app_require_signature', '0')
             app_gps = settings.get('driver_app_gps_mode', 'auto')
             app_sync = settings.get('driver_app_sync_interval_sec', '30')
-            content += f'''<section class="panel settings-panel" id="settings-app_config"><h2>📱 Parâmetros Globais do Aplicativo Mobile (PWA)</h2><div class="alert info">Acesso restrito exclusivamente a administradores <b>GOD</b>. Altera o comportamento do App do Motorista.</div><form method="post" action="/settings" class="form"><input type="hidden" name="redirect_section" value="app_config"><fieldset><legend>Identidade e Políticas da Entrega Mobile</legend><div class="grid3"><label>Título do aplicativo mobile<input name="driver_app_title" value="{esc(app_title)}"></label><label>Obrigatoriedade de foto do canhoto<select name="driver_app_require_photo"><option value="0" {"selected" if app_req_photo=="0" else ""}>Foto ou Assinatura (Flexível)</option><option value="1" {"selected" if app_req_photo=="1" else ""}>Foto do Canhoto Obrigatória</option></select></label><label>Obrigatoriedade de assinatura digital<select name="driver_app_require_signature"><option value="0" {"selected" if app_req_sig=="0" else ""}>Opcional (Foto ou Assinatura)</option><option value="1" {"selected" if app_req_sig=="1" else ""}>Assinatura Obrigatória</option></select></label><label>Captura de Geolocalização GPS<select name="driver_app_gps_mode"><option value="auto" {"selected" if app_gps=="auto" else ""}>Automática na Confirmação (Recomendado)</option><option value="disabled" {"selected" if app_gps=="disabled" else ""}>Desativada</option></select></label><label>Sincronização em segundo plano (segundos)<input type="number" name="driver_app_sync_interval_sec" value="{esc(app_sync)}" min="5" max="300"></label></div></fieldset><button class="btn primary" style="margin-top:1rem;">💾 Salvar configurações do App Mobile</button></form></section>'''
+            app_force_pass = settings.get('driver_app_force_password_change', '1')
+            
+            drivers_rows = ''.join(f'<tr><td>{esc(d["id"])}</td><td><b>{esc(d["name"])}</b></td><td>{esc(d["phone"] or "—")}</td><td>{esc(d["document"] or "—")}</td><td><a class="btn small ghost" href="/drivers?edit={d["id"]}">Editar Motorista</a></td></tr>' for d in drivers)
+            empty_drivers_tr = '<tr><td colspan="5">Nenhum motorista cadastrado.</td></tr>'
+            drivers_quick_table = f'<div class="table-wrap"><table><thead><tr><th>ID</th><th>Nome</th><th>Telefone</th><th>CPF</th><th>Ação</th></tr></thead><tbody>{drivers_rows or empty_drivers_tr}</tbody></table></div>'
 
-        if can_manage_users:
-            userform=f'''<form method="post" action="/settings/user" class="inline-form"><input type="hidden" name="redirect_section" value="users"><input name="name" placeholder="Nome" required><input name="username" placeholder="Usuário" required><select name="role">{option(ROLES)}</select><button>Criar usuário</button></form>
-            <div class="alert info">Ao criar usuário, a senha inicial será <b>usuario123</b> (ex.: joao = joao123) com troca obrigatória no primeiro login.</div>
-            <form method="post" action="/settings/users/default-passwords" class="inline-form needs-confirm" data-confirm-text="Confirma aplicar senha padrão usuario123 para todos os usuários e exigir troca no próximo login?"><input type="hidden" name="redirect_section" value="users"><button class="danger-btn">Aplicar padrão em todos os usuários</button></form>'''
+            content += f'''<section class="panel settings-panel" id="settings-app_config"><h2>📱 Parâmetros Globais e Gerenciamento do Aplicativo Mobile (GOD)</h2><div class="alert info">Acesso exclusivo para perfis <b>GOD</b>. Altera diretamente o comportamento do App do Motorista.</div><form method="post" action="/settings" class="form"><input type="hidden" name="redirect_section" value="app_config"><fieldset><legend>Identidade e Políticas da Entrega Mobile</legend><div class="grid3"><label>Título do aplicativo mobile<input name="driver_app_title" value="{esc(app_title)}"></label><label>Obrigatoriedade de foto do canhoto<select name="driver_app_require_photo"><option value="0" {"selected" if app_req_photo=="0" else ""}>Foto ou Assinatura (Flexível)</option><option value="1" {"selected" if app_req_photo=="1" else ""}>Foto do Canhoto Obrigatória</option></select></label><label>Obrigatoriedade de assinatura digital<select name="driver_app_require_signature"><option value="0" {"selected" if app_req_sig=="0" else ""}>Opcional (Foto ou Assinatura)</option><option value="1" {"selected" if app_req_sig=="1" else ""}>Assinatura Obrigatória</option></select></label><label>Captura de Geolocalização GPS<select name="driver_app_gps_mode"><option value="auto" {"selected" if app_gps=="auto" else ""}>Automática na Confirmação (Recomendado)</option><option value="disabled" {"selected" if app_gps=="disabled" else ""}>Desativada</option></select></label><label>Troca de Senha no 1º Acesso<select name="driver_app_force_password_change"><option value="1" {"selected" if app_force_pass=="1" else ""}>Sim (Exigir alteração no 1º login)</option><option value="0" {"selected" if app_force_pass=="0" else ""}>Não</option></select></label><label>Sincronização em segundo plano (segundos)<input type="number" name="driver_app_sync_interval_sec" value="{esc(app_sync)}" min="5" max="300"></label></div></fieldset><button class="btn primary" style="margin-top:1rem;">💾 Salvar configurações do App Mobile</button></form><div style="margin-top:2rem;border-top:2px solid #e2e8f0;padding-top:1.5rem;"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;"><h3 style="margin:0;color:#1e293b;">🚛 Gerenciamento Rápido de Motoristas</h3><a class="btn primary small" href="/drivers">Gerenciar Motoristas Completo →</a></div>{drivers_quick_table}</div></section>'''
+
+        elif section == 'users' and can_manage_users:
+            userform=f'''<form method="post" action="/settings/user" class="inline-form"><input type="hidden" name="redirect_section" value="users"><input name="name" placeholder="Nome" required><input name="username" placeholder="Usuário" required><select name="role">{option(ROLES)}</select><button class="btn primary">Criar usuário</button></form><div class="alert info">Ao criar usuário, a senha inicial será <b>usuario123</b> (ex.: joao = joao123) com troca obrigatória no primeiro login.</div>'''
             edit_panel=''
             if edit_target:
                 active_select = f'<select name="active"><option value="1" {"selected" if int(edit_target["active"] or 0)==1 else ""}>Ativo</option><option value="0" {"selected" if int(edit_target["active"] or 0)==0 else ""}>Inativo</option></select>'
-                edit_panel=f'''<section class="panel" style="border:2px solid #2563eb;background:#f8fafc;margin-top:1rem;margin-bottom:1rem;"><h2>Editar usuário: {esc(edit_target["name"])} (ID: {edit_target["id"]})</h2><form method="post" action="/settings/user/{edit_target["id"]}/update" class="inline-form"><input type="hidden" name="redirect_section" value="users"><label style="font-weight:600;">Nome:<input name="name" value="{esc(edit_target["name"])}" required></label><label style="font-weight:600;">Login:<input name="username" value="{esc(edit_target["username"])}" required></label><label style="font-weight:600;">Perfil:<select name="role">{option(ROLES,edit_target["role"])}</select></label><label style="font-weight:600;">Status:{active_select}</label><label style="font-weight:600;">Nova senha:<input name="password" type="password" placeholder="Opcional"></label><button class="btn primary">💾 Salvar edição</button><a class="btn ghost" href="/settings?section=users#settings-users">Cancelar</a></form><small style="color:#64748b;display:block;margin-top:.4rem;">Não é permitido desativar o próprio usuário logado nem remover o último GOD ativo.</small></section>'''
+                edit_panel=f'''<section class="panel" style="border:2px solid #2563eb;background:#f8fafc;margin-top:1rem;margin-bottom:1rem;"><h2>Editar usuário: {esc(edit_target["name"])} (ID: {edit_target["id"]})</h2><form method="post" action="/settings/user/{edit_target["id"]}/update" class="inline-form"><input type="hidden" name="redirect_section" value="users"><label style="font-weight:600;">Nome:<input name="name" value="{esc(edit_target["name"])}" required></label><label style="font-weight:600;">Login:<input name="username" value="{esc(edit_target["username"])}" required></label><label style="font-weight:600;">Perfil:<select name="role">{option(ROLES,edit_target["role"])}</select></label><label style="font-weight:600;">Status:{active_select}</label><label style="font-weight:600;">Nova senha:<input name="password" type="password" placeholder="Opcional"></label><button class="btn primary">💾 Salvar edição</button><a class="btn ghost" href="/settings?section=users#settings-users">Cancelar</a></form></section>'''
             rows=''
             for x in users:
                 is_self = (x['id'] == u['id'])
                 edit_link = f'<a class="btn small ghost" href="/settings?section=users&edit_user={x["id"]}#settings-users">Editar</a>'
                 if is_self:
-                    action = f'''<div class="user-actions-stack">
-                                 <div class="user-actions-top">
-                                   {edit_link}
-                                   <span class="muted small" style="font-size:0.8rem;align-self:center;">(Seu usuário)</span>
-                                 </div>
-                               </div>'''
+                    action = f'<span class="muted small">(Seu usuário)</span>'
                 else:
-                    action = f'''<div class="user-actions-stack">
-                                 <div class="user-actions-top">
-                                   {edit_link}
-                                   <form method="post" action="/settings/user/{x["id"]}/delete" class="inline-mini needs-confirm" data-confirm-text="Confirma desativar este usuário?"><input type="hidden" name="redirect_section" value="users"><button class="danger-btn small">Desativar</button></form>
-                                   <form method="post" action="/settings/user/{x["id"]}/purge" class="inline-mini needs-confirm" data-confirm-text="Confirma apagar este usuário definitivamente? Essa ação não pode ser desfeita."><input type="hidden" name="redirect_section" value="users"><button class="danger-btn small">Apagar definitivo</button></form>
-                                 </div>
-                                 <form method="post" action="/settings/user/{x["id"]}/reset-password" class="user-reset-form needs-confirm" data-confirm-text="Confirma resetar senha deste usuário?">
-                                   <input type="hidden" name="redirect_section" value="users">
-                                   <input name="new_password" placeholder="Nova senha" required>
-                                   <label class="muted"><input type="checkbox" name="must_change_password" value="1" checked> Alterar senha no próximo login</label>
-                                   <button class="small">Resetar senha</button>
-                                 </form>
-                               </div>'''
-                pending_change = 0
-                try:
-                    pending_change = int(x['must_change_password'] or 0)
-                except Exception:
-                    pending_change = 0
-                rows += f'<tr><td>{esc(x["name"])}</td><td>{esc(x["username"])}</td><td>{esc(normalize_role(x["role"]))}</td><td>{"Ativo" if x["active"] else "Inativo"}</td><td>{"Sim" if pending_change==1 else "Não"}</td><td>{brdate(x["last_login_at"])} {esc(str(x["last_login_at"] or "")[11:16]) if x["last_login_at"] else "—"}</td><td class="settings-user-actions">{action}</td></tr>'
-            content += f'<section class="panel settings-panel" id="settings-users"><h2>Usuários</h2>{saved_msg if section=="users" else ""}{userform}{edit_panel}<div class="table-wrap"><table><thead><tr><th>Nome</th><th>Usuário</th><th>Perfil</th><th>Status</th><th>Troca senha pendente</th><th>Último acesso</th><th>Ações</th></tr></thead><tbody>{rows}</tbody></table></div></section>'
+                    action = f'''<div style="display:flex;gap:6px;">{edit_link}<form method="post" action="/settings/user/{x["id"]}/delete" class="inline-mini needs-confirm" data-confirm-text="Confirma desativar este usuário?"><input type="hidden" name="redirect_section" value="users"><button class="danger-btn small">Desativar</button></form></div>'''
+                rows += f'<tr><td><b>{esc(x["name"])}</b></td><td>{esc(x["username"])}</td><td>{esc(normalize_role(x["role"]))}</td><td>{"Ativo" if x["active"] else "Inativo"}</td><td>{brdate(x["last_login_at"])}</td><td class="settings-user-actions">{action}</td></tr>'
+            content += f'<section class="panel settings-panel" id="settings-users"><h2>Usuários</h2>{saved_msg}{userform}{edit_panel}<div class="table-wrap"><table><thead><tr><th>Nome</th><th>Usuário</th><th>Perfil</th><th>Status</th><th>Último acesso</th><th>Ações</th></tr></thead><tbody>{rows}</tbody></table></div></section>'
 
-        if can_manage_permissions:
+        elif section == 'permissions' and can_manage_permissions:
             role_links=' '.join(f'<a class="btn small {"ghost" if perm_role!=r else ""}" href="/settings?section=permissions&perm_role={quote(r)}#settings-permissions">{esc(r)}</a>' for r in ROLES)
-            role_rows=''
-            for perm_key, perm_label in PERMISSIONS:
-                checked = 'checked' if int(role_perm_rows.get(perm_key, 1 if perm_key in default_permissions_for_role(perm_role) else 0)) == 1 else ''
-                role_rows += f'<tr><td>{esc(perm_label)}</td><td><input type="checkbox" name="perm_{esc(perm_key)}" value="1" {checked}></td></tr>'
-            role_panel=f'''<section class="panel"><h2>Permissões por perfil</h2><div class="action-strip">{role_links}</div><form method="post" action="/settings/permissions/role" class="form compact"><input type="hidden" name="redirect_section" value="permissions"><input type="hidden" name="role_name" value="{esc(perm_role)}"><div class="table-wrap"><table><thead><tr><th>Permissão</th><th>Liberado ({esc(perm_role)})</th></tr></thead><tbody>{role_rows}</tbody></table></div><button>Salvar permissões do perfil</button></form></section>'''
-            user_links=' '.join(f'<a class="btn small {"ghost" if perm_uid!=x["id"] else ""}" href="/settings?section=permissions&perm_role={quote(perm_role)}&perm_user={x["id"]}#settings-permissions">{esc(x["username"])}</a>' for x in users[:20])
-            user_panel=''
-            if perm_user_target:
-                user_rows=''
-                for perm_key, perm_label in PERMISSIONS:
-                    checked = 'checked' if int(user_perm_rows.get(perm_key, 0)) == 1 else ''
-                    user_rows += f'<tr><td>{esc(perm_label)}</td><td><input type="checkbox" name="perm_{esc(perm_key)}" value="1" {checked}></td></tr>'
-                user_panel=f'''<section class="panel"><h2>Permissões por usuário (override)</h2><p><b>{esc(perm_user_target["name"])}</b> · {esc(perm_user_target["username"])} · perfil {esc(normalize_role(perm_user_target["role"]))}</p><div class="action-strip">{user_links}</div><form method="post" action="/settings/permissions/user/{perm_user_target["id"]}/update" class="form compact"><input type="hidden" name="redirect_section" value="permissions"><input type="hidden" name="perm_role" value="{esc(perm_role)}"><div class="table-wrap"><table><thead><tr><th>Permissão</th><th>Override</th></tr></thead><tbody>{user_rows}</tbody></table></div><button>Salvar override do usuário</button></form><form method="post" action="/settings/permissions/user/{perm_user_target["id"]}/update" class="inline-form needs-confirm" data-confirm-text="Confirma limpar todos os overrides deste usuário?"><input type="hidden" name="redirect_section" value="permissions"><input type="hidden" name="perm_role" value="{esc(perm_role)}"><input type="hidden" name="reset_overrides" value="1"><button class="danger-btn">Restaurar padrão do perfil</button></form></section>'''
-            else:
-                user_panel=f'''<section class="panel"><h2>Permissões por usuário (override)</h2><div class="action-strip">{user_links}</div><p class="muted">Selecione um usuário para configurar override de permissões.</p></section>'''
-            content += f'<section class="settings-stack" id="settings-permissions">{role_panel}{user_panel}</section>'
-        if can_view_audit:
+            
+            # Agrupamento de permissões por módulo em Cards
+            modules = {
+                "📦 Módulo de Pedidos & Faturamento": ['view_orders', 'create_orders', 'edit_orders', 'cancel_orders', 'invoice_orders'],
+                "🚛 Módulo de Cargas & Entregas": ['view_routes', 'create_routes', 'edit_routes', 'settle_routes', 'cancel_routes'],
+                "📋 Módulo de Cadastros & Auditoria": ['view_clients', 'view_drivers', 'view_vehicles', 'view_route_catalog', 'view_dashboard', 'view_reports', 'view_sla', 'view_backup', 'view_settings'],
+                "⚙️ Módulo de Administração & Sistema": ['manage_settings', 'manage_users', 'manage_permissions']
+            }
+            perm_dict = dict(PERMISSIONS)
+            module_cards = ""
+            for mod_title, mod_perms in modules.items():
+                mod_rows = ""
+                for p_key in mod_perms:
+                    if p_key in perm_dict:
+                        checked = 'checked' if int(role_perm_rows.get(p_key, 1 if p_key in default_permissions_for_role(perm_role) else 0)) == 1 else ''
+                        mod_rows += f'<label class="checkbox-card"><input type="checkbox" name="perm_{esc(p_key)}" value="1" {checked}> {esc(perm_dict[p_key])}</label>'
+                module_cards += f'<div class="perm-card"><h4 style="margin:0 0 10px 0;color:#1e293b;border-bottom:1px solid #e2e8f0;padding-bottom:6px;">{mod_title}</h4><div class="checkbox-grid">{mod_rows}</div></div>'
+
+            role_panel=f'''<section class="panel"><h2>Permissões do Perfil: <span style="color:var(--primary);">{esc(perm_role)}</span></h2><div class="action-strip" style="margin-bottom:1rem;">{role_links}</div><form method="post" action="/settings/permissions/role" class="form"><input type="hidden" name="redirect_section" value="permissions"><input type="hidden" name="role_name" value="{esc(perm_role)}"><div class="perm-grid">{module_cards}</div><button class="btn primary" style="margin-top:1.2rem;">💾 Salvar permissões do perfil ({esc(perm_role)})</button></form></section>'''
+            content += f'<section class="settings-stack" id="settings-permissions">{role_panel}</section>'
+
+        elif section == 'audit' and can_view_audit:
             logrows=''.join(
-                f'<tr><td>{brdate(l["created_at"])} {esc(str(l["created_at"])[11:16])}</td><td>{esc(l["user_name"] or "Sistema")}<br><small>ID: {esc(l["user_id"] or "")}</small></td><td>{esc(l["module"])}</td><td>{esc(l["action"])}</td><td>{esc(l["entity"] or "")}</td><td>{esc(l["source_ip"] or "—")}</td><td><small>Antes: {esc(l["old_value"] or "—")}<br>Depois: {esc(l["new_value"] or "—")}<br>Obs: {esc(l["notes"] or "—")}</small></td></tr>'
+                f'<tr><td>{brdate(l["created_at"])} {esc(str(l["created_at"])[11:16])}</td><td><b>{esc(l["user_name"] or "Sistema")}</b></td><td>{esc(l["module"])}</td><td>{esc(l["action"])}</td><td>{esc(l["entity"] or "")}</td><td><small>{esc(l["notes"] or "—")}</small></td></tr>'
                 for l in logs
-            ) or '<tr><td colspan="7">Sem auditoria ainda.</td></tr>'
-            content += f'<section class="panel settings-panel" id="settings-audit"><h2>Auditoria recente</h2><div class="table-wrap"><table><thead><tr><th>Data</th><th>Usuário</th><th>Módulo</th><th>Ação</th><th>Registro</th><th>IP</th><th>Detalhes técnicos</th></tr></thead><tbody>{logrows}</tbody></table></div></section>'
+            ) or '<tr><td colspan="6">Sem auditoria ainda.</td></tr>'
+            content += f'<section class="panel settings-panel" id="settings-audit"><h2>Auditoria recente</h2><div class="table-wrap"><table><thead><tr><th>Data</th><th>Usuário</th><th>Módulo</th><th>Ação</th><th>Registro</th><th>Detalhes</th></tr></thead><tbody>{logrows}</tbody></table></div></section>'
+
         return self.send_html(layout(u,'Configurações',content,'Administração do sistema, usuários e permissões'))
 
     def generate_pdf_report_now(self, u):
@@ -6286,7 +6340,7 @@ document.addEventListener('DOMContentLoaded', function(){
         if redirect_section == 'app_config':
             if not is_god(u):
                 return self.send_html(layout(u,'Acesso negado','<div class="alert danger">Somente perfis GOD alteram configurações do App Mobile.</div>'),403)
-            app_keys=['driver_app_title','driver_app_require_photo','driver_app_require_signature','driver_app_gps_mode','driver_app_sync_interval_sec']
+            app_keys=['driver_app_title','driver_app_require_photo','driver_app_require_signature','driver_app_gps_mode','driver_app_sync_interval_sec','driver_app_force_password_change']
             with conn() as db:
                 for k in app_keys:
                     db.execute('INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES(?,?,?)',(k,d.get(k,''),now()))
@@ -6296,7 +6350,7 @@ document.addEventListener('DOMContentLoaded', function(){
         if redirect_section == 'reports':
             if not (self.has_perm(u,'manage_settings') or is_admin(u)):
                 return self.send_html(layout(u,'Acesso negado','<div class="alert danger">Somente perfis autorizados alteram preferências de relatórios.</div>'),403)
-            report_keys=['pdf_report_enabled','pdf_report_days','pdf_report_time','pdf_report_status_filter']
+            report_keys=['pdf_report_enabled','pdf_report_days','pdf_report_time','pdf_report_st_venda','pdf_report_st_faturado','pdf_report_st_rota','pdf_report_st_acertado','pdf_report_st_problema','pdf_report_st_cancelado','pdf_report_col_financial','pdf_report_col_weight','pdf_report_col_dates','pdf_report_col_seller','pdf_report_col_receiver']
             with conn() as db:
                 for k in report_keys:
                     db.execute('INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES(?,?,?)',(k,d.get(k,''),now()))

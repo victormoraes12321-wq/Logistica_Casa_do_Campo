@@ -88,7 +88,7 @@ def fmt_weight(val):
 def generate_orders_pdf_report(db, config=None, target_dir=None, filename_prefix="Relatorio_Pedidos"):
     """
     Gera um relatório profissional dos pedidos em PDF e o salva na pasta da Área de Trabalho.
-    Retorna o caminho completo do arquivo gerado.
+    Respeita as escolhas de checkboxes (status a incluir e colunas visíveis).
     """
     if config is None:
         config = {}
@@ -101,23 +101,43 @@ def generate_orders_pdf_report(db, config=None, target_dir=None, filename_prefix
     filename = f"{filename_prefix}_{stamp}.pdf"
     filepath = os.path.join(target_folder, filename)
 
-    # 1. Consulta dos pedidos no banco de dados
-    status_filter = config.get("pdf_report_status_filter", "Todos")
-    query = """
+    # 1. Filtros de Status (Checkboxes)
+    included_statuses = []
+    if config.get("pdf_report_st_venda", "1") == "1":
+        included_statuses.append("Venda")
+    if config.get("pdf_report_st_faturado", "1") == "1":
+        included_statuses.append("Faturado")
+    if config.get("pdf_report_st_rota", "1") == "1":
+        included_statuses.append("Saiu para entrega")
+    if config.get("pdf_report_st_acertado", "1") == "1":
+        included_statuses.extend(["Acertado", "Entregue"])
+    if config.get("pdf_report_st_problema", "1") == "1":
+        included_statuses.append("Problema")
+    if config.get("pdf_report_st_cancelado", "0") == "1":
+        included_statuses.append("Cancelado")
+
+    if not included_statuses:
+        included_statuses = ["Venda", "Faturado", "Saiu para entrega", "Acertado", "Entregue", "Problema", "Cancelado"]
+
+    query = f"""
         SELECT o.*, c.name AS client_name, c.farm_name,
                (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id=o.id) AS item_count
         FROM orders o
         LEFT JOIN clients c ON c.id=o.client_id
+        WHERE o.status IN ({','.join(['?']*len(included_statuses))})
+        ORDER BY o.id DESC
     """
-    params = []
-    if status_filter and status_filter != "Todos":
-        query += " WHERE o.status=?"
-        params.append(status_filter)
-    query += " ORDER BY o.id DESC"
+    rows = db.execute(query, tuple(included_statuses)).fetchall()
 
-    rows = db.execute(query, tuple(params)).fetchall()
+    # Opções de Exibição de Colunas (Checkboxes)
+    show_financial = config.get("pdf_report_col_financial", "1") == "1"
+    show_weight = config.get("pdf_report_col_weight", "1") == "1"
+    show_dates = config.get("pdf_report_col_dates", "1") == "1"
+    show_seller = config.get("pdf_report_col_seller", "1") == "1"
+    show_receiver = config.get("pdf_report_col_receiver", "1") == "1"
+    show_items = config.get("pdf_report_col_items", "0") == "1"
 
-    # 2. Cálculos de resumo
+    # 2. Resumo
     total_orders = len(rows)
     total_weight = sum(float(r["weight_kg"] or 0) for r in rows)
     total_value = sum(float(r["total_value"] or 0) for r in rows)
@@ -125,7 +145,7 @@ def generate_orders_pdf_report(db, config=None, target_dir=None, filename_prefix
     total_problems = sum(1 for r in rows if str(r["status"]).strip() == "Problema")
     total_canceled = sum(1 for r in rows if str(r["status"]).strip() == "Cancelado")
 
-    # 3. Documento PDF em formato Paisagem (Landscape A4) para melhor acomodação de colunas
+    # 3. Documento PDF em formato Paisagem (Landscape A4)
     doc = SimpleDocTemplate(
         filepath,
         pagesize=landscape(A4),
@@ -137,7 +157,6 @@ def generate_orders_pdf_report(db, config=None, target_dir=None, filename_prefix
 
     styles = getSampleStyleSheet()
 
-    # Estilos customizados
     title_style = ParagraphStyle(
         "HeaderTitle",
         parent=styles["Normal"],
@@ -161,7 +180,7 @@ def generate_orders_pdf_report(db, config=None, target_dir=None, filename_prefix
         fontSize=8,
         leading=10,
         textColor=colors.HexColor("#475569"),
-        alignment=1, # Center
+        alignment=1,
     )
     card_value_style = ParagraphStyle(
         "CardValue",
@@ -170,7 +189,7 @@ def generate_orders_pdf_report(db, config=None, target_dir=None, filename_prefix
         fontSize=12,
         leading=14,
         textColor=colors.HexColor("#0f172a"),
-        alignment=1, # Center
+        alignment=1,
     )
     th_style = ParagraphStyle(
         "TableHeader",
@@ -203,7 +222,7 @@ def generate_orders_pdf_report(db, config=None, target_dir=None, filename_prefix
     header_data = [
         [
             Paragraph("<b>LOGÍSTICA CASA DO CAMPO</b>", title_style),
-            Paragraph(f"<b>Relatório Operacional de Pedidos</b><br/>Emissão: {now_dt.strftime('%d/%m/%Y %H:%M')}", subtitle_style)
+            Paragraph(f"<b>Relatório Personalizado de Pedidos</b><br/>Emissão: {now_dt.strftime('%d/%m/%Y %H:%M')}", subtitle_style)
         ]
     ]
     header_table = Table(header_data, colWidths=[18 * cm, 9.3 * cm])
@@ -218,7 +237,7 @@ def generate_orders_pdf_report(db, config=None, target_dir=None, filename_prefix
     elements.append(header_table)
     elements.append(Spacer(1, 10))
 
-    # CARDS DE RESUMO OPERACIONAL
+    # CARDS DE RESUMO
     cards_data = [
         [
             Paragraph("TOTAL PEDIDOS", card_title_style),
@@ -250,21 +269,40 @@ def generate_orders_pdf_report(db, config=None, target_dir=None, filename_prefix
     elements.append(summary_table)
     elements.append(Spacer(1, 12))
 
-    # TABELA DE PEDIDOS
-    headers = [
-        Paragraph("Nº Pedido", th_style),
-        Paragraph("Cliente / Fazenda", th_style),
-        Paragraph("Cidade / Rota", th_style),
-        Paragraph("Vendedor", th_style),
-        Paragraph("Data Prev.", th_style),
-        Paragraph("Peso (kg)", th_style),
-        Paragraph("Valor (R$)", th_style),
-        Paragraph("Status", th_style),
-        Paragraph("Recebedor / Obs", th_style),
-    ]
+    # MONTAGEM DINÂMICA DAS COLUNAS
+    headers = [Paragraph("Nº Pedido", th_style), Paragraph("Cliente / Fazenda", th_style), Paragraph("Cidade / Rota", th_style)]
+    widths = [2.3 * cm, 5.2 * cm, 4.0 * cm]
+
+    if show_seller:
+        headers.append(Paragraph("Vendedor", th_style))
+        widths.append(3.0 * cm)
+
+    if show_dates:
+        headers.append(Paragraph("Data Prev.", th_style))
+        widths.append(2.2 * cm)
+
+    if show_weight:
+        headers.append(Paragraph("Peso (kg)", th_style))
+        widths.append(2.2 * cm)
+
+    if show_financial:
+        headers.append(Paragraph("Valor (R$)", th_style))
+        widths.append(2.8 * cm)
+
+    headers.append(Paragraph("Status", th_style))
+    widths.append(2.6 * cm)
+
+    if show_receiver:
+        headers.append(Paragraph("Recebedor / Obs", th_style))
+        widths.append(5.0 * cm)
+
+    # Ajustar proporção de larguras para preencher 27.3 cm
+    total_w = sum(widths)
+    scale = (27.3 * cm) / total_w
+    widths = [w * scale for w in widths]
+
     table_data = [headers]
 
-    # Cores por status (Background, Text)
     status_colors = {
         "Acertado": (colors.HexColor("#dff5e7"), colors.HexColor("#13733b")),
         "Entregue": (colors.HexColor("#dff5e7"), colors.HexColor("#13733b")),
@@ -283,10 +321,16 @@ def generate_orders_pdf_report(db, config=None, target_dir=None, filename_prefix
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
     ]
 
+    status_col_index = 3
+    if show_seller: status_col_index += 1
+    if show_dates: status_col_index += 1
+    if show_weight: status_col_index += 1
+    if show_financial: status_col_index += 1
+
     for i, r in enumerate(rows, start=1):
         st = str(r["status"] or "").strip()
         bg_col, txt_col = status_colors.get(st, (colors.HexColor("#f1f5f9"), colors.HexColor("#334155")))
-        
+
         status_p_style = ParagraphStyle(
             f"Status_{i}",
             parent=styles["Normal"],
@@ -294,7 +338,7 @@ def generate_orders_pdf_report(db, config=None, target_dir=None, filename_prefix
             fontSize=7,
             leading=8,
             textColor=txt_col,
-            alignment=1, # Center
+            alignment=1,
         )
         status_cell = Paragraph(f"<b>{esc(st)}</b>", status_p_style)
 
@@ -306,55 +350,51 @@ def generate_orders_pdf_report(db, config=None, target_dir=None, filename_prefix
         if r["route_name"]:
             city_route += f"<br/><font color='#64748b'>Rota: {esc(r['route_name'])}</font>"
 
-        receiver_obs = ""
-        if r["delivered_to"]:
-            doc_type = esc(r["delivered_document_type"] or "Doc")
-            doc_info = f" ({doc_type}: {esc(r['delivered_document'])})" if r["delivered_document"] else ""
-            receiver_obs += f"<b>Recebeu:</b> {esc(r['delivered_to'])}{doc_info}"
-        if r["final_notes"]:
-            if receiver_obs:
-                receiver_obs += "<br/>"
-            receiver_obs += f"<font color='#64748b'>Obs: {esc(r['final_notes'][:60])}</font>"
-        if not receiver_obs:
-            receiver_obs = "—"
-
         row_cells = [
             Paragraph(f"<b>{esc(r['order_number'])}</b>", td_bold),
             Paragraph(client_text, td_style),
             Paragraph(city_route, td_style),
-            Paragraph(esc(r["seller_name"] or "—"), td_style),
-            Paragraph(fmt_br_date(r["expected_delivery_date"]), td_style),
-            Paragraph(fmt_weight(r["weight_kg"]), td_style),
-            Paragraph(fmt_money(r["total_value"]), td_style),
-            status_cell,
-            Paragraph(receiver_obs, td_style),
         ]
+
+        if show_seller:
+            row_cells.append(Paragraph(esc(r["seller_name"] or "—"), td_style))
+
+        if show_dates:
+            row_cells.append(Paragraph(fmt_br_date(r["expected_delivery_date"]), td_style))
+
+        if show_weight:
+            row_cells.append(Paragraph(fmt_weight(r["weight_kg"]), td_style))
+
+        if show_financial:
+            row_cells.append(Paragraph(fmt_money(r["total_value"]), td_style))
+
+        row_cells.append(status_cell)
+
+        if show_receiver:
+            receiver_obs = ""
+            if r["delivered_to"]:
+                doc_type = esc(r["delivered_document_type"] or "Doc")
+                doc_info = f" ({doc_type}: {esc(r['delivered_document'])})" if r["delivered_document"] else ""
+                receiver_obs += f"<b>Recebeu:</b> {esc(r['delivered_to'])}{doc_info}"
+            if r["final_notes"]:
+                if receiver_obs:
+                    receiver_obs += "<br/>"
+                receiver_obs += f"<font color='#64748b'>Obs: {esc(r['final_notes'][:60])}</font>"
+            if not receiver_obs:
+                receiver_obs = "—"
+            row_cells.append(Paragraph(receiver_obs, td_style))
+
         table_data.append(row_cells)
+        table_styles.append(("BACKGROUND", (status_col_index, i), (status_col_index, i), bg_col))
 
-        # Aplicar fundo colorido na célula de status
-        table_styles.append(("BACKGROUND", (7, i), (7, i), bg_col))
-
-        # Alternar fundo leve de linha
         if i % 2 == 0:
-            table_styles.append(("BACKGROUND", (0, i), (6, i), colors.HexColor("#f8fafc")))
-            table_styles.append(("BACKGROUND", (8, i), (8, i), colors.HexColor("#f8fafc")))
-
-    widths = [
-        2.2 * cm, # Nº Pedido
-        4.8 * cm, # Cliente
-        3.5 * cm, # Cidade/Rota
-        3.0 * cm, # Vendedor
-        2.0 * cm, # Data
-        2.0 * cm, # Peso
-        2.5 * cm, # Valor
-        2.5 * cm, # Status
-        4.8 * cm, # Recebedor/Obs
-    ]
+            for c_idx in range(len(headers)):
+                if c_idx != status_col_index:
+                    table_styles.append(("BACKGROUND", (c_idx, i), (c_idx, i), colors.HexColor("#f8fafc")))
 
     orders_table = Table(table_data, colWidths=widths, repeatRows=1)
     orders_table.setStyle(TableStyle(table_styles))
     elements.append(orders_table)
 
-    # 4. Construir o documento PDF
     doc.build(elements, canvasmaker=NumberedCanvas)
     return filepath
