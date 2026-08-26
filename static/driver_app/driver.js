@@ -487,37 +487,57 @@ const DriverApp = {
     this.el('signatureDialog').close();
   },
 
-  async getGpsCoords() {
-    if (!('geolocation' in navigator)) return { latitude: null, longitude: null };
-    return new Promise(resolve => {
-      let resolved = false;
-      const timeoutTimer = setTimeout(() => {
-        if (!resolved) {
-          resolved = true;
-          resolve({ latitude: null, longitude: null });
-        }
-      }, 5000);
-      navigator.geolocation.getCurrentPosition(
+  lastKnownCoords: null,
+  watchGpsId: null,
+
+  startGpsTracking() {
+    if (!('geolocation' in navigator) || this.watchGpsId) return;
+    try {
+      this.watchGpsId = navigator.geolocation.watchPosition(
         pos => {
-          if (!resolved) {
-            resolved = true;
-            clearTimeout(timeoutTimer);
-            resolve({
+          if (pos && pos.coords) {
+            this.lastKnownCoords = {
               latitude: pos.coords.latitude,
               longitude: pos.coords.longitude
-            });
+            };
           }
         },
-        err => {
-          if (!resolved) {
-            resolved = true;
-            clearTimeout(timeoutTimer);
-            resolve({ latitude: null, longitude: null });
+        () => {},
+        { enableHighAccuracy: true, maximumAge: 300000, timeout: 10000 }
+      );
+    } catch (_) {}
+  },
+
+  async getGpsCoords() {
+    this.startGpsTracking();
+    if (!('geolocation' in navigator)) return this.lastKnownCoords || { latitude: null, longitude: null };
+
+    const tryFetch = (highAcc, timeoutMs) => new Promise(resolve => {
+      let done = false;
+      const timer = setTimeout(() => {
+        if (!done) { done = true; resolve(null); }
+      }, timeoutMs);
+
+      navigator.geolocation.getCurrentPosition(
+        pos => {
+          if (!done) {
+            done = true;
+            clearTimeout(timer);
+            const coords = { latitude: pos.coords.latitude, longitude: pos.coords.longitude };
+            this.lastKnownCoords = coords;
+            resolve(coords);
           }
         },
-        { enableHighAccuracy: true, timeout: 5000, maximumAge: 60000 }
+        () => {
+          if (!done) { done = true; clearTimeout(timer); resolve(null); }
+        },
+        { enableHighAccuracy: highAcc, timeout: timeoutMs, maximumAge: 300000 }
       );
     });
+
+    let result = await tryFetch(true, 6000);
+    if (!result) result = await tryFetch(false, 4000);
+    return result || this.lastKnownCoords || { latitude: null, longitude: null };
   },
 
   buildPayload(isProblem, coords) {

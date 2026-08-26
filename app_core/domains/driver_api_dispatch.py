@@ -318,8 +318,8 @@ def _deliver(handler: Any, driver: dict[str, Any]) -> bool:
     delivered_to = str(data.get("delivered_to") or "").strip()[:200]
     delivered_doc = str(data.get("delivered_document") or "").strip()[:80]
     delivered_doc_type = str(data.get("delivered_document_type") or "CPF").strip()[:30]
-    lat_val = data.get("latitude")
-    lng_val = data.get("longitude")
+    lat_val = data.get("latitude") if data.get("latitude") is not None else data.get("lat")
+    lng_val = data.get("longitude") if data.get("longitude") is not None else data.get("lng")
     latitude = None
     longitude = None
     location_link = ""
