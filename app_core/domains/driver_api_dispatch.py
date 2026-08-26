@@ -426,22 +426,6 @@ def _deliver(handler: Any, driver: dict[str, Any]) -> bool:
                               delivery_location_link=?,updated_at=?,version=COALESCE(version,1)+1 WHERE id=?""",
                     (delivered_to, delivered_doc, delivered_doc_type, now_ts, notes, now_ts, latitude, longitude, location_link, now_ts, order_id),
                 )
-                db.execute("""CREATE TABLE IF NOT EXISTS delivery_receipts(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    order_id INTEGER NOT NULL,
-                    route_id INTEGER,
-                    image_data BLOB,
-                    mime_type TEXT,
-                    digital_signature TEXT,
-                    delivered_to TEXT,
-                    delivered_document TEXT,
-                    delivered_document_type TEXT,
-                    notes TEXT,
-                    latitude REAL,
-                    longitude REAL,
-                    delivery_location_link TEXT,
-                    created_at TEXT NOT NULL
-                )""")
                 db.execute("UPDATE route_orders SET status='Entregue' WHERE route_id=? AND order_id=?", (route_id, order_id))
                 db.execute("DELETE FROM delivery_receipts WHERE route_id=? AND order_id=?", (route_id, order_id))
                 db.execute(
