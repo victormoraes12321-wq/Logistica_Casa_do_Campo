@@ -229,9 +229,18 @@ const DriverApp = {
   async loadDrivers() {
     const select = this.el('driverSelect');
     try {
-      const data = await this.api('/api/v1/driver/all_drivers', {auth:false});
-      select.innerHTML = '<option value="">Selecione seu nome</option>' + data.drivers.map(driver => `<option value="${Number(driver.id)}">${this.escape(driver.name)}</option>`).join('');
-      if (!data.drivers.length) select.innerHTML = '<option value="">Nenhum motorista ativo</option>';
+      let data = null;
+      try {
+        data = await this.api('/api/v1/driver/all_drivers', {auth:false});
+      } catch (_) {
+        data = await this.api('/api/v1/driver/drivers', {auth:false});
+      }
+      if (data && data.drivers && Array.isArray(data.drivers)) {
+        select.innerHTML = '<option value="">Selecione seu nome</option>' + data.drivers.map(driver => `<option value="${Number(driver.id)}">${this.escape(driver.name)}</option>`).join('');
+        if (!data.drivers.length) select.innerHTML = '<option value="">Nenhum motorista ativo</option>';
+      } else {
+        throw new Error('Resposta de motoristas inválida');
+      }
     } catch (_) {
       select.innerHTML = '<option value="">Servidor indisponível</option>';
       this.showError('loginError', 'Não foi possível carregar os motoristas. Verifique a conexão e tente novamente.');

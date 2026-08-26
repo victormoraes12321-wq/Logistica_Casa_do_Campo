@@ -1,4 +1,4 @@
-const CACHE_NAME = 'driver-app-v2.7.1-production-prep-r1';
+const CACHE_NAME = 'driver-app-v2.8.2-live-gps-r2';
 const APP_SHELL = [
   '/static/driver_app/index.html',
   '/static/driver_app/driver.js',

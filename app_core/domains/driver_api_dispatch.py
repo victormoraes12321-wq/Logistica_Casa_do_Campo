@@ -468,7 +468,7 @@ def _deliver(handler: Any, driver: dict[str, Any]) -> bool:
 
 
 def handle_driver_api_request(handler: Any, path: str, method: str) -> bool:
-    if path == "/api/v1/driver/all_drivers" and method == "GET":
+    if path in ("/api/v1/driver/all_drivers", "/api/v1/driver/drivers", "/api/v1/driver/list") and method == "GET":
         try:
             with handler.conn() as db:
                 rows = db.execute("SELECT id,name FROM drivers WHERE active=1 ORDER BY name").fetchall()
