@@ -11,6 +11,7 @@ from app_core.domains import (
     orders_dispatch,
     reports_dispatch,
     routes_dispatch,
+    trip_registry_dispatch,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "orders_dispatch",
     "reports_dispatch",
     "routes_dispatch",
+    "trip_registry_dispatch",
 ]

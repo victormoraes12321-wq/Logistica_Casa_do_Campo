@@ -165,6 +165,7 @@ class ErpConfig:
         self.view_vendedores: str = _setting("view_vendedores", "ERP_VIEW_VENDEDORES", "VW_VENDEDOR_CAD_LM")
         self.view_produtos: str = _setting("view_produtos", "ERP_VIEW_PRODUTOS", "VW_PRODUTOS_CAD_LM")
         self.view_faturamento: str = _setting("view_faturamento", "ERP_VIEW_FATURAMENTO", "VW_FATURAMENTO_CAD_LM")
+        self.view_carga: str = _setting("view_carga", "ERP_VIEW_CARGA", "VW_PEDIDO_CARGA_CC")
 
         # Coluna de data de venda para filtro de 30 dias (pode variar por ERP)
         self.col_data_venda: str = _setting("col_data_venda", "ERP_COL_DATA_VENDA", "DATAVENDA")
@@ -823,12 +824,32 @@ def _fetch_live_order_from_erp(cfg: ErpConfig, order_number: str) -> dict[str, A
                         ped_dict = {k: _json_safe(v) for k, v in _row_to_dict(cur, pv_row).items()}
                         # Mapeia colunas conhecidas para chaves padrão
                         ped_dict["posicao_pedido"] = ped_dict.get("posicao_pedido") or "L"
-                        ped_dict["numero_nota_fiscal_saida"] = ped_dict.get("numero_nota_fiscal_saida") or 0
+                        num_nf = ped_dict.get("numero_nota_fiscal_saida")
+                        num_orc = ped_dict.get("numero_orcamento")
+                        if (not num_nf or str(num_nf).strip() in ("0", "0.0", "None", "null", "NULL")) and num_orc and str(num_orc).strip() not in ("0", "0.0", "None", "null", "NULL"):
+                            num_nf = num_orc
+                        ped_dict["numero_nota_fiscal_saida"] = num_nf or 0
+                        ped_dict["nota_"] = num_nf or 0
+                        ped_dict["numero_orcamento"] = num_orc
                         ped_dict["valortotal"] = ped_dict.get("valor_total") or 0.0
                         ped_dict["total_weight"] = ped_dict.get("peso_total") or 0.0
                         ped_dict["dtemissao_"] = ped_dict.get("data")
                         ped_dict["codcliente_"] = ped_dict.get("codigo_cliente")
                         ped_dict["rca_"] = ped_dict.get("codigo_rca")
+
+                        # Se ainda não temos número de nota ou se é 0, consulta VW_VENDAS_LM para NOTA_ / NUMERO_NFE
+                        try:
+                            v_ped_chk = _resolve_oracle_view(cur2, cfg.view_pedidos, cfg.schema, cfg.user)
+                            cur2.execute(f"SELECT NOTA_, NUMERO_NFE FROM {v_ped_chk} WHERE TO_CHAR(PEDIDO_) = :1 AND ROWNUM = 1", (order_number,))
+                            v_row_chk = cur2.fetchone()
+                            if v_row_chk:
+                                if v_row_chk[0] and (not ped_dict.get("numero_nota_fiscal_saida") or str(ped_dict.get("numero_nota_fiscal_saida")).strip() in ("0", "0.0", "None")):
+                                    ped_dict["numero_nota_fiscal_saida"] = v_row_chk[0]
+                                    ped_dict["nota_"] = v_row_chk[0]
+                                if v_row_chk[1]:
+                                    ped_dict["numero_nfe"] = v_row_chk[1]
+                        except Exception:
+                            pass
 
                         # Busca itens em DONWMS.DON_PEDIDO_VENDA_ITEM
                         try:
@@ -862,6 +883,20 @@ def _fetch_live_order_from_erp(cfg: ErpConfig, order_number: str) -> dict[str, A
                                     ped_dict["_vendedor"] = {k: _json_safe(v) for k, v in _row_to_dict(cur2, vd_row).items()}
                             except Exception:
                                 pass
+                            if not ped_dict.get("_vendedor"):
+                                try:
+                                    cur2.execute(f"SELECT CODIGO, NOME, EMAIL, CELULAR FROM {cfg.schema}.DON_RCA WHERE TO_CHAR(CODIGO) = :1", (cod_vend,))
+                                    rca_row = cur2.fetchone()
+                                    if rca_row:
+                                        ped_dict["_vendedor"] = {
+                                            "codi_ved": rca_row[0],
+                                            "nome_ved": rca_row[1],
+                                            "nome": rca_row[1],
+                                            "mail_ved": rca_row[2],
+                                            "telc_ved": rca_row[3],
+                                        }
+                                except Exception:
+                                    pass
 
                         raw_json = json.dumps(ped_dict, ensure_ascii=False)
                         synced_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -946,6 +981,20 @@ def _fetch_live_order_from_erp(cfg: ErpConfig, order_number: str) -> dict[str, A
                         ped_dict["_vendedor"] = {k: _json_safe(v) for k, v in _row_to_dict(cur2, vd_row).items()}
                 except Exception as exc_vend:
                     logger.warning("Falha ao buscar vendedor '%s': %s", cod_vend, exc_vend)
+                if not ped_dict.get("_vendedor") and cfg.driver == "oracle":
+                    try:
+                        cur2.execute(f"SELECT CODIGO, NOME, EMAIL, CELULAR FROM {cfg.schema}.DON_RCA WHERE TO_CHAR(CODIGO) = :1", (cod_vend,))
+                        rca_row = cur2.fetchone()
+                        if rca_row:
+                            ped_dict["_vendedor"] = {
+                                "codi_ved": rca_row[0],
+                                "nome_ved": rca_row[1],
+                                "nome": rca_row[1],
+                                "mail_ved": rca_row[2],
+                                "telc_ved": rca_row[3],
+                            }
+                    except Exception:
+                        pass
 
             raw_json = json.dumps(ped_dict, ensure_ascii=False)
 
@@ -1060,6 +1109,59 @@ def lookup_invoice_status(order_number: str, force_live: bool = False) -> dict[s
         return None
 
     try:
+        if cfg.driver == "oracle":
+            try:
+                schema_pfx = f"{cfg.schema}." if cfg.schema else ""
+                sql_ora = f"""
+                    SELECT 
+                        p.NUMERO AS numero_pedido,
+                        p.POSICAO_PEDIDO AS posicao_pedido,
+                        COALESCE(NULLIF(n.NUMERO, 0), NULLIF(p.NUMERO_NOTA_FISCAL_SAIDA, 0)) AS nota_fiscal,
+                        n.NUMERO_NFE AS chave_nfe,
+                        p.DATA_FATURAMENTO_PEDIDO AS data_faturamento,
+                        p.HORA_FATURAMENTO_PEDIDO AS hora_faturamento,
+                        p.MINUTO_FATURAMENTO_PEDIDO AS minuto_faturamento,
+                        n.DATA_EMISSAO AS data_emissao_nf
+                    FROM {schema_pfx}don_pedido_venda p
+                    LEFT JOIN {schema_pfx}DON_NOTA_FISCAL_SAIDA n ON n.NUMERO_PEDIDO = p.NUMERO AND n.CANCELADA = 'N'
+                    WHERE p.NUMERO = :ped
+                """
+                with _erp_connection(cfg) as erp_conn:
+                    cur = erp_conn.cursor()
+                    cur.execute(sql_ora, {"ped": int(order_number) if order_number.isdigit() else order_number})
+                    row = cur.fetchone()
+                    if row:
+                        cols = [d[0].lower() for d in cur.description]
+                        d_ora = dict(zip(cols, row))
+                        pos = str(d_ora.get("posicao_pedido") or "").upper()
+                        nf_val = d_ora.get("nota_fiscal")
+                        dt_fat = d_ora.get("data_faturamento") or d_ora.get("data_emissao_nf")
+                        h = d_ora.get("hora_faturamento") or 0
+                        m = d_ora.get("minuto_faturamento") or 0
+                        fat_ts = None
+                        if dt_fat:
+                            d_str = dt_fat.strftime("%Y-%m-%d") if hasattr(dt_fat, "strftime") else str(dt_fat)[:10]
+                            fat_ts = f"{d_str} {h:02d}:{m:02d}:00" if (h or m) else d_str
+
+                        is_fat = (pos == "F") or (nf_val and str(nf_val).strip() not in ("", "0", "0.0", "None", "null"))
+                        if is_fat:
+                            resolved_nf = str(nf_val).strip() if (nf_val and str(nf_val).strip() not in ("", "0", "0.0", "None", "null")) else str(order_number)
+                            return {
+                                "numeropedido": order_number,
+                                "nota_fiscal": resolved_nf,
+                                "data_faturamento": fat_ts,
+                                "numeronota": resolved_nf,
+                                "datafaturamento": fat_ts,
+                                "chave_nfe": d_ora.get("chave_nfe") or "",
+                                "is_invoiced": True,
+                                "invoice_number": resolved_nf,
+                                "raw_json": json.dumps(d_ora, default=str)
+                            }
+                        else:
+                            return None
+            except Exception as ora_err:
+                logger.warning("lookup_invoice_status direto via Oracle falhou para '%s': %s", order_number, ora_err)
+
         if not force_live:
             fat = _cache_get_faturamento(order_number)
             if fat:
@@ -1090,10 +1192,18 @@ def lookup_invoice_status(order_number: str, force_live: bool = False) -> dict[s
                 or ped.get("notafiscal")
                 or ped.get("num_nota_fiscal")
                 or ped.get("numero_nota_fiscal_saida")
+                or ped.get("numero_orcamento")
+                or ped.get("orcamento")
+                or ped.get("num_orcamento")
                 or ped.get("nota_")
                 or ped.get("numero_nfe")
                 or ped.get("nfe")
             )
+            if nf in (0, "0", "0.0", "None", "null", "NULL"):
+                nf = ped.get("numero_orcamento") or ped.get("nota_") or ""
+            if nf in (0, "0", "0.0", "None", "null", "NULL"):
+                nf = ""
+
             dt_fat = (
                 ped.get("datafaturamento")
                 or ped.get("data_faturamento")
@@ -1104,16 +1214,17 @@ def lookup_invoice_status(order_number: str, force_live: bool = False) -> dict[s
                 or ped.get("data_venda")
             )
             st = str(ped.get("posicao_pedido") or ped.get("status") or ped.get("statuspedido") or ped.get("situacao") or "").upper()
-            is_fat = (nf and str(nf).strip() not in ("", "0", "0.0", "None", "null")) or st in ("F", "FATURADO", "FAT", "E", "EMITIDO", "CONCLUIDO", "FECHADO", "ENCERRADO")
+            is_fat = (nf and str(nf).strip() not in ("", "0", "0.0", "None", "null", "NULL")) or st in ("F", "FATURADO", "FAT", "E", "EMITIDO", "CONCLUIDO", "FECHADO", "ENCERRADO", "FINALIZADO")
             if is_fat:
+                resolved_nf = str(nf).strip() if (nf and str(nf).strip() not in ("", "0", "0.0", "None", "null", "NULL")) else str(order_number)
                 return {
                     "numeropedido": order_number,
-                    "nota_fiscal": str(nf).strip() if (nf and str(nf).strip() not in ("", "0", "0.0", "None", "null")) else "1",
+                    "nota_fiscal": resolved_nf,
                     "data_faturamento": dt_fat,
-                    "numeronota": nf,
+                    "numeronota": resolved_nf,
                     "datafaturamento": dt_fat,
                     "is_invoiced": True,
-                    "invoice_number": str(nf).strip() if (nf and str(nf).strip() not in ("", "0", "0.0", "None", "null")) else "1",
+                    "invoice_number": resolved_nf,
                     "raw_json": json.dumps(ped)
                 }
 
@@ -1131,6 +1242,8 @@ def check_connectivity(config: ErpConfig | None = None) -> dict[str, Any]:
     Retorna dict com 'ok', 'message' e 'views'.
     """
     cfg = config or get_erp_config()
+    if not cfg.enabled:
+        return {"ok": False, "message": "Integração ERP está desabilitada nas configurações.", "views": {}}
     has_credentials = bool(cfg.host) and bool(cfg.database) and bool(cfg.user)
     if not has_credentials:
         return {"ok": False, "message": "Configuração ERP incompleta. Verifique Host, Banco e Usuário.", "views": {}}

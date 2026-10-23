@@ -77,10 +77,14 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private var pendingGeolocationCallback: android.webkit.GeolocationPermissions.Callback? = null
+    private var pendingGeolocationOrigin: String? = null
+
     companion object {
         private const val TAG = "LogisticaApp"
         private const val FILE_CHOOSER_REQUEST = 1001
         private const val CAMERA_PERMISSION_REQUEST = 1002
+        private const val LOCATION_PERMISSION_REQUEST = 1003
         private const val PREFS_NAME = "LogisticaPrefs"
         private const val PREF_SERVER_ORIGIN = "server_origin"
         private const val LEGACY_PREF_SERVER_URL = "server_url"
@@ -96,6 +100,8 @@ class MainActivity : AppCompatActivity() {
         cameraPhotoFile = savedInstanceState?.getString(STATE_PHOTO_FILE)?.let(::File)
         cleanupStaleCameraFiles()
 
+        ensureLocationPermissions()
+
         webView = WebView(this)
         setContentView(webView)
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
@@ -106,10 +112,16 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun configureWebView() {
+        android.webkit.CookieManager.getInstance().apply {
+            setAcceptCookie(true)
+            setAcceptThirdPartyCookies(webView, true)
+        }
         with(webView.settings) {
             javaScriptEnabled = true
             domStorageEnabled = true
             databaseEnabled = true
+            setGeolocationEnabled(true)
+            setGeolocationDatabasePath(filesDir.path)
             allowFileAccess = false
             allowContentAccess = true
             allowFileAccessFromFileURLs = false
@@ -122,6 +134,8 @@ class MainActivity : AppCompatActivity() {
             userAgentString = "$userAgentString LogisticaCasaDoCampo/${BuildConfig.VERSION_NAME}"
         }
 
+        webView.addJavascriptInterface(AndroidLocationBridge(this), "AndroidBridge")
+
         webView.webChromeClient = object : WebChromeClient() {
             override fun onPermissionRequest(request: PermissionRequest?) {
                 // O PWA não usa WebRTC; câmera e galeria passam pelo seletor nativo.
@@ -129,7 +143,19 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onGeolocationPermissionsShowPrompt(origin: String?, callback: android.webkit.GeolocationPermissions.Callback?) {
-                callback?.invoke(origin, true, false)
+                val fineGranted = ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                val coarseGranted = ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                if (fineGranted || coarseGranted) {
+                    callback?.invoke(origin, true, true)
+                } else {
+                    pendingGeolocationCallback = callback
+                    pendingGeolocationOrigin = origin
+                    ActivityCompat.requestPermissions(
+                        this@MainActivity,
+                        arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
+                        LOCATION_PERMISSION_REQUEST
+                    )
+                }
             }
 
             override fun onShowFileChooser(
@@ -141,6 +167,27 @@ class MainActivity : AppCompatActivity() {
                 discardPendingCameraFile()
                 filePathCallback = callback
                 return launchImageChooser()
+            }
+
+            override fun onJsAlert(view: WebView?, url: String?, message: String?, result: android.webkit.JsResult?): Boolean {
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("Aviso")
+                    .setMessage(message ?: "")
+                    .setPositiveButton("OK") { _, _ -> result?.confirm() }
+                    .setOnCancelListener { result?.cancel() }
+                    .show()
+                return true
+            }
+
+            override fun onJsConfirm(view: WebView?, url: String?, message: String?, result: android.webkit.JsResult?): Boolean {
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("Confirmação")
+                    .setMessage(message ?: "")
+                    .setPositiveButton("Confirmar") { _, _ -> result?.confirm() }
+                    .setNegativeButton("Cancelar") { _, _ -> result?.cancel() }
+                    .setOnCancelListener { result?.cancel() }
+                    .show()
+                return true
             }
         }
 
@@ -160,9 +207,15 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
-                handler?.cancel()
-                Log.w(TAG, "Conexão TLS rejeitada: certificado inválido para ${error?.url?.let(Uri::parse)?.host.orEmpty()}")
-                showConnectionIssue()
+                val host = error?.url?.let(Uri::parse)?.host.orEmpty()
+                if (isLocalHost(host) || BuildConfig.DEBUG) {
+                    handler?.proceed()
+                    Log.i(TAG, "Conexão TLS aceita para ambiente local/debug: $host")
+                } else {
+                    handler?.cancel()
+                    Log.w(TAG, "Conexão TLS rejeitada: certificado inválido para $host")
+                    showConnectionIssue()
+                }
             }
         }
     }
@@ -174,7 +227,7 @@ class MainActivity : AppCompatActivity() {
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), CAMERA_PERMISSION_REQUEST)
             return true
         }
-        val gallery = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+        val gallery = Intent(Intent.ACTION_GET_CONTENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "image/*"
         }
@@ -389,6 +442,7 @@ class MainActivity : AppCompatActivity() {
                 connection.readTimeout = 5000
                 connection.instanceFollowRedirects = false
                 connection.setRequestProperty("Accept", "application/json")
+                connection.setRequestProperty("ngrok-skip-browser-warning", "true")
                 connection.responseCode == 200 && connection.inputStream.bufferedReader().use { body ->
                     val payload = JSONObject(body.readText())
                     detectedBackendVersion = payload.optString("system_version").takeIf { it.isNotBlank() }
@@ -415,7 +469,20 @@ class MainActivity : AppCompatActivity() {
 
     private fun loadApplication(origin: String) {
         Log.i(TAG, "Carregando origem validada: ${Uri.parse(origin).host}")
-        webView.loadUrl("$origin$APP_PATH")
+        val host = Uri.parse(origin).host.orEmpty()
+        try {
+            val cm = android.webkit.CookieManager.getInstance()
+            cm.setAcceptCookie(true)
+            cm.setAcceptThirdPartyCookies(webView, true)
+            if (host.contains("ngrok")) {
+                cm.setCookie(origin, "abuse_interstitial=$host; path=/; Max-Age=31536000; Secure; SameSite=None")
+                cm.flush()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Falha ao definir cookie de bypass", e)
+        }
+        val headers = mapOf("ngrok-skip-browser-warning" to "true")
+        webView.loadUrl("$origin$APP_PATH", headers)
     }
 
     private fun showConnectionIssue() {
@@ -442,6 +509,151 @@ class MainActivity : AppCompatActivity() {
                 launchImageChooser(skipPermissionRequest = true)
             } else if (granted) startQrScanner()
             else Toast.makeText(this, "A câmera é necessária para ler o QR Code.", Toast.LENGTH_LONG).show()
+        } else if (requestCode == LOCATION_PERMISSION_REQUEST) {
+            val granted = grantResults.any { it == PackageManager.PERMISSION_GRANTED }
+            pendingGeolocationCallback?.invoke(pendingGeolocationOrigin, granted, true)
+            pendingGeolocationCallback = null
+            pendingGeolocationOrigin = null
+            if (granted) {
+                startLocationUpdates()
+                Toast.makeText(this, "GPS e Localização ativados no aplicativo.", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    private var nativeLocationListener: android.location.LocationListener? = null
+    @Volatile private var latestAccurateLocation: android.location.Location? = null
+
+    private fun startLocationUpdates() {
+        val fineGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val coarseGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        if (!fineGranted && !coarseGranted) return
+
+        val lm = getSystemService(Context.LOCATION_SERVICE) as? android.location.LocationManager ?: return
+        if (nativeLocationListener == null) {
+            nativeLocationListener = object : android.location.LocationListener {
+                override fun onLocationChanged(location: android.location.Location) {
+                    if (location.accuracy <= 40f || latestAccurateLocation == null || location.accuracy <= latestAccurateLocation!!.accuracy) {
+                        latestAccurateLocation = location
+                    }
+                }
+                @Deprecated("Deprecated in Java")
+                override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+                override fun onProviderEnabled(provider: String) {}
+                override fun onProviderDisabled(provider: String) {}
+            }
+        }
+        try {
+            if (lm.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER)) {
+                lm.requestLocationUpdates(android.location.LocationManager.GPS_PROVIDER, 2000L, 2f, nativeLocationListener!!)
+            }
+            if (lm.isProviderEnabled(android.location.LocationManager.NETWORK_PROVIDER)) {
+                lm.requestLocationUpdates(android.location.LocationManager.NETWORK_PROVIDER, 5000L, 10f, nativeLocationListener!!)
+            }
+        } catch (_: SecurityException) {}
+    }
+
+    private fun stopLocationUpdates() {
+        val lm = getSystemService(Context.LOCATION_SERVICE) as? android.location.LocationManager ?: return
+        nativeLocationListener?.let {
+            try { lm.removeUpdates(it) } catch (_: SecurityException) {}
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        startLocationUpdates()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        stopLocationUpdates()
+    }
+
+    private fun ensureLocationPermissions() {
+        val fineGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val coarseGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        if (!fineGranted && !coarseGranted) {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
+                LOCATION_PERMISSION_REQUEST
+            )
+        } else {
+            startLocationUpdates()
+        }
+    }
+
+    inner class AndroidLocationBridge(private val context: Context) {
+        @android.webkit.JavascriptInterface
+        fun isNativeBridge(): Boolean = true
+
+        @android.webkit.JavascriptInterface
+        fun isLocationEnabled(): Boolean {
+            val lm = context.getSystemService(Context.LOCATION_SERVICE) as? android.location.LocationManager ?: return false
+            return lm.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER) ||
+                   lm.isProviderEnabled(android.location.LocationManager.NETWORK_PROVIDER)
+        }
+
+        @android.webkit.JavascriptInterface
+        fun getDeviceLocation(): String {
+            val fine = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+            val coarse = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+            if (!fine && !coarse) {
+                runOnUiThread { ensureLocationPermissions() }
+                return JSONObject().put("ok", false).put("error", "permission_required").toString()
+            }
+
+            // 1. Prioriza sinal de alta precisão capturado pelo listener de GPS ativo (< 60s e <= 40m)
+            val now = System.currentTimeMillis()
+            val active = latestAccurateLocation
+            if (active != null && (now - active.time < 60000) && active.accuracy <= 40f) {
+                return JSONObject()
+                    .put("ok", true)
+                    .put("latitude", active.latitude)
+                    .put("longitude", active.longitude)
+                    .put("accuracy", active.accuracy.toDouble())
+                    .put("time", active.time)
+                    .put("source", "android_native_gps")
+                    .toString()
+            }
+
+            // 2. Consulta GPS_PROVIDER (apenas se for satélite real recente com precisão <= 40m)
+            val lm = context.getSystemService(Context.LOCATION_SERVICE) as? android.location.LocationManager
+                ?: return JSONObject().put("ok", false).put("error", "no_location_manager").toString()
+
+            try {
+                if (lm.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER)) {
+                    val gpsLoc = lm.getLastKnownLocation(android.location.LocationManager.GPS_PROVIDER)
+                    if (gpsLoc != null && (now - gpsLoc.time < 60000) && gpsLoc.accuracy <= 40f) {
+                        latestAccurateLocation = gpsLoc
+                        return JSONObject()
+                            .put("ok", true)
+                            .put("latitude", gpsLoc.latitude)
+                            .put("longitude", gpsLoc.longitude)
+                            .put("accuracy", gpsLoc.accuracy.toDouble())
+                            .put("time", gpsLoc.time)
+                            .put("source", "android_native_gps")
+                            .toString()
+                    }
+                }
+            } catch (_: SecurityException) {}
+
+            runOnUiThread { startLocationUpdates() }
+
+            // Rejeita estimativas de antena de celular que apontam para locais distantes
+            return JSONObject()
+                .put("ok", false)
+                .put("error", "waiting_fix")
+                .put("message", "Aguardando sinal preciso de satélite GPS")
+                .toString()
+        }
+
+        @android.webkit.JavascriptInterface
+        fun openLocationSettings() {
+            try {
+                startActivity(Intent(android.provider.Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+            } catch (_: Exception) {}
         }
     }
 
@@ -449,13 +661,16 @@ class MainActivity : AppCompatActivity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode != FILE_CHOOSER_REQUEST) return
         val callback = filePathCallback ?: return
-        val gallerySelected = data?.data != null || data?.clipData != null
+        val hasCameraPhoto = cameraPhotoFile != null && cameraPhotoFile!!.exists() && cameraPhotoFile!!.length() > 0
         val result = if (resultCode == RESULT_OK) {
-            if (gallerySelected) WebChromeClient.FileChooserParams.parseResult(resultCode, data)
-            else cameraPhotoUri?.let { arrayOf(it) }
+            if (hasCameraPhoto) {
+                cameraPhotoUri?.let { arrayOf(it) }
+            } else {
+                WebChromeClient.FileChooserParams.parseResult(resultCode, data)
+            }
         } else null
-        val completedCameraFile = if (!gallerySelected && result != null) cameraPhotoFile else null
-        if (result == null || gallerySelected) cameraPhotoFile?.delete()
+        val completedCameraFile = if (hasCameraPhoto && result != null) cameraPhotoFile else null
+        if (result == null && cameraPhotoFile != null && !hasCameraPhoto) cameraPhotoFile?.delete()
         callback.onReceiveValue(result)
         filePathCallback = null
         cameraPhotoUri?.let {

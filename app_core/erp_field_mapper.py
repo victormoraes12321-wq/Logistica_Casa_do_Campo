@@ -245,6 +245,10 @@ def map_erp_to_logistica(erp_data: dict[str, Any]) -> dict[str, Any]:
         _get(vend, col_nome_vend, "nomevendedor", "nome_ved", "nome", "vendedor")
         or _get(erp_data, "nomevendedor", "nome_vendedor", "vendedor", "nome_", "nome")
     )
+    if not seller_name or re.match(r'^(?:RCA\s*|\#\s*)?(\d+)$', seller_name, re.I):
+        v_alt = _clean_str(_get(vend, "nome_ved", "nome", "nomevendedor", "nome_vendedor"))
+        if v_alt:
+            seller_name = v_alt
 
     # ---- Itens ----
     items = []
@@ -297,15 +301,21 @@ def map_erp_to_logistica(erp_data: dict[str, Any]) -> dict[str, Any]:
 
     # ---- Detecção de Faturamento ----
     posicao = _clean_str(_get(erp_data, "posicao_pedido", "posicao", "posicao_")).upper()
-    raw_nf = _clean_str(_get(erp_data, "numero_nota_fiscal_saida", "nota_", "nota_fiscal", "numeronf", "numero_nfe", "nota", "numeronota", "notafiscal", "num_nota", "num_nota_fiscal", "numero_nota", "nfe"))
-    if raw_nf in ("0", "0.0", "None", "NULL"):
+    raw_nf = _clean_str(_get(erp_data, "numero_nota_fiscal_saida", "nota_", "nota_fiscal", "numeronf", "numero_nfe", "nota", "numeronota", "notafiscal", "num_nota", "num_nota_fiscal", "numero_nota", "numero_orcamento", "orcamento", "num_orcamento", "nfe"))
+    if raw_nf in ("0", "0.0", "None", "NULL", "null"):
         raw_nf = ""
 
     # Faturado se possui número de NF válido OU se a posição no ERP indica faturamento
     invoiced_pos_codes = ("F", "FATURADO", "FAT", "E", "EMITIDO", "CONCLUIDO", "FECHADO", "ENCERRADO", "FINALIZADO")
     is_invoiced = bool(raw_nf) or (posicao in invoiced_pos_codes)
 
-    invoice_number = raw_nf if raw_nf else ("1" if is_invoiced else "")
+    # Se faturado no ERP e não tem NF formal emitida, busca número de orçamento / pedido
+    if is_invoiced and not raw_nf:
+        raw_nf = _clean_str(_get(erp_data, "numero_orcamento", "orcamento", "num_orcamento", "numero", "pedido_", "numeropedido", "num_pedido"))
+        if raw_nf in ("0", "0.0", "None", "NULL", "null"):
+            raw_nf = ""
+
+    invoice_number = raw_nf if raw_nf else (str(order_number) if (is_invoiced and order_number) else "")
     invoiced_at = _parse_date(_get(erp_data, "data_faturamento_pedido", "data_faturamento", "datanota", "data_nota", "dtemissao_")) if is_invoiced else ""
     if is_invoiced and not invoiced_at:
         invoiced_at = sale_date or datetime.now().strftime("%Y-%m-%d")
@@ -361,17 +371,26 @@ def map_erp_invoice_to_logistica(erp_fat_data: dict[str, Any]) -> dict[str, Any]
     col_nf_data = _col("ERP_COL_NF_DATA", "datafaturamento")
 
     nf = _clean_str(
-        _get(erp_fat_data, col_nf_num, "numeronf", "nota_fiscal", "nf", "numernf", "numnf", "numero_nota_fiscal_saida", "nota_", "nota", "num_nota", "notafiscal", "numero_nota_fiscal", "nfe", "numero_nfe")
+        _get(erp_fat_data, col_nf_num, "numeronf", "nota_fiscal", "nf", "numernf", "numnf", "numero_nota_fiscal_saida", "nota_", "nota", "num_nota", "notafiscal", "numero_nota_fiscal", "numero_orcamento", "orcamento", "num_orcamento", "nfe", "numero_nfe")
     )
-    if not nf or nf in ("0", "0.0", "None", "null"):
+    if not nf or nf in ("0", "0.0", "None", "null", "NULL"):
         if erp_fat_data.get("is_invoiced") or erp_fat_data.get("invoice_number"):
             nf = _clean_str(erp_fat_data.get("invoice_number"))
 
-    if not nf or nf in ("0", "0.0", "None", "null"):
+    posicao = _clean_str(_get(erp_fat_data, "posicao_pedido", "posicao", "posicao_")).upper()
+    is_invoiced = erp_fat_data.get("is_invoiced") or (posicao in ("F", "FATURADO", "FAT", "E", "EMITIDO", "CONCLUIDO", "FECHADO", "ENCERRADO", "FINALIZADO"))
+
+    if not nf or nf in ("0", "0.0", "None", "null", "NULL"):
+        if is_invoiced:
+            nf = _clean_str(_get(erp_fat_data, "numero_orcamento", "orcamento", "num_orcamento", "numeropedido", "pedido_", "numero"))
+            if not nf or nf in ("0", "0.0", "None", "null", "NULL"):
+                nf = _clean_str(erp_fat_data.get("order_number") or erp_fat_data.get("numeropedido") or "")
+
+    if not nf or nf in ("0", "0.0", "None", "null", "NULL"):
         return None
 
     nf_date = _parse_date(
-        _get(erp_fat_data, col_nf_data, "datafaturamento", "data_faturamento", "data_faturamento_pedido", "data_nf", "datanf", "datanota", "data_nota", "invoiced_at")
+        _get(erp_fat_data, col_nf_data, "datafaturamento", "data_faturamento", "data_faturamento_pedido", "data_nf", "datanf", "datanota", "data_nota", "dtemissao_", "invoiced_at")
     )
 
     return {

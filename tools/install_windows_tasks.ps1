@@ -35,6 +35,7 @@ function Find-PythonExe {
     } catch {}
   }
   $candidates = @(
+    "C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe",
     "$env:USERPROFILE\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe",
     "$env:LOCALAPPDATA\Programs\Python\Python314\python.exe",
     "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe",

@@ -28,12 +28,13 @@ class ScheduledStatusTests(unittest.TestCase):
         # Validar transições permitidas a partir dos status principais
         self.assertIn('Agendado', ORDER_ALLOWED_TRANSITIONS['Venda'])
         self.assertIn('Agendado', ORDER_ALLOWED_TRANSITIONS['Faturado'])
+        self.assertIn('Agendado', ORDER_ALLOWED_TRANSITIONS['Carga Montada'])
         self.assertIn('Agendado', ORDER_ALLOWED_TRANSITIONS['Saiu para entrega'])
         
         # Validar transições a partir de 'Agendado'
         self.assertEqual(
             ORDER_ALLOWED_TRANSITIONS['Agendado'],
-            {'Venda', 'Faturado', 'Saiu para entrega', 'Acertado', 'Problema', 'Cancelado'}
+            {'Venda', 'Faturado', 'Carga Montada', 'Saiu para entrega', 'Acertado', 'Problema', 'Cancelado'}
         )
 
     def test_sla_exclusion_for_scheduled_orders(self):

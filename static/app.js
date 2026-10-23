@@ -274,9 +274,24 @@ document.addEventListener('DOMContentLoaded', () => {
     if (e.key === 'Escape') document.body.classList.remove('menu-open');
   });
 
+  // Toggle visualização de senha no Login
+  const togglePassBtn = $('#togglePasswordBtn');
+  const passInput = $('#inputPassword');
+  if (togglePassBtn && passInput) {
+    togglePassBtn.addEventListener('click', () => {
+      const isPass = passInput.type === 'password';
+      passInput.type = isPass ? 'text' : 'password';
+      const iconShow = $('#eyeIconShow');
+      const iconHide = $('#eyeIconHide');
+      if (iconShow) iconShow.style.display = isPass ? 'none' : 'inline';
+      if (iconHide) iconHide.style.display = isPass ? 'inline' : 'none';
+    });
+  }
+
   // Confirm risky actions
   $$('form').forEach(form => {
     ensureCsrfInput(form);
+    if (form.id === 'loginForm' || form.action?.includes('/login') || form.action?.includes('/force-password')) return;
     form.addEventListener('submit', e => {
       ensureCsrfInput(form);
       let alreadyConfirmed = false;
@@ -287,7 +302,7 @@ document.addEventListener('DOMContentLoaded', () => {
       }
       const danger = form.querySelector('.danger-btn');
       const deleting = /cancelar|excluir|remover|problema|desativar/i.test(form.textContent || '');
-      if (!alreadyConfirmed && (danger || deleting) && !confirm('Confirma esta ação?')) e.preventDefault();
+      if (!alreadyConfirmed && danger && !confirm('Confirma esta ação?')) e.preventDefault();
     });
   });
 
@@ -1722,10 +1737,17 @@ document.addEventListener('DOMContentLoaded', () => {
       }, 30000);
     };
 
+    const preserveEditablePage = () => {
+      const path = window.location.pathname.replace(/\/+$/, '');
+      return path === '/registro-viagens'
+        || path.includes('/routes/new') || path.includes('/edit')
+        || path.includes('/new') || path.includes('/load-settlement/')
+        || Boolean(document.querySelector('[data-realtime-refresh="off"]'));
+    };
+
     const handleRealtimeEvent = (eventType) => {
-      // Não atualizar automaticamente em telas de criação ou edição ativa para evitar perda de dados digitados
-      const path = window.location.pathname;
-      if (path.includes('/routes/new') || path.includes('/edit') || path.includes('/new') || path.includes('/load-settlement/')) {
+      // Formulários de trabalho mantêm seu DOM, mesmo com foco fora da tabela.
+      if (preserveEditablePage()) {
         return;
       }
 
@@ -1736,6 +1758,8 @@ document.addEventListener('DOMContentLoaded', () => {
           return response.text();
         })
         .then(html => {
+          // A página pode ter entrado em edição enquanto a resposta estava em trânsito.
+          if (preserveEditablePage()) return;
           const parser = new DOMParser();
           const doc = parser.parseFromString(html, 'text/html');
 

@@ -183,6 +183,12 @@ class DriverApiTests(unittest.TestCase):
             self.assertEqual((history["old_status"], history["new_status"]), ("Saiu para entrega", "Acertado"))
             self.assertIn("app", history["action"])
             self.assertEqual(db.execute("SELECT status FROM orders WHERE id=3111").fetchone()[0], "Acertado")
+            self.assertEqual(db.execute("SELECT status FROM routes WHERE id=311").fetchone()[0], "Aguardando Chegada")
+
+        arr_handler = DummyHandler({"route_id": 311, "latitude": -20.4697, "longitude": -54.6201}, token)
+        handle_driver_api_request(arr_handler, "/api/v1/driver/route/arrival", "POST")
+        self.assertEqual(arr_handler.result_status, 200)
+        with app.conn() as db:
             self.assertEqual(db.execute("SELECT status FROM routes WHERE id=311").fetchone()[0], "Acertada")
 
     def test_client_disconnect_after_commit_does_not_report_transaction_failure(self):
@@ -223,7 +229,7 @@ class DriverApiTests(unittest.TestCase):
         }, token)
         handle_driver_api_request(handler, "/api/v1/driver/deliver", "POST")
         self.assertEqual(handler.result_status, 200, handler.result_data)
-        self.assertEqual(handler.result_data["route_status"], "Com problema")
+        self.assertEqual(handler.result_data["route_status"], "Aguardando Chegada")
         with app.conn() as db:
             problem = db.execute("SELECT route_id,problem_type,description FROM delivery_problems WHERE order_id=4111").fetchone()
             self.assertEqual(problem["route_id"], 411)
@@ -231,6 +237,12 @@ class DriverApiTests(unittest.TestCase):
             history = db.execute("SELECT new_status,notes FROM order_history WHERE order_id=4111").fetchone()
             self.assertEqual(history["new_status"], "Problema")
             self.assertIn("Cliente ausente", history["notes"])
+            self.assertEqual(db.execute("SELECT status FROM routes WHERE id=411").fetchone()[0], "Aguardando Chegada")
+
+        arr_handler = DummyHandler({"route_id": 411, "latitude": -20.4697, "longitude": -54.6201}, token)
+        handle_driver_api_request(arr_handler, "/api/v1/driver/route/arrival", "POST")
+        self.assertEqual(arr_handler.result_status, 200)
+        with app.conn() as db:
             self.assertEqual(db.execute("SELECT status FROM routes WHERE id=411").fetchone()[0], "Com problema")
 
     def test_failed_receipt_insert_rolls_back_all_business_state(self):
@@ -393,6 +405,71 @@ class DriverApiTests(unittest.TestCase):
             routes = [row[0] for row in db.execute("SELECT route_id FROM delivery_receipts WHERE order_id=11111 ORDER BY route_id")]
             self.assertEqual(routes, [1110, 1111])
 
+    def test_contingency_delivery_without_photo_or_signature(self):
+        self._create_driver(121, "Motorista Contingência")
+        self._create_route_order(121, 1211, 12111)
+        token = self._login(121)
+        delivery = DummyHandler({
+            "idempotency_key": "contingency-delivery-12111",
+            "route_id": 1211,
+            "order_id": 12111,
+            "delivered_to": "Recebedor Sérgio",
+            "receipt_photo": "",
+            "digital_signature": "",
+            "is_problem": False,
+        }, token)
+        handle_driver_api_request(delivery, "/api/v1/driver/deliver", "POST")
+        self.assertEqual(delivery.result_status, 200, delivery.result_data)
+        with app.conn() as db:
+            order = db.execute("SELECT status, delivered_to, final_notes FROM orders WHERE id=12111").fetchone()
+            self.assertEqual(order["status"], "Acertado")
+            self.assertEqual(order["delivered_to"], "Recebedor Sérgio")
+            self.assertIn("contingência", str(order["final_notes"]))
+
+    def test_already_finalized_order_returns_200_with_code(self):
+        self._create_driver(131, "Motorista Replay")
+        self._create_route_order(131, 1311, 13111)
+        token = self._login(131)
+        # Finaliza pela primeira vez com foto
+        delivery = DummyHandler({
+            "idempotency_key": "first-delivery-13111",
+            "route_id": 1311,
+            "order_id": 13111,
+            "delivered_to": "Cliente",
+            "receipt_photo": "data:image/jpeg;base64," + base64.b64encode(b"\xff\xd8\xffphoto").decode("ascii"),
+        }, token)
+        handle_driver_api_request(delivery, "/api/v1/driver/deliver", "POST")
+        self.assertEqual(delivery.result_status, 200)
+
+        # Segunda tentativa (com outra chave ou reenvio) deve retornar 200 com order_already_finalized
+        replay = DummyHandler({
+            "idempotency_key": "second-delivery-13111",
+            "route_id": 1311,
+            "order_id": 13111,
+            "delivered_to": "Cliente",
+            "receipt_photo": "",
+        }, token)
+        handle_driver_api_request(replay, "/api/v1/driver/deliver", "POST")
+        self.assertEqual(replay.result_status, 200, replay.result_data)
+        self.assertEqual(replay.result_data.get("code"), "order_already_finalized")
+
+    def test_already_completed_route_returns_200_on_arrival(self):
+        self._create_driver(141, "Motorista Chegada")
+        self._create_route_order(141, 1411, 14111)
+        token = self._login(141)
+        with app.conn() as db:
+            db.execute("UPDATE routes SET status='Acertada', km_end=100.0 WHERE id=1411")
+            db.commit()
+
+        arrival = DummyHandler({
+            "route_id": 1411,
+            "km_end": 100.0,
+        }, token)
+        handle_driver_api_request(arrival, "/api/v1/driver/route/arrival", "POST")
+        self.assertEqual(arrival.result_status, 200, arrival.result_data)
+        self.assertTrue(arrival.result_data.get("ok"))
+
 
 if __name__ == "__main__":
     unittest.main()
+

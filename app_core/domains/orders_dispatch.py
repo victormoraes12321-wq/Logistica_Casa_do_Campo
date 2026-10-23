@@ -7,6 +7,11 @@ def handle_get(handler, path: str, user) -> bool:
             return True
         handler.handle_erp_lookup(user)
         return True
+    if path == "/orders/sync-carga-erp":
+        if not handler.require_perm(user, "create_orders", "Sem permissão para sincronizar pedidos do ERP."):
+            return True
+        handler.handle_orders_sync_carga_erp(user)
+        return True
     if path.startswith("/orders/") and path.endswith("/receipt-image"):
         if not handler.require_perm(user, "view_orders", "Sem permissão para visualizar comprovantes."):
             return True
@@ -35,6 +40,11 @@ def handle_get(handler, path: str, user) -> bool:
 
 
 def handle_post(handler, path: str, user) -> bool:
+    if path == "/orders/sync-carga-erp":
+        if not handler.require_perm(user, "create_orders", "Sem permissão para sincronizar pedidos do ERP."):
+            return True
+        handler.handle_orders_sync_carga_erp(user)
+        return True
     if path == "/orders/new":
         if not handler.require_perm(user, "create_orders", "Sem permissão para criar pedidos."):
             return True

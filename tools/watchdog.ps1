@@ -28,6 +28,7 @@ function Find-PythonExe {
     } catch {}
   }
   $candidates = @(
+    "C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe",
     "$env:USERPROFILE\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe",
     "$env:LOCALAPPDATA\Programs\Python\Python314\python.exe",
     "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe",
@@ -115,7 +116,24 @@ try {
   Ensure-FirewallRule -PortToOpen $Port
   Write-WatchdogLog "Watchdog iniciado. Host=$BindHost Porta=$Port Python=$pythonExe"
 
+  $ngrokExe = Join-Path $scriptDir "ngrok.exe"
+  function Ensure-NgrokTunnel {
+    if (Test-Path $ngrokExe) {
+      try {
+        $ngCheck = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 2 -ErrorAction Stop
+        if ($ngCheck.tunnels.Count -gt 0) { return }
+      } catch {}
+      try {
+        Write-WatchdogLog "Iniciando tunel ngrok para app externo..."
+        Start-Process -FilePath $ngrokExe -ArgumentList "http 3000 --url deserve-reload-purging.ngrok-free.dev" -WindowStyle Hidden
+      } catch {
+        Write-WatchdogLog "Falha ao iniciar ngrok: $_"
+      }
+    }
+  }
+
   while ($true) {
+    Ensure-NgrokTunnel
     if (Test-PortListening -PortToCheck $Port) {
       Start-Sleep -Seconds 20
       continue

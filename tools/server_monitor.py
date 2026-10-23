@@ -97,6 +97,30 @@ def check_http_health(port: int) -> tuple[bool, str]:
     except Exception as e:
         return False, str(e)
 
+def ensure_ngrok_tunnel() -> None:
+    """Verifica e inicia o túnel seguro do ngrok caso configurado."""
+    ngrok_exe = os.path.join(BASE_DIR, "tools", "ngrok.exe")
+    if not os.path.exists(ngrok_exe):
+        return
+    try:
+        req = Request("http://127.0.0.1:4040/api/tunnels", headers={"User-Agent": "LogisticaWatchdog/1.0"})
+        with urlopen(req, timeout=1.5) as resp:
+            if resp.status == 200:
+                return
+    except Exception:
+        pass
+    try:
+        subprocess.Popen(
+            [ngrok_exe, "http", "3000", "--url", "deserve-reload-purging.ngrok-free.dev"],
+            cwd=BASE_DIR,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+        safe_print(" [NGROK] Túnel seguro iniciado: https://deserve-reload-purging.ngrok-free.dev")
+    except Exception as e:
+        safe_print(f" [NGROK] Falha ao iniciar túnel: {e}")
+
 def print_header(host: str, port: int, python_exe: str) -> None:
     lan_ip = get_lan_ip()
     safe_print("\n" + "=" * 75)
@@ -104,9 +128,12 @@ def print_header(host: str, port: int, python_exe: str) -> None:
     safe_print("=" * 75)
     safe_print(f" Executável Python:  {python_exe}")
     safe_print(f" Modo de Rede:       Bind {host}:{port}")
-    safe_print(f" Acesso neste PC:    http://localhost:{port}")
+    safe_print(f" Acesso neste PC:    http://localhost:{port} | https://localhost:3443")
     if host == "0.0.0.0":
         safe_print(f" Acesso na Rede:     http://{lan_ip}:{port}")
+        safe_print(f" Acesso HTTPS (GPS): https://{lan_ip}:3443 (Recomendado p/ Celular)")
+    safe_print(f" App Celular/Externo: https://deserve-reload-purging.ngrok-free.dev")
+    safe_print(f" App do Motorista:   https://deserve-reload-purging.ngrok-free.dev/static/driver_app/index.html")
     safe_print(f" Arquivo de Log:     logs/runtime.log")
     safe_print(f" Log de Erros:       logs/server_errors.log")
     safe_print("-" * 75)
@@ -139,9 +166,11 @@ def run_server_monitor(host: str = "0.0.0.0", port: int = 3000, restart_delay: i
         def health_loop():
             # Aguarda o app subir (5s iniciais)
             time.sleep(5)
+            ensure_ngrok_tunnel()
             while not stop_health_check.is_set():
                 if proc and proc.poll() is not None:
                     break
+                ensure_ngrok_tunnel()
                 ok, status_msg = check_http_health(port)
                 now_str = datetime.datetime.now().strftime('%H:%M:%S')
                 uptime_sec = int(time.time() - start_time)

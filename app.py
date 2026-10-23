@@ -21,6 +21,7 @@ from app_core.domains import (
     orders_dispatch,
     reports_dispatch,
     routes_dispatch,
+    trip_registry_dispatch,
 )
 try:
     from app_core.domains import erp_admin_dispatch as _erp_admin_dispatch
@@ -46,7 +47,7 @@ from app_core.services.backup_service import (
     restore_sqlite_from_backup,
 )
 from app_core.services.permission_service import has_permission as permission_service_has_permission
-from app_core.services.driver_security import DEFAULT_DRIVER_PASSWORD, hash_driver_password
+from app_core.services.driver_security import DEFAULT_DRIVER_PASSWORD, hash_driver_password, utc_iso
 import queue
 
 # Integração ERP (importação condicional — nunca quebra o app se módulo ausente)
@@ -149,8 +150,8 @@ REQUEST_LATENCIES_MS = []
 REQUEST_LATENCIES_LOCK = threading.Lock()
 SLA_LIMIT_DAYS = 15
 SLA_RISK_DAYS = 5
-STATUSES = ['Venda','Faturado','Saiu para entrega','Agendado','Acertado','Problema','Cancelado']
-FLOW = ['Venda','Faturado','Saiu para entrega','Acertado']
+STATUSES = ['Venda','Faturado','Carga Montada','Saiu para entrega','Agendado','Acertado','Problema','Cancelado']
+FLOW = ['Venda','Faturado','Carga Montada','Saiu para entrega','Acertado']
 ROLES = ['GOD','Admin','Gestor','Faturamento','Expedicao','Motorista','Operador','Consulta']
 PROBLEM_TYPES = ['Cliente ausente','Endereço incorreto','Produto errado','Produto faltando','Cliente recusou','Local de difícil acesso','Chuva/estrada ruim','Veículo com problema','Outro motivo']
 PAYMENT_METHODS = ['À vista','Boleto','Pix','Cartão','Prazo','Nota Promissória','Dinheiro','Pago antecipado','Sem cobrança na entrega','Outro']
@@ -238,6 +239,13 @@ ORDER_STATUS_ALIASES = {
     'Em separaÃ§Ã£o': 'Faturado',
     'Em separa??o': 'Faturado',
     'Pronto para entrega': 'Faturado',
+    'Carga Montada': 'Carga Montada',
+    'Carga montada': 'Carga Montada',
+    'Aguardando Saída': 'Carga Montada',
+    'Aguardando saída': 'Carga Montada',
+    'Aguardando Saida': 'Carga Montada',
+    'Aguardando saida': 'Carga Montada',
+    'Carga Montada / Aguardando Saída': 'Carga Montada',
     'Saiu para entrega': 'Saiu para entrega',
     'Agendado': 'Agendado',
     'Entrega agendada': 'Agendado',
@@ -265,9 +273,10 @@ FINAL_ROUTE_STATUSES = {'Acertada', 'Com problema', 'Cancelada'}
 ACTIVE_ROUTE_STATUSES = ('Planejada', 'Em rota')
 ORDER_ALLOWED_TRANSITIONS = {
     'Venda': {'Faturado', 'Problema', 'Cancelado', 'Agendado'},
-    'Faturado': {'Saiu para entrega', 'Acertado', 'Problema', 'Cancelado', 'Agendado'},
-    'Saiu para entrega': {'Faturado', 'Acertado', 'Problema', 'Cancelado', 'Agendado'},
-    'Agendado': {'Venda', 'Faturado', 'Saiu para entrega', 'Acertado', 'Problema', 'Cancelado'},
+    'Faturado': {'Carga Montada', 'Saiu para entrega', 'Acertado', 'Problema', 'Cancelado', 'Agendado'},
+    'Carga Montada': {'Faturado', 'Saiu para entrega', 'Acertado', 'Problema', 'Cancelado', 'Agendado'},
+    'Saiu para entrega': {'Faturado', 'Carga Montada', 'Acertado', 'Problema', 'Cancelado', 'Agendado'},
+    'Agendado': {'Venda', 'Faturado', 'Carga Montada', 'Saiu para entrega', 'Acertado', 'Problema', 'Cancelado'},
     'Acertado': set(),
     'Problema': set(),
     'Cancelado': set(),
@@ -310,6 +319,79 @@ def normalize_route_status(status):
     return s if s in ROUTE_STATUSES else 'Planejada'
 
 
+_SELLER_NAME_BY_CODE: dict[str, str] = {}
+
+def get_seller_name_map(db=None) -> dict[str, str]:
+    """Retorna dicionário mapeando código RCA (string) para nome completo do vendedor."""
+    global _SELLER_NAME_BY_CODE
+    if _SELLER_NAME_BY_CODE:
+        return _SELLER_NAME_BY_CODE
+
+    # 1. Carrega do banco SQLite local (erp_cache_vendedores)
+    try:
+        def _read_cache(conn_obj):
+            for row in conn_obj.execute("SELECT codigovendedor, raw_json FROM erp_cache_vendedores").fetchall():
+                c_code = str(row[0] or "").strip()
+                if not c_code:
+                    continue
+                try:
+                    d = json.loads(row[1]) if isinstance(row[1], str) else row[1]
+                    name = (d.get("nome_ved") or d.get("nome") or d.get("nomevendedor") or d.get("nome_vendedor") or "").strip()
+                    if name:
+                        _SELLER_NAME_BY_CODE[c_code] = name
+                except Exception:
+                    pass
+        if db is not None:
+            _read_cache(db)
+        else:
+            with conn() as ldb:
+                _read_cache(ldb)
+    except Exception:
+        pass
+
+    return _SELLER_NAME_BY_CODE
+
+
+def resolve_seller_name(code_or_str, db=None) -> str:
+    """Resolve código RCA ou texto legado para o nome real completo do vendedor."""
+    if not code_or_str:
+        return "Não informado"
+    val = str(code_or_str).strip()
+    if not val:
+        return "Não informado"
+
+    # Se já é um nome completo de vendedor (não é "RCA XX", "#XX" nem número puro)
+    m_rca = re.match(r'^(?:RCA\s*|\#\s*)?(\d+)$', val, re.IGNORECASE)
+    if not m_rca:
+        return val
+
+    code = m_rca.group(1).strip()
+    seller_map = get_seller_name_map(db)
+    name = seller_map.get(code)
+    if name:
+        return name
+
+    # Fallback buscando pontualmente no SQLite se ainda não carregado
+    try:
+        def _check_one(c_obj):
+            r = c_obj.execute("SELECT raw_json FROM erp_cache_vendedores WHERE codigovendedor = ?", (code,)).fetchone()
+            if r and r[0]:
+                d = json.loads(r[0]) if isinstance(r[0], str) else r[0]
+                return (d.get("nome_ved") or d.get("nome") or d.get("nomevendedor") or "").strip()
+            return None
+        found = _check_one(db) if db is not None else None
+        if not found:
+            with conn() as ldb:
+                found = _check_one(ldb)
+        if found:
+            _SELLER_NAME_BY_CODE[code] = found
+            return found
+    except Exception:
+        pass
+
+    return f"Vendedor (RCA {code})"
+
+
 def now(): return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 def today(): return date.today().isoformat()
 def esc(v): return html.escape('' if v is None else str(v), quote=True)
@@ -333,6 +415,10 @@ def client_display_name(customer_code, name):
 def fmt_num(v, places=0):
     try: return f"{float(v or 0):,.{places}f}".replace(',', 'X').replace('.', ',').replace('X','.')
     except Exception: return '0'
+def to_float(v, default=0.0):
+    try: return float(v or 0)
+    except Exception: return default
+Number = to_float
 def brdate(v):
     if not v: return '—'
     s = str(v)[:10]
@@ -842,36 +928,58 @@ def order_sla_row_class(limit_date, status=''):
     return 'sla-ok'
 
 
+def extract_lat_lng(val):
+    if not val:
+        return None, None
+    if isinstance(val, (tuple, list)) and len(val) >= 2:
+        try:
+            return float(val[0]), float(val[1])
+        except Exception:
+            pass
+    val_str = str(val).strip()
+    m = re.search(r'([-+]?\d+\.\d+)\s*,\s*([-+]?\d+\.\d+)', val_str)
+    if m:
+        try:
+            lat, lng = float(m.group(1)), float(m.group(2))
+            if -90 <= lat <= 90 and -180 <= lng <= 180:
+                return lat, lng
+        except Exception:
+            pass
+    return None, None
+
+
 def order_map_info(order_row, receipt_row=None):
     if not order_row:
         return ("", False, "")
     keys = order_row.keys()
 
-    # 1. GPS do comprovante
+    # 1. GPS do comprovante (coordenadas exatas do dispositivo)
     if receipt_row:
         r_keys = receipt_row.keys()
         if 'delivery_location_link' in r_keys and receipt_row['delivery_location_link']:
-            return (receipt_row['delivery_location_link'], True, 'GPS')
+            return (receipt_row['delivery_location_link'], True, 'GPS Exato')
         if 'latitude' in r_keys and receipt_row['latitude'] is not None and 'longitude' in r_keys and receipt_row['longitude'] is not None:
             try:
                 lat, lng = float(receipt_row['latitude']), float(receipt_row['longitude'])
-                return (f"https://www.google.com/maps?q={lat:.6f},{lng:.6f}", True, 'GPS')
+                return (f"https://www.google.com/maps?q={lat:.6f},{lng:.6f}", True, 'GPS Exato')
             except (ValueError, TypeError):
                 pass
 
-    # 2. GPS do pedido
+    # 2. GPS do pedido (capturado na confirmação da entrega mobile)
     if 'dr_loc_link' in keys and order_row['dr_loc_link']:
-        return (order_row['dr_loc_link'], True, 'GPS')
+        return (order_row['dr_loc_link'], True, 'GPS Exato')
     if 'delivery_location_link' in keys and order_row['delivery_location_link']:
-        return (order_row['delivery_location_link'], True, 'GPS')
+        return (order_row['delivery_location_link'], True, 'GPS Exato')
     if 'delivery_latitude' in keys and order_row['delivery_latitude'] is not None and 'delivery_longitude' in keys and order_row['delivery_longitude'] is not None:
         try:
             lat, lng = float(order_row['delivery_latitude']), float(order_row['delivery_longitude'])
-            return (f"https://www.google.com/maps?q={lat:.6f},{lng:.6f}", True, 'GPS')
+            return (f"https://www.google.com/maps?q={lat:.6f},{lng:.6f}", True, 'GPS Exato')
         except (ValueError, TypeError):
             pass
+
+    # 3. Link de Mapa cadastrado no cliente
     if 'location_link' in keys and order_row['location_link']:
-        return (order_row['location_link'], True, 'GPS')
+        return (order_row['location_link'], False, 'Cadastrado')
 
     # 3. Fallback de Endereço / Fazenda no Google Maps
     client = order_row['client'] if 'client' in keys else (order_row['client_name'] if 'client_name' in keys else '')
@@ -895,6 +1003,14 @@ def get_setting(key, default=''):
     except Exception:
         return default
 
+
+def get_google_maps_api_key():
+    env_key = os.environ.get('GOOGLE_MAPS_API_KEY', '').strip()
+    if env_key:
+        return env_key
+    return get_setting('google_maps_api_key', '').strip()
+
+
 def db_executescript(db):
     db.executescript('''
     PRAGMA foreign_keys=ON;
@@ -905,7 +1021,7 @@ def db_executescript(db):
     CREATE TABLE IF NOT EXISTS drivers(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,phone TEXT,document TEXT,vehicle_default TEXT,active INTEGER DEFAULT 1,updated_at TEXT,version INTEGER DEFAULT 1,password_hash TEXT,must_change_password INTEGER DEFAULT 1);
     CREATE TABLE IF NOT EXISTS vehicles(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,plate TEXT,type TEXT,capacity TEXT,capacity_kg REAL,active INTEGER DEFAULT 1,updated_at TEXT,version INTEGER DEFAULT 1);
     CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY AUTOINCREMENT,order_number TEXT UNIQUE NOT NULL,external_id TEXT,client_id INTEGER,seller_id INTEGER,seller_name TEXT,status TEXT NOT NULL,urgency TEXT DEFAULT 'Normal',sale_date TEXT,expected_delivery_date TEXT,invoice_limit_date TEXT,payment_method TEXT,total_value REAL DEFAULT 0,weight_kg REAL DEFAULT 0,delivery_address TEXT,location_link TEXT,route_name TEXT,city TEXT,uf TEXT,notes TEXT,invoice_number TEXT,invoice_file_path TEXT,invoiced_at TEXT,driver_id INTEGER,vehicle_id INTEGER,delivered_to TEXT,delivered_document TEXT,delivered_at TEXT,final_notes TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,version INTEGER DEFAULT 1,FOREIGN KEY(client_id) REFERENCES clients(id),FOREIGN KEY(seller_id) REFERENCES users(id),FOREIGN KEY(driver_id) REFERENCES drivers(id),FOREIGN KEY(vehicle_id) REFERENCES vehicles(id));
-    CREATE TABLE IF NOT EXISTS order_items(id INTEGER PRIMARY KEY AUTOINCREMENT,order_id INTEGER NOT NULL,product_code TEXT,product_name TEXT NOT NULL,category TEXT,quantity REAL DEFAULT 0,unit TEXT,weight_kg REAL DEFAULT 0,notes TEXT,FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE);
+    CREATE TABLE IF NOT EXISTS order_items(id INTEGER PRIMARY KEY AUTOINCREMENT,order_id INTEGER NOT NULL,product_code TEXT,product_name TEXT NOT NULL,category TEXT,quantity REAL DEFAULT 0,unit TEXT,weight_kg REAL DEFAULT 0,unit_price REAL DEFAULT 0,total_value REAL DEFAULT 0,status TEXT DEFAULT 'Pendente',problem_notes TEXT DEFAULT '',notes TEXT,FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE);
     CREATE TABLE IF NOT EXISTS routes(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,date TEXT,driver_id INTEGER,vehicle_id INTEGER,status TEXT DEFAULT 'Planejada',route_name TEXT,total_weight REAL DEFAULT 0,capacity REAL DEFAULT 11000,notes TEXT,created_at TEXT NOT NULL,updated_at TEXT,version INTEGER DEFAULT 1,FOREIGN KEY(driver_id) REFERENCES drivers(id),FOREIGN KEY(vehicle_id) REFERENCES vehicles(id));
     CREATE TABLE IF NOT EXISTS route_orders(id INTEGER PRIMARY KEY AUTOINCREMENT,route_id INTEGER NOT NULL,order_id INTEGER NOT NULL,delivery_order INTEGER DEFAULT 1,status TEXT DEFAULT 'Pendente',FOREIGN KEY(route_id) REFERENCES routes(id) ON DELETE CASCADE,FOREIGN KEY(order_id) REFERENCES orders(id));
     CREATE TABLE IF NOT EXISTS route_cities(id INTEGER PRIMARY KEY AUTOINCREMENT,route_name TEXT,city TEXT,uf TEXT,delivery_order INTEGER,active INTEGER DEFAULT 1,notes TEXT,created_at TEXT,updated_at TEXT,version INTEGER DEFAULT 1);
@@ -942,6 +1058,12 @@ def db_executescript(db):
         value TEXT,
         updated_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS deleted_orders (
+        order_number TEXT PRIMARY KEY,
+        deleted_at TEXT NOT NULL,
+        deleted_by INTEGER,
+        reason TEXT
+    );
     CREATE INDEX IF NOT EXISTS idx_erp_cache_pedidos_sync ON erp_cache_pedidos(erp_synced_at);
     CREATE INDEX IF NOT EXISTS idx_erp_cache_fat_sync ON erp_cache_faturamento(erp_synced_at);
     ''')
@@ -954,6 +1076,8 @@ def ensure_column(db, table, column_name, column_def):
 
 
 def ensure_schema_migrations(db):
+    from app_core.services.trip_audit import ensure_schema as ensure_trip_audit_schema
+    ensure_trip_audit_schema(db)
     ensure_column(db, 'users', 'role', 'role TEXT NOT NULL DEFAULT "Operador"')
     ensure_column(db, 'users', 'active', 'active INTEGER DEFAULT 1')
     ensure_column(db, 'users', 'must_change_password', 'must_change_password INTEGER DEFAULT 0')
@@ -1000,24 +1124,69 @@ def ensure_schema_migrations(db):
     ensure_column(db, 'orders', 'delivery_longitude', 'delivery_longitude REAL')
     ensure_column(db, 'orders', 'delivery_location_link', 'delivery_location_link TEXT')
     ensure_column(db, 'orders', 'delivered_document_type', 'delivered_document_type TEXT')
-    ensure_column(db, 'delivery_problems', 'route_id', 'route_id INTEGER')
     ensure_column(db, 'routes', 'status', 'status TEXT DEFAULT "Planejada"')
     ensure_column(db, 'routes', 'route_name', 'route_name TEXT')
     ensure_column(db, 'routes', 'total_weight', 'total_weight REAL DEFAULT 0')
+    ensure_column(db, 'routes', 'declared_weight', 'declared_weight REAL DEFAULT 0')
     ensure_column(db, 'routes', 'capacity', 'capacity REAL DEFAULT 11000')
     ensure_column(db, 'routes', 'notes', 'notes TEXT')
     ensure_column(db, 'routes', 'date', 'date TEXT')
     ensure_column(db, 'routes', 'created_at', 'created_at TEXT')
+    ensure_column(db, 'routes', 'km_start', 'km_start REAL')
+    ensure_column(db, 'routes', 'km_end', 'km_end REAL')
+    ensure_column(db, 'routes', 'km_total', 'km_total REAL')
+    ensure_column(db, 'routes', 'departure_time', 'departure_time TEXT')
+    ensure_column(db, 'routes', 'arrival_time', 'arrival_time TEXT')
+    ensure_column(db, 'routes', 'helper_name', 'helper_name TEXT')
+    ensure_column(db, 'routes', 'destination', 'destination TEXT')
+    ensure_column(db, 'routes', 'odometer_start_photo', 'odometer_start_photo TEXT')
+    ensure_column(db, 'routes', 'odometer_end_photo', 'odometer_end_photo TEXT')
+    ensure_column(db, 'routes', 'driver_signature', 'driver_signature TEXT')
+    ensure_column(db, 'routes', 'expenses_json', 'expenses_json TEXT')
+    ensure_column(db, 'routes', 'arrival_latitude', 'arrival_latitude REAL')
+    ensure_column(db, 'routes', 'arrival_longitude', 'arrival_longitude REAL')
+    ensure_column(db, 'routes', 'arrival_location_link', 'arrival_location_link TEXT')
+    ensure_column(db, 'routes', 'arrival_at', 'arrival_at TEXT')
     ensure_column(db, 'routes', 'updated_at', 'updated_at TEXT')
     ensure_column(db, 'routes', 'version', 'version INTEGER DEFAULT 1')
+    db.execute('''CREATE TABLE IF NOT EXISTS trip_expenses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        route_id INTEGER NOT NULL,
+        expense_type TEXT NOT NULL,
+        quantity REAL DEFAULT 1,
+        unit_value REAL DEFAULT 0,
+        total_value REAL DEFAULT 0,
+        notes TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(route_id) REFERENCES routes(id) ON DELETE CASCADE
+    )''')
+    db.execute('CREATE INDEX IF NOT EXISTS idx_trip_expenses_route ON trip_expenses(route_id)')
+    db.execute('''CREATE TABLE IF NOT EXISTS trip_photos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        route_id INTEGER NOT NULL,
+        photo_type TEXT NOT NULL,
+        image_data TEXT NOT NULL,
+        mime_type TEXT DEFAULT 'image/jpeg',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(route_id) REFERENCES routes(id) ON DELETE CASCADE
+    )''')
     ensure_column(db, 'route_orders', 'delivery_order', 'delivery_order INTEGER DEFAULT 1')
     ensure_column(db, 'route_orders', 'status', 'status TEXT DEFAULT "Pendente"')
     ensure_column(db, 'route_cities', 'created_at', 'created_at TEXT')
     ensure_column(db, 'route_cities', 'updated_at', 'updated_at TEXT')
     ensure_column(db, 'route_cities', 'version', 'version INTEGER DEFAULT 1')
+    ensure_column(db, 'clients', 'latitude', 'latitude REAL')
+    ensure_column(db, 'clients', 'longitude', 'longitude REAL')
+    ensure_column(db, 'clients', 'location_link', 'location_link TEXT')
+    ensure_column(db, 'orders', 'latitude', 'latitude REAL')
+    ensure_column(db, 'orders', 'longitude', 'longitude REAL')
     ensure_column(db, 'clients', 'updated_at', 'updated_at TEXT')
     ensure_column(db, 'clients', 'version', 'version INTEGER DEFAULT 1')
     ensure_column(db, 'clients', 'customer_code', 'customer_code TEXT')
+    ensure_column(db, 'clients', 'is_rural_verified', 'is_rural_verified INTEGER DEFAULT 0')
+    ensure_column(db, 'clients', 'gps_source', 'gps_source TEXT DEFAULT "pending"')
+    ensure_column(db, 'orders', 'is_rural_verified', 'is_rural_verified INTEGER DEFAULT 0')
+    ensure_column(db, 'orders', 'gps_source', 'gps_source TEXT DEFAULT "pending"')
     ensure_column(db, 'drivers', 'updated_at', 'updated_at TEXT')
     ensure_column(db, 'drivers', 'version', 'version INTEGER DEFAULT 1')
     ensure_column(db, 'drivers', 'password_hash', 'password_hash TEXT')
@@ -1029,6 +1198,32 @@ def ensure_schema_migrations(db):
     ensure_column(db, 'holidays', 'created_at', 'created_at TEXT')
     ensure_column(db, 'audit_logs', 'user_id', 'user_id INTEGER')
     ensure_column(db, 'audit_logs', 'source_ip', 'source_ip TEXT')
+    ensure_column(db, 'order_items', 'status', 'status TEXT DEFAULT "Pendente"')
+    ensure_column(db, 'order_items', 'problem_notes', 'problem_notes TEXT DEFAULT ""')
+    ensure_column(db, 'order_items', 'unit_price', 'unit_price REAL DEFAULT 0')
+    ensure_column(db, 'order_items', 'total_value', 'total_value REAL DEFAULT 0')
+    try:
+        for r_rca in db.execute("SELECT id, seller_name FROM orders WHERE seller_name LIKE 'RCA %' OR seller_name GLOB '*[0-9]*'").fetchall():
+            real_n = resolve_seller_name(r_rca['seller_name'], db)
+            if real_n and not real_n.startswith('RCA ') and not real_n.startswith('Vendedor (RCA'):
+                db.execute("UPDATE orders SET seller_name = ? WHERE id = ?", (real_n, r_rca['id']))
+    except Exception:
+        pass
+    try:
+        # Reconciliação automática: pedidos em cargas Planejadas devem ter status 'Carga Montada'
+        db.execute("""
+            UPDATE orders
+            SET status='Carga Montada', updated_at=DATETIME('now','localtime')
+            WHERE id IN (
+                SELECT ro.order_id
+                FROM route_orders ro
+                JOIN routes r ON r.id=ro.route_id
+                WHERE r.status='Planejada'
+            )
+            AND status IN ('Faturado', 'Venda')
+        """)
+    except Exception:
+        pass
 
 
 def ensure_indexes(db):
@@ -1117,6 +1312,55 @@ def apply_named_user_permission_overrides(db):
             )
 
 
+def normalize_legacy_business_text_once(db):
+    """Migração única: reiniciar o serviço não deve regravar cadastros/históricos."""
+    key = 'migration_business_text_normalization_v1'
+    if db.execute("SELECT 1 FROM settings WHERE key=? AND value='done'", (key,)).fetchone():
+        return False
+    db.execute("""UPDATE orders
+                  SET seller_name=COALESCE(
+                    NULLIF(TRIM(seller_name),''),
+                    (SELECT u.name FROM users u WHERE u.id=orders.seller_id),
+                    'Não informado'
+                  )""")
+    # Normalização de rotas e cidades para caixa alta (unificação total de dados históricos)
+    db.execute("UPDATE route_cities SET route_name = UPPER(TRIM(COALESCE(route_name, ''))), city = UPPER(TRIM(COALESCE(city, '')))")
+    db.execute("UPDATE orders SET route_name = UPPER(TRIM(COALESCE(route_name, ''))), city = UPPER(TRIM(COALESCE(city, '')))")
+    db.execute("UPDATE routes SET route_name = UPPER(TRIM(COALESCE(route_name, '')))")
+    db.execute("UPDATE clients SET route_name = UPPER(TRIM(COALESCE(route_name, ''))), city = UPPER(TRIM(COALESCE(city, '')))")
+    db.execute("UPDATE clients SET customer_code=CAST(id AS TEXT) WHERE customer_code IS NULL OR TRIM(customer_code)=''")
+    for c in db.execute('SELECT id,customer_code,name,document,phone,whatsapp,farm_name,address,reference_point,notes FROM clients').fetchall():
+        db.execute(
+            """UPDATE clients
+               SET customer_code=?,
+                   name=?,
+                   document=?,
+                   phone=?,
+                   whatsapp=?,
+                   farm_name=?,
+                   address=?,
+                   reference_point=?,
+                   notes=?,
+                   updated_at=?
+               WHERE id=?""",
+            (
+                upper_text(c['customer_code']),
+                upper_text(c['name']),
+                upper_text(c['document']),
+                upper_text(c['phone']),
+                upper_text(c['whatsapp']),
+                upper_text(c['farm_name']),
+                upper_text(c['address']),
+                upper_text(c['reference_point']),
+                upper_text(c['notes']),
+                now(),
+                c['id'],
+            ),
+        )
+    db.execute("INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES(?,'done',?)", (key,now()))
+    return True
+
+
 def init_db():
     with conn() as db:
         db_executescript(db)
@@ -1138,51 +1382,12 @@ def init_db():
                 db.execute('UPDATE users SET password_hash=? WHERE id=?', (hash_password(secrets.token_urlsafe(10)), row['id']))
         db.execute('UPDATE users SET must_change_password=0 WHERE must_change_password IS NULL')
         db.execute("UPDATE orders SET version=1 WHERE version IS NULL")
-        db.execute("""UPDATE orders
-                      SET seller_name=COALESCE(
-                        NULLIF(TRIM(seller_name),''),
-                        (SELECT u.name FROM users u WHERE u.id=orders.seller_id),
-                        'Não informado'
-                      )""")
         db.execute("UPDATE routes SET updated_at=COALESCE(updated_at,created_at) WHERE updated_at IS NULL")
         db.execute("UPDATE routes SET version=1 WHERE version IS NULL")
         db.execute("UPDATE route_cities SET version=1 WHERE version IS NULL")
         db.execute("UPDATE clients SET updated_at=COALESCE(updated_at,created_at) WHERE updated_at IS NULL")
         db.execute("UPDATE clients SET version=1 WHERE version IS NULL")
-        # Normalização de rotas e cidades para caixa alta (unificação total de dados históricos)
-        db.execute("UPDATE route_cities SET route_name = UPPER(TRIM(COALESCE(route_name, ''))), city = UPPER(TRIM(COALESCE(city, '')))")
-        db.execute("UPDATE orders SET route_name = UPPER(TRIM(COALESCE(route_name, ''))), city = UPPER(TRIM(COALESCE(city, '')))")
-        db.execute("UPDATE routes SET route_name = UPPER(TRIM(COALESCE(route_name, '')))")
-        db.execute("UPDATE clients SET route_name = UPPER(TRIM(COALESCE(route_name, ''))), city = UPPER(TRIM(COALESCE(city, '')))")
-        db.execute("UPDATE clients SET customer_code=CAST(id AS TEXT) WHERE customer_code IS NULL OR TRIM(customer_code)=''")
-        for c in db.execute('SELECT id,customer_code,name,document,phone,whatsapp,farm_name,address,reference_point,notes FROM clients').fetchall():
-            db.execute(
-                """UPDATE clients
-                   SET customer_code=?,
-                       name=?,
-                       document=?,
-                       phone=?,
-                       whatsapp=?,
-                       farm_name=?,
-                       address=?,
-                       reference_point=?,
-                       notes=?,
-                       updated_at=?
-                   WHERE id=?""",
-                (
-                    upper_text(c['customer_code']),
-                    upper_text(c['name']),
-                    upper_text(c['document']),
-                    upper_text(c['phone']),
-                    upper_text(c['whatsapp']),
-                    upper_text(c['farm_name']),
-                    upper_text(c['address']),
-                    upper_text(c['reference_point']),
-                    upper_text(c['notes']),
-                    now(),
-                    c['id'],
-                ),
-            )
+        normalize_legacy_business_text_once(db)
         db.execute("UPDATE drivers SET updated_at=COALESCE(updated_at,?) WHERE updated_at IS NULL",(now(),))
         db.execute("UPDATE drivers SET version=1 WHERE version IS NULL")
         for driver_row in db.execute("SELECT id FROM drivers WHERE password_hash IS NULL OR TRIM(password_hash)='' ").fetchall():
@@ -1266,11 +1471,332 @@ def audit(db, user, action, module, entity='', old='', new='', notes='', source_
         source_ip=str(source_ip or '').strip(),
     )
 
-def login_page(err=''):
+def login_page(err='', username=''):
     system=get_setting('system_name','Logística Casa do Campo')
     company=get_setting('company_name','Casa do Campo')
-    return f'''<!doctype html><html lang="pt-br"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Login · {esc(system)}</title><link rel="stylesheet" href="/static/style.css"><script src="/static/app.js" defer></script></head>
-    <body class="login-bg"><div class="login-shell"><section class="login-hero"><div class="hero-chip">Central de logística · Casa do Campo</div><h1>{esc(system)}</h1><p>Controle profissional da venda até o acerto final da carga, com SLA de 15 dias corridos, faturamento, rotas, problemas e operação em tempo real.</p><div class="hero-metrics"><span>SLA 15 dias corridos</span><span>Rotas e cargas</span><span>Acesso GOD</span></div></section><section class="login-card"><img src="/static/logo.png" class="login-logo"><h2>Acesso operacional</h2><p class="login-hint">Entre com seu usuário interno autorizado.</p>{f'<div class="alert danger">{esc(err)}</div>' if err else ''}<form method="post" action="/login" autocomplete="off"><label>Usuário<input name="username" required autofocus autocomplete="off" value=""></label><label>Senha<input name="password" type="password" required autocomplete="off" value=""></label><button>Entrar no sistema</button></form></section></div></body></html>'''
+    is_maint = get_setting('maintenance_mode','off') == 'on'
+
+    if is_maint:
+        status_pill_html = '<div class="hero-status-pill maintenance"><span class="status-dot red"></span>Modo de Manutenção Ativo</div>'
+        maint_banner_html = '<div class="login-alert-maintenance"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><span><b>Modo de Manutenção Ativo:</b> O sistema está em manutenção. Acesso restrito a administradores.</span></div>'
+    else:
+        status_pill_html = '<div class="hero-status-pill"><span class="status-dot"></span>Sistema Operacional On-line</div>'
+        maint_banner_html = ''
+
+    error_html = ''
+    if err:
+        error_html = f'''<div class="login-alert-error" style="background:#fef2f2; border:1px solid #f87171; border-left:4px solid #dc2626; color:#991b1b; padding:12px 14px; border-radius:8px; margin-bottom:16px; display:flex; align-items:flex-start; gap:10px; font-size:13px; line-height:1.45;">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#dc2626" stroke-width="2" style="flex:none; margin-top:1px;"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+            <div>
+              <b style="color:#7f1d1d;">Não foi possível entrar:</b><br>
+              <span>{esc(err)}</span>
+              <div style="margin-top:6px; font-size:11px; color:#b91c1c;">💡 <b>Dica:</b> Confira se a tecla Caps Lock está ativada ou peça ao administrador para redefinir sua senha.</div>
+            </div>
+          </div>'''
+
+    return f'''<!doctype html><html lang="pt-br"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Login · {esc(system)}</title><link rel="stylesheet" href="/static/style.css"></head>
+<body class="login-bg">
+  <div class="login-split-container">
+    <!-- LADO ESQUERDO: Dark Emerald Hero Section (Edge-to-Edge) -->
+    <section class="login-hero-side">
+      <div class="hero-bg-grid"></div>
+      
+      <!-- Topo com a Logo Oficial Destacada -->
+      <div class="hero-top-bar">
+        <div class="hero-logo-box">
+          <img src="/static/logo.png" alt="{esc(company)}" class="hero-logo-img">
+        </div>
+        <div class="hero-system-info">
+          <div class="system-title-row">
+            <span class="system-name-tag">{esc(system)}</span>
+            <span class="system-version-tag">V2.9.1 PRO</span>
+          </div>
+          <p class="system-desc-sub">Central Integrada de Expedição, Faturamento & Rotas</p>
+        </div>
+        {status_pill_html}
+      </div>
+
+      <!-- Meio com a Mensagem Principal -->
+      <div class="hero-middle-content">
+        <div class="hero-tagline-chip">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          Tecnologia & Alta Eficiência Logística no Campo
+        </div>
+
+        <h1 class="hero-heading">
+          Gestão Inteligente de <span class="gradient-accent">Rotas, Cargas e SLA</span> para o Agronegócio.
+        </h1>
+
+        <p class="hero-description">
+          Controle centralizado da venda até o acerto final da carga, com faturamento automático, rastreamento mobile com GPS exato e monitoramento de SLA em tempo real.
+        </p>
+
+        <!-- 2x2 Feature Cards Grid -->
+        <div class="hero-cards-grid">
+          <div class="hero-feature-card">
+            <div class="feat-icon green">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="1" y="3" width="15" height="13"/><polygon points="16 8 20 8 23 11 23 16 16 16 16 8"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/></svg>
+            </div>
+            <div>
+              <h5>Expedição & Cargas</h5>
+              <p>Montagem otimizada de rotas com limite de carga por veículo.</p>
+            </div>
+          </div>
+
+          <div class="hero-feature-card">
+            <div class="feat-icon blue">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
+            </div>
+            <div>
+              <h5>GPS Exato Mobile</h5>
+              <p>Baixa em campo com canhoto digital e geolocalização exata.</p>
+            </div>
+          </div>
+
+          <div class="hero-feature-card">
+            <div class="feat-icon yellow">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            </div>
+            <div>
+              <h5>SLA em Horário Útil</h5>
+              <p>Cálculo automático do prazo oficial de 15 dias corridos.</p>
+            </div>
+          </div>
+
+          <div class="hero-feature-card">
+            <div class="feat-icon purple">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+            </div>
+            <div>
+              <h5>Segurança & Auditoria</h5>
+              <p>Histórico completo de ações com auditoria e controle de acesso.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Rodapé do Lado Esquerdo -->
+      <div class="hero-bottom-strip">
+        <span>{esc(system)} Platform</span>
+        <span class="strip-item"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg> SLA Monitorado</span>
+        <span class="strip-item"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg> Criptografia Ponta a Ponta</span>
+      </div>
+    </section>
+
+    <!-- LADO DIREITO: Form Section (Fundo Claro Neutro com Card Elevado) -->
+    <section class="login-form-side">
+      <div class="login-card-wrapper">
+        <div class="login-card">
+          
+          <div class="card-access-badge">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+            <span>Portal de Acesso Corporativo</span>
+          </div>
+
+          <div class="card-title-group">
+            <h2>Entrar no Sistema</h2>
+            <p>Informe seu usuário e senha para acessar ordens de serviço e painéis.</p>
+          </div>
+
+          {maint_banner_html}
+          {error_html}
+
+          <form method="post" action="/login" autocomplete="off" id="loginForm">
+            <div class="form-input-group">
+              <label for="inputUsername">NOME DE USUÁRIO</label>
+              <div class="input-icon-wrapper">
+                <svg class="input-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+                <input id="inputUsername" name="username" placeholder="Ex: aline, gustavo ou admin" required autofocus autocomplete="username" value="{esc(username)}">
+              </div>
+            </div>
+
+            <div class="form-input-group">
+              <div class="label-row">
+                <label for="inputPassword">SENHA DE ACESSO</label>
+                <span class="forgot-hint">Esqueceu sua senha?</span>
+              </div>
+              <div class="input-icon-wrapper">
+                <svg class="input-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                <input id="inputPassword" name="password" type="password" placeholder="••••••••" required autocomplete="current-password" value="">
+                <button type="button" class="btn-toggle-password" id="togglePasswordBtn" title="Mostrar/ocultar senha" aria-label="Mostrar ou ocultar senha">
+                  <svg id="eyeIconShow" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                  <svg id="eyeIconHide" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none;"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+                </button>
+              </div>
+            </div>
+
+            <button type="submit" class="btn-login-submit" id="btnLoginSubmit">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>
+              <span>Acessar Minha Conta</span>
+            </button>
+          </form>
+
+          <div class="login-card-help-footer" style="display:flex; flex-direction:column; gap:8px;">
+            <p>Precisa de auxílio ou novo acesso na empresa?</p>
+            <small>Fale com a TI ou Administrador para liberação de perfil.</small>
+            <button type="button" id="btnOpenAccessModalLogin" style="margin-top:6px; background:#f0fdf4; border:1px solid #bbf7d0; color:#166534; font-size:12px; font-weight:700; cursor:pointer; padding:6px 10px; border-radius:6px; display:inline-flex; align-items:center; justify-content:center; gap:6px;">
+              <span>🔒 Alterar Acesso (HTTPS / HTTP)</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="login-copyright-footer">
+          <b>{esc(system)}</b> · Plataforma Corporativa Logística<br>
+          © 2026 {esc(company)} — Todos os direitos reservados.
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- Modal de Alteração de Acesso Protegido por Senha H0llyw00d26 -->
+  <div id="modalAccessControl" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.65); z-index:99999; justify-content:center; align-items:center; backdrop-filter:blur(3px);">
+    <div style="background:#ffffff; border-radius:14px; width:90%; max-width:420px; box-shadow:0 20px 40px rgba(0,0,0,0.3); overflow:hidden; border:1px solid #cbd5e1;">
+      <div style="background:#0f172a; color:#ffffff; padding:14px 18px; display:flex; justify-content:space-between; align-items:center;">
+        <h3 style="margin:0; font-size:15px; display:flex; align-items:center; gap:8px;">🔒 Alterar Modo de Acesso</h3>
+        <button type="button" id="btnCloseAccessModal" style="background:transparent; border:none; color:#fff; font-size:22px; cursor:pointer; line-height:1;">&times;</button>
+      </div>
+      <div style="padding:18px;">
+        <div id="accessAuthBox">
+          <p style="margin:0 0 10px 0; font-size:13px; color:#475569; line-height:1.4;">Digite a senha de segurança do sistema para alterar o modo de conexão ou endereço do servidor.</p>
+          <div id="accessModalError" style="display:none; background:#fef2f2; color:#991b1b; border:1px solid #fecaca; padding:8px 12px; border-radius:6px; font-size:12px; margin-bottom:10px;"></div>
+          <div style="margin-bottom:12px;">
+            <label style="display:block; font-size:12px; font-weight:700; color:#334155; margin-bottom:4px;">SENHA DE SEGURANÇA</label>
+            <input type="password" id="accessModalPass" placeholder="Digite a senha..." style="width:100%; box-sizing:border-box; padding:10px; border:1px solid #cbd5e1; border-radius:8px; font-size:14px;">
+          </div>
+          <button type="button" id="btnValidateAccessModal" style="width:100%; padding:10px; background:#166534; color:#fff; font-weight:700; border:none; border-radius:8px; cursor:pointer; font-size:14px;">Desbloquear</button>
+        </div>
+        <div id="accessOptionsBox" style="display:none; flex-direction:column; gap:10px;">
+          <div style="font-size:12px; padding:10px; border-radius:8px; background:#f0fdf4; border:1px solid #bbf7d0; color:#166534;">
+            <b>Conexão Atual:</b> <span id="currentAccessLabel"></span>
+          </div>
+          <button type="button" id="btnGoHttps" style="padding:12px; background:#166534; color:#fff; font-weight:700; border:none; border-radius:8px; cursor:pointer; text-align:left; display:flex; align-items:center; gap:10px;">
+            <span style="font-size:20px;">🔒</span>
+            <div><b>Acessar via HTTPS (Porta 3443)</b><br><small style="opacity:0.9; font-weight:400;">Recomendado no celular para GPS ao vivo</small></div>
+          </button>
+          <button type="button" id="btnGoHttp" style="padding:12px; background:#f8fafc; border:1px solid #cbd5e1; font-weight:700; border-radius:8px; cursor:pointer; text-align:left; display:flex; align-items:center; gap:10px;">
+            <span style="font-size:20px;">🌐</span>
+            <div><b>Acessar via HTTP (Porta 3000)</b><br><small style="color:#64748b; font-weight:400;">Conexão padrão de rede local</small></div>
+          </button>
+          <div style="margin-top:6px; border-top:1px solid #e2e8f0; padding-top:10px;">
+            <label style="display:block; font-size:12px; font-weight:700; margin-bottom:4px; color:#334155;">Endereço IP / Servidor</label>
+            <input id="inputCustomHost" placeholder="Ex: 192.168.0.35" style="width:100%; box-sizing:border-box; padding:8px 10px; border:1px solid #cbd5e1; border-radius:8px; font-size:13px; margin-bottom:8px;">
+            <button type="button" id="btnApplyCustomHost" style="width:100%; padding:8px; background:#f1f5f9; border:1px solid #cbd5e1; font-weight:700; border-radius:8px; cursor:pointer;">Conectar neste IP</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    document.addEventListener('DOMContentLoaded', function() {{
+      const toggleBtn = document.getElementById('togglePasswordBtn');
+      const pwdInput = document.getElementById('inputPassword');
+      const eyeShow = document.getElementById('eyeIconShow');
+      const eyeHide = document.getElementById('eyeIconHide');
+      const loginForm = document.getElementById('loginForm');
+      const submitBtn = document.getElementById('btnLoginSubmit');
+
+      if (toggleBtn && pwdInput) {{
+        toggleBtn.addEventListener('click', function(e) {{
+          e.preventDefault();
+          e.stopPropagation();
+          const isPass = pwdInput.type === 'password';
+          pwdInput.type = isPass ? 'text' : 'password';
+          if (eyeShow) eyeShow.style.display = isPass ? 'none' : 'block';
+          if (eyeHide) eyeHide.style.display = isPass ? 'block' : 'none';
+          pwdInput.focus();
+        }});
+      }}
+
+      if (loginForm && submitBtn) {{
+        loginForm.addEventListener('submit', function() {{
+          submitBtn.innerHTML = '<svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"><circle cx=\"12\" cy=\"12\" r=\"10\" stroke-dasharray=\"30\" stroke-linecap=\"round\"><animateTransform attributeName=\"transform\" type=\"rotate\" from=\"0 12 12\" to=\"360 12 12\" dur=\"0.8s\" repeatCount=\"indefinite\"/></svg><span>Autenticando...</span>';
+          submitBtn.style.opacity = '0.9';
+        }});
+      }}
+
+      // Modal de Alteração de Acesso com Senha H0llyw00d26
+      const btnOpenAccess = document.getElementById('btnOpenAccessModalLogin');
+      const modalAccess = document.getElementById('modalAccessControl');
+      const btnCloseAccess = document.getElementById('btnCloseAccessModal');
+      const btnValidate = document.getElementById('btnValidateAccessModal');
+      const passInput = document.getElementById('accessModalPass');
+      const errBox = document.getElementById('accessModalError');
+      const authBox = document.getElementById('accessAuthBox');
+      const optBox = document.getElementById('accessOptionsBox');
+      const currentLbl = document.getElementById('currentAccessLabel');
+      const customHost = document.getElementById('inputCustomHost');
+
+      if (btnOpenAccess && modalAccess) {{
+        btnOpenAccess.addEventListener('click', function() {{
+          modalAccess.style.display = 'flex';
+          authBox.style.display = 'block';
+          optBox.style.display = 'none';
+          errBox.style.display = 'none';
+          errBox.textContent = '';
+          passInput.value = '';
+          passInput.focus();
+        }});
+      }}
+
+      if (btnCloseAccess && modalAccess) {{
+        btnCloseAccess.addEventListener('click', function() {{
+          modalAccess.style.display = 'none';
+        }});
+      }}
+
+      if (btnValidate && passInput) {{
+        btnValidate.addEventListener('click', function() {{
+          if (passInput.value.trim() === 'H0llyw00d26') {{
+            authBox.style.display = 'none';
+            optBox.style.display = 'flex';
+            const proto = location.protocol;
+            const port = location.port || (proto === 'https:' ? '3443' : '3000');
+            currentLbl.textContent = proto + '//' + location.hostname + ':' + port;
+            customHost.value = location.hostname;
+          }} else {{
+            errBox.textContent = 'Senha de segurança incorreta.';
+            errBox.style.display = 'block';
+          }}
+        }});
+
+        passInput.addEventListener('keydown', function(e) {{
+          if (e.key === 'Enter') {{
+            e.preventDefault();
+            btnValidate.click();
+          }}
+        }});
+      }}
+
+      const btnHttps = document.getElementById('btnGoHttps');
+      if (btnHttps) {{
+        btnHttps.addEventListener('click', function() {{
+          const h = (customHost && customHost.value.trim()) || location.hostname;
+          window.location.href = 'https://' + h + ':3443/login';
+        }});
+      }}
+
+      const btnHttp = document.getElementById('btnGoHttp');
+      if (btnHttp) {{
+        btnHttp.addEventListener('click', function() {{
+          const h = (customHost && customHost.value.trim()) || location.hostname;
+          window.location.href = 'http://' + h + ':3000/login';
+        }});
+      }}
+
+      const btnApplyHost = document.getElementById('btnApplyCustomHost');
+      if (btnApplyHost) {{
+        btnApplyHost.addEventListener('click', function() {{
+          const h = customHost ? customHost.value.trim() : '';
+          if (!h) return alert('Informe um IP ou domínio válido.');
+          const proto = location.protocol;
+          const port = location.port || (proto === 'https:' ? '3443' : '3000');
+          window.location.href = proto + '//' + h + ':' + port + '/login';
+        }});
+      }}
+    }});
+  </script>
+</body></html>'''
 
 
 
@@ -1391,7 +1917,7 @@ def contextual_help_widget(title):
         "</details>"
     )
 
-def layout(user,title,content,subtitle=None):
+def layout(user,title,content,subtitle=None,search_action=None,search_placeholder=None,search_q='',head_actions_extra=''):
     system=get_setting('system_name','Logística Casa do Campo'); company=get_setting('company_name','Casa do Campo'); sub=get_setting('company_subtitle','Operação logística interna')
     primary=get_setting('primary_color','#d90429'); secondary=get_setting('secondary_color','#ffbf1f'); accent=get_setting('accent_color','#174f2a'); bg=get_setting('background_color','#f6f7f2'); logo=get_setting('logo_file','/static/logo.png')
 
@@ -1405,10 +1931,13 @@ def layout(user,title,content,subtitle=None):
     if user_can(user,'create_orders'):       op_items.append(('/orders/new','＋','Novo Pedido'))
     if user_can(user,'invoice_orders'):      op_items.append(('/faturamento','▣','Faturamento'))
     if user_can(user,'view_routes'):         op_items.append(('/routes','⇄','Cargas/Rotas'))
+    if user_can(user,'create_routes'):       op_items.append(('/registro-viagens','📝','Registro de Viagens'))
     if user_can(user,'settle_routes'):       op_items.append(('/load-settlement','☑','Acerto de Carga'))
+    if user_can(user,'view_orders'):         op_items.append(('/map','🗺','Mapa de Entregas'))
 
     if user_can(user,'view_sla'):            monitor_items.append(('/sla','◷','SLA & Prazos'))
-    if user_can(user,'view_reports'):        monitor_items.append(('/relatorios','▥','Relatórios'))
+    if user_can(user,'view_reports'):        monitor_items.append(('/relatorios','▥','Relatórios Gerais'))
+    if user_can(user,'view_reports') or user_can(user,'view_routes'): monitor_items.append(('/relatorio-viagens','🚛','Relatório de Motoristas'))
 
     if user_can(user,'view_clients'):        config_items.append(('/clients','◉','Clientes'))
     if user_can(user,'view_drivers'):        config_items.append(('/drivers','◈','Motoristas'))
@@ -1425,6 +1954,42 @@ def layout(user,title,content,subtitle=None):
         return f'<span class="nav-section-label">{label}</span>{links}'
 
     nav = render_group('Operação', op_items) + render_group('Monitoramento', monitor_items) + render_group('Configuração', config_items)
+
+    # --- Configuração contextual da barra única de pesquisa ---
+    t_low = (title or '').lower()
+    if not search_action:
+        if 'acerto' in t_low:
+            search_action = '/load-settlement'
+            search_placeholder = 'Buscar carga para acerto por número, nome ou motorista...'
+        elif 'carga' in t_low or 'rota' in t_low:
+            search_action = '/routes'
+            search_placeholder = 'Buscar cargas por código, motorista, veículo, rota...'
+        elif 'cliente' in t_low:
+            search_action = '/clients'
+            search_placeholder = 'Buscar clientes por nome, CPF/CNPJ, fazenda, cidade...'
+        elif 'motorista' in t_low:
+            search_action = '/drivers'
+            search_placeholder = 'Buscar motoristas por nome, CPF, telefone...'
+        elif 'veículo' in t_low or 'veiculo' in t_low:
+            search_action = '/vehicles'
+            search_placeholder = 'Buscar veículos por placa, modelo...'
+        elif 'sla' in t_low:
+            search_action = '/sla'
+            search_placeholder = 'Filtrar SLA por cliente, pedido, rota...'
+        elif 'faturamento' in t_low:
+            search_action = '/faturamento'
+            search_placeholder = 'Buscar pedido em venda para faturamento...'
+        elif 'mapa' in t_low:
+            search_action = '/map'
+            search_placeholder = 'Buscar pedido, cliente ou cidade no mapa...'
+        elif 'relatório' in t_low or 'relatorio' in t_low:
+            search_action = '/relatorios'
+            search_placeholder = 'Buscar no histórico de relatórios...'
+        else:
+            search_action = '/orders'
+            search_placeholder = 'Buscar pedido por NF, cliente, vendedor, cidade... (Ctrl+K)'
+    if not search_placeholder:
+        search_placeholder = 'Buscar nesta tela...'
 
     # --- Topbar: chips de alerta em tempo real ---
     try:
@@ -1446,6 +2011,7 @@ def layout(user,title,content,subtitle=None):
 
     cssvars=f'--primary:{primary};--secondary:{secondary};--accent:{accent};--bg:{bg};'
     new_order_btn = '<a class="btn ghost" href="/orders/new">Novo pedido</a>' if user_can(user,'create_orders') else ''
+    extra_actions_html = f'{head_actions_extra}' if head_actions_extra else ''
     help_widget = contextual_help_widget(title)
     dynamic_css = f'''<style>
 :root {{
@@ -1472,7 +2038,7 @@ button.primary:hover, .btn.primary:hover {{ filter: brightness(1.15); transform:
 .checkbox-card {{ display: flex; align-items: center; gap: 8px; background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; padding: 10px 12px; cursor: pointer; font-weight: 600; font-size: 0.9rem; }}
 .checkbox-card input[type="checkbox"] {{ width: 18px; height: 18px; accent-color: var(--primary); cursor: pointer; }}
 </style>'''
-    return f'''<!doctype html><html lang="pt-br"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{esc(title)} · {esc(system)}</title><link rel="stylesheet" href="/static/style.css">{dynamic_css}<script src="/static/app.js" defer></script></head><body style="{cssvars}"><aside class="sidebar"><div class="brand"><img src="{esc(logo)}" alt="Logo"><div><b>{esc(system)}</b><span>{esc(company)}</span></div></div><nav>{nav}</nav><div class="side-foot"><b>{esc(sub)}</b><small>Fluxo: venda → faturado → saiu para entrega → acerto</small></div></aside><main class="main"><header class="topbar"><form class="search" method="get" action="/orders"><input name="q" placeholder="Buscar pedido, NF, cliente, cidade... (Ctrl+K)"></form>{topbar_alerts}<div class="userbox"><div><b>{esc(user['name'])}</b><small>{esc(normalize_role(user['role']))}</small></div><a href="/logout">Sair</a></div></header><section class="content"><div class="page-head"><div><h1>{esc(title)}</h1><p>{esc(subtitle or (company+' · operação logística local'))}</p></div><div class="head-actions">{help_widget}{new_order_btn}<button id="btnPrintPage" class="btn print">Imprimir</button></div></div>{tutorial_for(title)}{content}</section></main>
+    return f'''<!doctype html><html lang="pt-br"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{esc(title)} · {esc(system)}</title><link rel="stylesheet" href="/static/style.css"><link rel="stylesheet" href="/static/leaflet/leaflet.css">{dynamic_css}<script src="/static/app.js" defer></script><script src="/static/leaflet/leaflet.js"></script></head><body style="{cssvars}"><aside class="sidebar"><div class="brand"><img src="{esc(logo)}" alt="Logo"><div><b>{esc(system)}</b><span>{esc(company)}</span></div></div><nav>{nav}</nav><div class="side-foot"><b>{esc(sub)}</b><small>Fluxo: venda → faturado → saiu para entrega → acerto</small></div></aside><main class="main"><header class="topbar"><form class="search" method="get" action="{search_action}"><input name="q" value="{esc(search_q)}" placeholder="{esc(search_placeholder)}"></form>{topbar_alerts}<div class="userbox"><button type="button" id="btnOpenAccessTopbar" class="btn ghost btn-small" style="padding:4px 8px; font-size:12px; font-weight:700; border:1px solid #cbd5e1; border-radius:6px; cursor:pointer;" title="Alterar Modo de Acesso (HTTPS/HTTP)">🔒 Acesso</button><div><b>{esc(user['name'])}</b><small>{esc(normalize_role(user['role']))}</small></div><a href="/logout">Sair</a></div></header><section class="content"><div class="page-head"><div><h1>{esc(title)}</h1><p>{esc(subtitle or (company+' · operação logística local'))}</p></div><div class="head-actions">{extra_actions_html}{help_widget}{new_order_btn}<button id="btnPrintPage" class="btn print">Imprimir</button></div></div>{tutorial_for(title)}{content}</section></main>
     
     <!-- Drawer Lateral de Faturamento Inline -->
     <div id="invoiceDrawer" class="drawer-overlay">
@@ -1635,6 +2201,128 @@ button.primary:hover, .btn.primary:hover {{ filter: brightness(1.15); transform:
       setInterval(initGlobalTableSorter, 2000);
     }})();
     </script>
+
+    <!-- Modal de Alteração de Acesso Protegido por Senha H0llyw00d26 -->
+    <div id="modalAccessControlLayout" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.65); z-index:99999; justify-content:center; align-items:center; backdrop-filter:blur(3px);">
+      <div style="background:#ffffff; border-radius:14px; width:90%; max-width:420px; box-shadow:0 20px 40px rgba(0,0,0,0.3); overflow:hidden; border:1px solid #cbd5e1;">
+        <div style="background:#0f172a; color:#ffffff; padding:14px 18px; display:flex; justify-content:space-between; align-items:center;">
+          <h3 style="margin:0; font-size:15px; display:flex; align-items:center; gap:8px;">🔒 Alterar Modo de Acesso</h3>
+          <button type="button" id="btnCloseAccessModalLayout" style="background:transparent; border:none; color:#fff; font-size:22px; cursor:pointer; line-height:1;">&times;</button>
+        </div>
+        <div style="padding:18px;">
+          <div id="accessAuthBoxLayout">
+            <p style="margin:0 0 10px 0; font-size:13px; color:#475569; line-height:1.4;">Digite a senha de segurança do sistema para alterar o modo de conexão ou endereço do servidor.</p>
+            <div id="accessModalErrorLayout" style="display:none; background:#fef2f2; color:#991b1b; border:1px solid #fecaca; padding:8px 12px; border-radius:6px; font-size:12px; margin-bottom:10px;"></div>
+            <div style="margin-bottom:12px;">
+              <label style="display:block; font-size:12px; font-weight:700; color:#334155; margin-bottom:4px;">SENHA DE SEGURANÇA</label>
+              <input type="password" id="accessModalPassLayout" placeholder="Digite a senha..." style="width:100%; box-sizing:border-box; padding:10px; border:1px solid #cbd5e1; border-radius:8px; font-size:14px;">
+            </div>
+            <button type="button" id="btnValidateAccessModalLayout" style="width:100%; padding:10px; background:#166534; color:#fff; font-weight:700; border:none; border-radius:8px; cursor:pointer; font-size:14px;">Desbloquear</button>
+          </div>
+          <div id="accessOptionsBoxLayout" style="display:none; flex-direction:column; gap:10px;">
+            <div style="font-size:12px; padding:10px; border-radius:8px; background:#f0fdf4; border:1px solid #bbf7d0; color:#166534;">
+              <b>Conexão Atual:</b> <span id="currentAccessLabelLayout"></span>
+            </div>
+            <button type="button" id="btnGoHttpsLayout" style="padding:12px; background:#166534; color:#fff; font-weight:700; border:none; border-radius:8px; cursor:pointer; text-align:left; display:flex; align-items:center; gap:10px;">
+              <span style="font-size:20px;">🔒</span>
+              <div><b>Acessar via HTTPS (Porta 3443)</b><br><small style="opacity:0.9; font-weight:400;">Recomendado no celular para GPS ao vivo</small></div>
+            </button>
+            <button type="button" id="btnGoHttpLayout" style="padding:12px; background:#f8fafc; border:1px solid #cbd5e1; font-weight:700; border-radius:8px; cursor:pointer; text-align:left; display:flex; align-items:center; gap:10px;">
+              <span style="font-size:20px;">🌐</span>
+              <div><b>Acessar via HTTP (Porta 3000)</b><br><small style="color:#64748b; font-weight:400;">Conexão padrão de rede local</small></div>
+            </button>
+            <div style="margin-top:6px; border-top:1px solid #e2e8f0; padding-top:10px;">
+              <label style="display:block; font-size:12px; font-weight:700; margin-bottom:4px; color:#334155;">Endereço IP / Servidor</label>
+              <input id="inputCustomHostLayout" placeholder="Ex: 192.168.0.35" style="width:100%; box-sizing:border-box; padding:8px 10px; border:1px solid #cbd5e1; border-radius:8px; font-size:13px; margin-bottom:8px;">
+              <button type="button" id="btnApplyCustomHostLayout" style="width:100%; padding:8px; background:#f1f5f9; border:1px solid #cbd5e1; font-weight:700; border-radius:8px; cursor:pointer;">Conectar neste IP</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+    (function() {{
+      const btnOpen = document.getElementById('btnOpenAccessTopbar');
+      const modal = document.getElementById('modalAccessControlLayout');
+      const btnClose = document.getElementById('btnCloseAccessModalLayout');
+      const btnValidate = document.getElementById('btnValidateAccessModalLayout');
+      const passInput = document.getElementById('accessModalPassLayout');
+      const errBox = document.getElementById('accessModalErrorLayout');
+      const authBox = document.getElementById('accessAuthBoxLayout');
+      const optBox = document.getElementById('accessOptionsBoxLayout');
+      const currentLbl = document.getElementById('currentAccessLabelLayout');
+      const customHost = document.getElementById('inputCustomHostLayout');
+
+      if (btnOpen && modal) {{
+        btnOpen.addEventListener('click', function() {{
+          modal.style.display = 'flex';
+          authBox.style.display = 'block';
+          optBox.style.display = 'none';
+          errBox.style.display = 'none';
+          errBox.textContent = '';
+          passInput.value = '';
+          passInput.focus();
+        }});
+      }}
+
+      if (btnClose && modal) {{
+        btnClose.addEventListener('click', function() {{
+          modal.style.display = 'none';
+        }});
+      }}
+
+      if (btnValidate && passInput) {{
+        btnValidate.addEventListener('click', function() {{
+          if (passInput.value.trim() === 'H0llyw00d26') {{
+            authBox.style.display = 'none';
+            optBox.style.display = 'flex';
+            const proto = location.protocol;
+            const port = location.port || (proto === 'https:' ? '3443' : '3000');
+            currentLbl.textContent = proto + '//' + location.hostname + ':' + port;
+            customHost.value = location.hostname;
+          }} else {{
+            errBox.textContent = 'Senha de segurança incorreta.';
+            errBox.style.display = 'block';
+          }}
+        }});
+
+        passInput.addEventListener('keydown', function(e) {{
+          if (e.key === 'Enter') {{
+            e.preventDefault();
+            btnValidate.click();
+          }}
+        }});
+      }}
+
+      const btnHttps = document.getElementById('btnGoHttpsLayout');
+      if (btnHttps) {{
+        btnHttps.addEventListener('click', function() {{
+          const h = (customHost && customHost.value.trim()) || location.hostname;
+          window.location.href = 'https://' + h + ':3443' + location.pathname + location.search;
+        }});
+      }}
+
+      const btnHttp = document.getElementById('btnGoHttpLayout');
+      if (btnHttp) {{
+        btnHttp.addEventListener('click', function() {{
+          const h = (customHost && customHost.value.trim()) || location.hostname;
+          window.location.href = 'http://' + h + ':3000' + location.pathname + location.search;
+        }});
+      }}
+
+      const btnApplyHost = document.getElementById('btnApplyCustomHostLayout');
+      if (btnApplyHost) {{
+        btnApplyHost.addEventListener('click', function() {{
+          const h = customHost ? customHost.value.trim() : '';
+          if (!h) return alert('Informe um IP ou domínio válido.');
+          const proto = location.protocol;
+          const port = location.port || (proto === 'https:' ? '3443' : '3000');
+          window.location.href = proto + '//' + h + ':' + port + location.pathname + location.search;
+        }});
+      }}
+    }})();
+    </script>
     </body></html>'''
 
 
@@ -1668,20 +2356,55 @@ class App(BaseHTTPRequestHandler):
     def _common_headers(self):
         self.send_header('X-Frame-Options', 'DENY')
         self.send_header('X-Content-Type-Options', 'nosniff')
-        self.send_header('Referrer-Policy', 'same-origin')
+        self.send_header('Referrer-Policy', 'no-referrer-when-downgrade')
         self.send_header('X-Permitted-Cross-Domain-Policies', 'none')
-        self.send_header('Permissions-Policy', 'geolocation=(), microphone=(), camera=(), payment=()')
+        self.send_header('Permissions-Policy', 'geolocation=*, camera=*, microphone=(), payment=()')
         self.send_header('Cross-Origin-Opener-Policy', 'same-origin')
-        self.send_header('Cross-Origin-Resource-Policy', 'same-origin')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Authorization, Content-Type, Accept, X-Requested-With, Origin')
+        host_header = (
+            self.headers.get('X-Forwarded-Host') or
+            self.headers.get('Host') or
+            ''
+        )
+        host_name = host_header.split(':')[0].strip()
+        if 'ngrok' in host_name:
+            self.send_header('Set-Cookie', f'abuse_interstitial={host_name}; Path=/; Max-Age=31536000; SameSite=None; Secure')
         try:
             request_path = urlparse(self.path).path
         except Exception:
             request_path = ''
+
+        map_tile_domains = (
+            "https://*.basemaps.cartocdn.com "
+            "https://server.arcgisonline.com "
+            "https://services.arcgisonline.com "
+            "https://*.arcgisonline.com "
+            "https://*.tile.openstreetmap.org "
+            "https://tile.openstreetmap.org "
+            "https://*.openstreetmap.org "
+            "https://*.google.com "
+            "https://*.googleapis.com "
+            "https://*.gstatic.com "
+            "https://*.googleusercontent.com "
+            "https://unpkg.com "
+            "https://cdnjs.cloudflare.com"
+        )
+
+        google_scripts = "https://*.googleapis.com https://*.google.com https://*.gstatic.com"
         if request_path.startswith('/static/driver_app/') or request_path.startswith('/api/v1/driver/'):
-            csp = "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+            csp = f"default-src 'self'; img-src 'self' data: blob: {map_tile_domains}; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' {google_scripts}; connect-src * data: blob: http: https: ws: wss: {map_tile_domains}; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         else:
-            csp = "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+            csp = f"default-src 'self'; img-src 'self' data: blob: {map_tile_domains}; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' 'unsafe-eval' {google_scripts}; connect-src * data: blob: http: https: ws: wss: {map_tile_domains}; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         self.send_header('Content-Security-Policy', csp)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._common_headers()
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+        self.mark_request_timing()
 
     def send_error(self, code, message=None, explain=None):
         title_map = {
@@ -1743,10 +2466,16 @@ class App(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
         self.mark_request_timing()
+        return True
 
     def send_file(self,path,ctype='application/octet-stream'):
         if not os.path.exists(path): self.send_error(404); return
-        data=open(path,'rb').read(); self.send_response(200); self._common_headers(); self.send_header('Content-Type',ctype); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data); self.mark_request_timing()
+        data=open(path,'rb').read(); self.send_response(200); self._common_headers(); self.send_header('Content-Type',ctype)
+        if 'driver_app' in path or path.endswith('.html') or path.endswith('.js'):
+            self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+            self.send_header('Pragma', 'no-cache')
+            self.send_header('Expires', '0')
+        self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data); self.mark_request_timing()
 
     def send_response_bytes(self, b_data, ctype='image/jpeg', st=200):
         self.send_response(st)
@@ -1934,6 +2663,10 @@ class App(BaseHTTPRequestHandler):
             with SESSIONS_LOCK:
                 SESSIONS.pop(sid, None)
             return None
+        if get_setting('maintenance_mode', 'off') == 'on' and not is_god(user):
+            with SESSIONS_LOCK:
+                SESSIONS.pop(sid, None)
+            return None
         return user
 
     def require(self):
@@ -1968,12 +2701,44 @@ class App(BaseHTTPRequestHandler):
         </section>"""
         return self.send_html(layout(u, 'Trocar senha', body, 'A atualização é obrigatória antes de continuar'))
 
-    def fail(self, u, title, message, status=400):
-        back = '<a class="btn ghost" href="javascript:history.back()">Voltar</a>'
-        safe_message = safe_user_error_message(message, fallback='Não foi possível concluir esta ação agora.')
+    def fail(self, u, title, message, status=400, it_hint=None):
+        back = '<a class="btn ghost" href="javascript:history.back()" style="font-weight:700;">← Voltar à tela anterior</a>'
+        safe_message = safe_user_error_message(message, fallback='Não foi possível concluir esta operação no momento.')
+        
+        it_detail = str(it_hint or message or '')
+        it_box = f'''
+        <div style="margin-top:20px; padding:14px 16px; background:#f8fafc; border:1px solid #cbd5e1; border-radius:10px; font-size:12px; color:#334155;">
+            <b style="color:#0f172a; display:flex; align-items:center; gap:6px; font-size:13px;">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#2563eb" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+                📋 Informações para a Equipe de TI / Suporte:
+            </b>
+            <div style="margin-top:8px; font-family:Consolas, Monaco, monospace; background:#ffffff; padding:10px; border-radius:6px; border:1px solid #e2e8f0; color:#0f172a; word-break:break-word;">
+                Código HTTP: {status} | Módulo: {esc(title)}<br>
+                Detalhe Técnico: {esc(it_detail)}
+            </div>
+            <small style="margin-top:6px; display:block; color:#64748b;">
+                💡 Se o problema persistir, copie e envie as informações acima para o responsável técnico da empresa.
+            </small>
+        </div>''' if it_detail else ''
+
+        body = f'''<section class='panel' style='background:#fff; border:1px solid var(--border); border-radius:var(--radius); padding:24px; max-width:760px; margin:24px auto; box-shadow:0 8px 24px rgba(0,0,0,0.06);'>
+            <div class="alert danger" style="background:#fef2f2; border:1px solid #f87171; border-left:5px solid #dc2626; color:#991b1b; padding:16px 18px; border-radius:8px; font-size:14px; line-height:1.5;">
+                <h3 style="margin:0 0 6px 0; font-size:17px; color:#7f1d1d; display:flex; align-items:center; gap:8px;">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#dc2626" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                    Atenção: {esc(title)}
+                </h3>
+                <p style="margin:0; font-size:14px; color:#374151;">{esc(safe_message)}</p>
+            </div>
+            {it_box}
+            <div style="margin-top:22px; display:flex; gap:12px; align-items:center;">
+                {back}
+                <a class="btn primary" href="/dashboard" style="font-weight:700;">🏠 Ir para o Início</a>
+            </div>
+        </section>'''
+
         if u:
-            return self.send_html(layout(u,title,f'<div class="alert danger">{esc(safe_message)}</div>{back}'),status)
-        return self.send_html(login_page(safe_message),status)
+            return self.send_html(layout(u, title, body), status)
+        return self.send_html(login_page(safe_message), status)
 
     def require_god(self, u, message='Sem permissão para esta ação.'):
         if is_god(u):
@@ -2012,15 +2777,19 @@ class App(BaseHTTPRequestHandler):
                     self.send_error(403)
                     return
                 ext = os.path.splitext(fp)[1].lower()
-                c = {'.css':'text/css; charset=utf-8','.js':'application/javascript; charset=utf-8','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.svg':'image/svg+xml','.json':'application/json; charset=utf-8','.html':'text/html; charset=utf-8'}.get(ext,'application/octet-stream')
+                c = {'.css':'text/css; charset=utf-8','.js':'application/javascript; charset=utf-8','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.svg':'image/svg+xml','.json':'application/json; charset=utf-8','.html':'text/html; charset=utf-8','.apk':'application/vnd.android.package-archive'}.get(ext,'application/octet-stream')
                 return self.send_file(fp,c)
+            if path in ('/download-apk', '/app.apk', '/Logistica.apk'):
+                apk_path = os.path.join(STATIC_DIR, 'Logistica_Casa_do_Campo.apk')
+                if os.path.exists(apk_path):
+                    return self.send_file(apk_path, 'application/vnd.android.package-archive')
             if path == '/favicon.ico':
                 icon_path = os.path.join(STATIC_DIR, 'logo.png')
                 if os.path.exists(icon_path):
                     return self.send_file(icon_path, 'image/png')
                 self.send_error(404)
                 return
-            if path in ('/driver-app', '/driver-app/'):
+            if path in ('/driver-app', '/driver-app/', '/driver', '/driver/', '/driver/app'):
                 return self.send_file(os.path.join(STATIC_DIR, 'driver_app', 'index.html'), 'text/html; charset=utf-8')
             if path == '/healthz':
                 runtime_state_cleanup()
@@ -2061,8 +2830,9 @@ class App(BaseHTTPRequestHandler):
 
             if path=='/login': return self.send_html(login_page())
             if path.startswith('/api/v1/driver/'):
-                if driver_api_dispatch.handle_driver_api_request(self, path, 'GET'):
-                    return
+                if not driver_api_dispatch.handle_driver_api_request(self, path, 'GET'):
+                    self.send_json({'ok': False, 'message': 'Rota da API do motorista não encontrada.'}, 404)
+                return
             if path=='/logout':
                 c=cookies.SimpleCookie(self.headers.get('Cookie')); sid=c.get('sid')
                 logout_user=None
@@ -2103,6 +2873,8 @@ class App(BaseHTTPRequestHandler):
                 return self.fail(u,'Sistema em manutenção','O sistema está temporariamente em manutenção. Tente novamente em instantes.',503)
             if path == '/api/clients/duplicate-check':
                 return self.get_client_duplicate_check(u)
+            if path == '/api/map/points':
+                return self.get_map_points(u)
             if path == '/settings/reports/generate-now':
                 return self.generate_pdf_report_now(u)
             routes = GET_ROUTE_HANDLERS
@@ -2112,6 +2884,8 @@ class App(BaseHTTPRequestHandler):
             if routes_dispatch.handle_get(self, path, u):
                 return
             if reports_dispatch.handle_get(self, path, u):
+                return
+            if trip_registry_dispatch.handle_get(self, path, u, layout_func=layout):
                 return
             if _ERP_ADMIN_DISPATCH_OK and path.startswith('/admin/erp'):
                 if not is_god(u):
@@ -2143,8 +2917,9 @@ class App(BaseHTTPRequestHandler):
         if path=='/login':
             return self.post_login()
         if path.startswith('/api/v1/driver/'):
-            if driver_api_dispatch.handle_driver_api_request(self, path, 'POST'):
-                return
+            if not driver_api_dispatch.handle_driver_api_request(self, path, 'POST'):
+                self.send_json({'ok': False, 'message': 'Rota da API do motorista não encontrada.'}, 404)
+            return
         if not self.same_origin_ok():
             u = self.user()
             if u:
@@ -2152,7 +2927,7 @@ class App(BaseHTTPRequestHandler):
             return self.send_html(login_page('Origem da requisição não autorizada.'),403)
         u=self.require()
         if not u: return
-        if not self.validate_csrf() and not path.startswith('/admin/erp/'):
+        if not self.validate_csrf() and not path.startswith('/admin/erp/') and not path.startswith('/api/map/') and not path.startswith('/api/trips/'):
             return self.fail(u,'Segurança','Falha de segurança na submissão do formulário. Recarregue a página e tente novamente.',403)
         if path=='/force-password':
             return self.post_force_password(u)
@@ -2170,6 +2945,10 @@ class App(BaseHTTPRequestHandler):
                 return
             if backup_dispatch.handle_post(self, path, u):
                 return
+            if reports_dispatch.handle_post(self, path, u):
+                return
+            if trip_registry_dispatch.handle_post(self, path, u):
+                return
             if _ERP_ADMIN_DISPATCH_OK and path.startswith('/admin/erp'):
                 if not is_god(u):
                     return self.fail(u, 'Acesso negado', 'Esta área é exclusiva para administradores GOD.', 403)
@@ -2177,6 +2956,15 @@ class App(BaseHTTPRequestHandler):
                 return
             if admin_dispatch.handle_post(self, path, u):
                 return
+            if path == '/api/map/save-location':
+                return self.post_map_save_location(u)
+            if path == '/api/map/geocode-auto':
+                return self.post_map_geocode_auto(u)
+            if path == '/api/map/test-key':
+                return self.post_map_test_key(u)
+            if path == '/api/routes/create-from-map':
+                if not self.require_perm(u, 'create_routes', 'Sem permissão para criar cargas.'): return
+                return self.post_routes_create_from_map(u)
             if path=='/orders/new':
                 if not self.require_perm(u,'create_orders','Sem permissão para criar pedidos.'): return
                 return self.post_order_new(u)
@@ -2216,6 +3004,9 @@ class App(BaseHTTPRequestHandler):
             if path=='/drivers':
                 if not self.require_perm(u,'manage_drivers','Sem permissão para gerenciar motoristas.'): return
                 return self.post_driver(u)
+            if path.startswith('/drivers/') and (path.endswith('/reset-password') or path.endswith('/reset_password')):
+                if not self.require_perm(u,'manage_drivers','Sem permissão para resetar senha de motoristas.'): return
+                return self.post_driver_reset_password(u,self.path_int(path,2))
             if path.startswith('/drivers/') and path.endswith('/update'):
                 if not self.require_perm(u,'manage_drivers','Sem permissão para gerenciar motoristas.'): return
                 return self.post_driver_update(u,self.path_int(path,2))
@@ -2353,10 +3144,10 @@ class App(BaseHTTPRequestHandler):
         d=self.post_data(); username=(d.get('username','') or '').strip(); pwd=(d.get('password','') or '')
         ip = self.client_ip()
         if not username or not pwd:
-            return self.send_html(login_page('Usuário e senha são obrigatórios.'),400)
+            return self.send_html(login_page('Por favor, preencha o nome de usuário e a senha de acesso.', username=username), 400)
         wait_seconds = login_lock_remaining(ip, username)
         if wait_seconds > 0:
-            return self.send_html(login_page(f'Acesso temporariamente bloqueado. Aguarde {wait_seconds}s e tente novamente.'),429)
+            return self.send_html(login_page(f'Acesso temporariamente bloqueado por excesso de tentativas incorretas. Por segurança, aguarde {wait_seconds} segundos e tente novamente.', username=username), 429)
         with conn() as db:
             user = find_active_user_by_username(db, username)
             ok=False; rehash=False
@@ -2369,9 +3160,18 @@ class App(BaseHTTPRequestHandler):
                 update_user_last_login(db, int(user['id']), now())
                 db.commit()
         if not ok:
+            with conn() as db:
+                driver_match = db.execute("SELECT id, name FROM drivers WHERE (LOWER(name)=LOWER(?) OR name LIKE ?) AND active=1", (username, f"%{username}%")).fetchone()
+            if driver_match:
+                return self.send_html(login_page(f"'{esc(driver_match['name'])}' é um cadastro de Motorista. Para acessar suas cargas, utilize o aplicativo em <a href='/driver-app' style='color:#15803d;font-weight:bold;text-decoration:underline;'>/driver-app</a> ou o app Android.", username=username), 401)
             register_login_failure(ip, username)
-            return self.send_html(login_page('Usuário ou senha inválidos.'),401)
+            return self.send_html(login_page('Nome de usuário ou senha incorretos. Por favor, confira os dados digitados ou solicite ao Administrador para verificar seu cadastro.', username=username), 401)
         clear_login_failures(ip, username)
+
+        # Se o modo de manutenção estiver ativo, somente o usuário GOD (administrador geral) pode logar
+        if get_setting('maintenance_mode','off') == 'on' and not is_god(user):
+            return self.send_html(login_page('O sistema está em Modo de Manutenção no momento. O acesso está restrito exclusivamente ao Administrador Geral (GOD).', username=username), 403)
+
         sid=secrets.token_urlsafe(32)
         csrf_token=secrets.token_urlsafe(32)
         with SESSIONS_LOCK:
@@ -2549,9 +3349,13 @@ class App(BaseHTTPRequestHandler):
         if st != old:
             allowed = ORDER_ALLOWED_TRANSITIONS.get(old, set())
             if st not in allowed:
-                can_reopen_final = allow_reopen and old in FINAL_ORDER_STATUSES and st in ('Venda','Faturado','Saiu para entrega')
+                can_reopen_final = allow_reopen and old in FINAL_ORDER_STATUSES and st in ('Venda','Faturado','Carga Montada','Saiu para entrega')
                 if not can_reopen_final:
                     raise ValueError(f'Transição inválida de {old} para {st}.')
+        if st == 'Carga Montada':
+            route_info = self.order_route_info(db, oid)
+            if not route_info or normalize_route_status(route_info['route_status']) != 'Planejada':
+                raise ValueError('Pedido só pode ficar em "Carga Montada" quando estiver em uma carga com status "Planejada".')
         if st == 'Saiu para entrega':
             route_info = self.order_route_info(db, oid)
             if not route_info or normalize_route_status(route_info['route_status']) != 'Em rota':
@@ -2589,6 +3393,14 @@ class App(BaseHTTPRequestHandler):
         qs = qs or parse_qs(urlparse(self.path).query)
         default_start = today()[:8] + '01'
         default_end = today()
+        if 'start' not in qs and 'filtered' not in qs:
+            try:
+                with conn() as db:
+                    check_curr = db.execute("SELECT COUNT(*) FROM orders WHERE (substr(delivered_at,1,10) >= ? OR sale_date >= ?)", [default_start, default_start]).fetchone()[0]
+                    if check_curr == 0:
+                        default_start = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+            except Exception:
+                pass
         try:
             start = validate_date_field(qs.get('start',[default_start])[0], 'a data inicial', required=True)
         except Exception:
@@ -2599,37 +3411,709 @@ class App(BaseHTTPRequestHandler):
             end = default_end
         route_filter = (qs.get('route',[''])[0] or '').strip()
         status_filter = (qs.get('status',[''])[0] or '').strip()
-        return start, end, route_filter, status_filter
+        date_type = (qs.get('date_type', ['operational'])[0] or 'operational').strip()
+        if date_type not in ('operational', 'delivery', 'route', 'sale', 'expected'):
+            date_type = 'operational'
+        vehicle_filter = (qs.get('vehicle',[''])[0] or '').strip()
+        driver_filter = (qs.get('driver',[''])[0] or '').strip()
+        q_filter = (qs.get('q',[''])[0] or qs.get('search',[''])[0] or '').strip()
+        sla_filter = (qs.get('sla_status',[''])[0] or '').strip()
+        return start, end, route_filter, status_filter, date_type, vehicle_filter, driver_filter, q_filter, sla_filter
 
-    def report_where(self, start, end, route_filter='', status_filter='', alias='o'):
-        where = [f'{alias}.sale_date BETWEEN ? AND ?']
+    def report_where(self, start, end, route_filter='', status_filter='', alias='o', statuses_in=None, date_type='operational', vehicle_filter='', driver_filter='', q='', sla_filter=''):
+        op_date = f"""COALESCE(
+            NULLIF(substr({alias}.delivered_at, 1, 10), ''),
+            (SELECT r.date FROM route_orders ro JOIN routes r ON r.id=ro.route_id AND r.status <> 'Cancelada' WHERE ro.order_id={alias}.id ORDER BY ro.id DESC LIMIT 1),
+            NULLIF(substr({alias}.invoiced_at, 1, 10), ''),
+            {alias}.sale_date
+        )"""
+        route_date = f"""(SELECT r.date FROM route_orders ro JOIN routes r ON r.id=ro.route_id AND r.status <> 'Cancelada' WHERE ro.order_id={alias}.id ORDER BY ro.id DESC LIMIT 1)"""
+
+        if date_type == 'delivery':
+            where = [f"substr(COALESCE({alias}.delivered_at,''),1,10) BETWEEN ? AND ?"]
+        elif date_type == 'expected':
+            where = [f"{alias}.expected_delivery_date BETWEEN ? AND ?"]
+        elif date_type == 'sale':
+            where = [f"{alias}.sale_date BETWEEN ? AND ?"]
+        elif date_type == 'route':
+            where = [f"{route_date} BETWEEN ? AND ?"]
+        else:
+            where = [f"{op_date} BETWEEN ? AND ?"]
         params = [start, end]
-        if route_filter:
-            where.append(f'{alias}.route_name=?'); params.append(route_filter)
-        if status_filter:
-            where.append(f'{alias}.status=?'); params.append(status_filter)
+
+        if route_filter and route_filter not in ('', 'all', 'Todas', 'Todas as rotas'):
+            where.append(f'{alias}.route_name=?')
+            params.append(route_filter)
+
+        if status_filter and status_filter not in ('', 'all', 'Todos', 'Todos os status'):
+            if status_filter == 'all_with_canceled':
+                pass # Todos os status sem exclusão
+            elif status_filter == 'finalized':
+                where.append(f"{alias}.status IN ('Acertado', 'Entregue')")
+            elif status_filter == 'open':
+                where.append(f"{alias}.status IN ('Venda', 'Faturado', 'Carga Montada', 'Saiu para entrega', 'Agendado')")
+            else:
+                where.append(f'{alias}.status=?')
+                params.append(status_filter)
+        elif statuses_in:
+            where.append(f"{alias}.status IN ({','.join(['?']*len(statuses_in))})")
+            params.extend(statuses_in)
+        else:
+            where.append(f"{alias}.status <> 'Cancelado'")
+
+        if driver_filter and driver_filter not in ('', 'all', 'Todos', 'Todos os motoristas'):
+            dr_expr = f"""COALESCE(
+                (SELECT d.name FROM route_orders ro JOIN routes r ON r.id=ro.route_id AND r.status <> 'Cancelada' JOIN drivers d ON d.id=r.driver_id WHERE ro.order_id={alias}.id ORDER BY ro.id DESC LIMIT 1),
+                (SELECT od.name FROM drivers od WHERE od.id={alias}.driver_id),
+                'Sem motorista'
+            )"""
+            where.append(f"{dr_expr} = ?")
+            params.append(driver_filter)
+
+        if vehicle_filter and vehicle_filter not in ('', 'all', 'Todos', 'Todos os caminhões'):
+            veh_expr = f"""COALESCE(
+                (SELECT CASE WHEN v.plate IS NOT NULL AND TRIM(v.plate) <> '' THEN v.name || ' - ' || v.plate ELSE v.name END
+                 FROM route_orders ro JOIN routes r ON r.id=ro.route_id AND r.status <> 'Cancelada' JOIN vehicles v ON v.id=r.vehicle_id WHERE ro.order_id={alias}.id ORDER BY ro.id DESC LIMIT 1),
+                (SELECT CASE WHEN ov.plate IS NOT NULL AND TRIM(ov.plate) <> '' THEN ov.name || ' - ' || ov.plate ELSE ov.name END FROM vehicles ov WHERE ov.id={alias}.vehicle_id),
+                'Sem caminhão'
+            )"""
+            where.append(f"{veh_expr} = ?")
+            params.append(vehicle_filter)
+
+        if q:
+            where.append(f"({alias}.order_number LIKE ? OR {alias}.invoice_number LIKE ? OR {alias}.seller_name LIKE ? OR (SELECT c.name FROM clients c WHERE c.id={alias}.client_id) LIKE ?)")
+            params.extend([f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%"])
+
+        if sla_filter and sla_filter not in ('', 'all', 'Todas', 'Todas as situações'):
+            today_str = today()
+            if sla_filter == 'ontime':
+                where.append(f"(({alias}.status IN ('Acertado','Entregue') AND substr(COALESCE({alias}.delivered_at,''),1,10) <= {alias}.expected_delivery_date) OR ({alias}.status NOT IN ('Acertado','Entregue','Problema','Cancelado') AND {alias}.expected_delivery_date >= ?))")
+                params.append(today_str)
+            elif sla_filter == 'late':
+                where.append(f"(({alias}.status IN ('Acertado','Entregue') AND substr(COALESCE({alias}.delivered_at,''),1,10) > {alias}.expected_delivery_date) OR ({alias}.status NOT IN ('Acertado','Entregue','Problema','Cancelado') AND {alias}.expected_delivery_date < ?))")
+                params.append(today_str)
+            elif sla_filter == 'risk':
+                where.append(f"({alias}.status NOT IN ('Acertado','Entregue','Problema','Cancelado') AND {alias}.expected_delivery_date BETWEEN ? AND date(?, '+2 days'))")
+                params.extend([today_str, today_str])
+
         return ' WHERE ' + ' AND '.join(where), params
 
-    def report_orders_rows(self, db, start, end, route_filter='', status_filter='', limit=80):
-        where_sql, params = self.report_where(start, end, route_filter, status_filter, alias='o')
+    def report_orders_rows(self, db, start, end, route_filter='', status_filter='', limit=80, statuses_in=None, date_type='operational', vehicle_filter='', driver_filter='', q='', sla_filter=''):
+        where_sql, params = self.report_where(start, end, route_filter, status_filter, alias='o', statuses_in=statuses_in, date_type=date_type, vehicle_filter=vehicle_filter, driver_filter=driver_filter, q=q, sla_filter=sla_filter)
         limit_sql = f' LIMIT {int(limit)}' if limit else ''
         return db.execute(f"""SELECT
-                                o.id,o.order_number,o.invoice_number,o.seller_name,o.payment_method,o.status,o.route_name,o.city,o.weight_kg,o.total_value,o.sale_date,o.delivered_at,o.expected_delivery_date,
-                                c.name client,COALESCE(d.name, od.name, 'Sem motorista') driver,
+                                o.id,o.order_number,o.invoice_number,o.seller_name,o.payment_method,o.status,o.route_name,o.city,o.weight_kg,o.total_value,o.sale_date,o.invoiced_at,o.delivered_at,o.expected_delivery_date,
+                                c.name client,
+                                COALESCE(
+                                    (SELECT d.name FROM route_orders ro JOIN routes r ON r.id=ro.route_id AND r.status <> 'Cancelada' JOIN drivers d ON d.id=r.driver_id WHERE ro.order_id=o.id ORDER BY ro.id DESC LIMIT 1),
+                                    (SELECT od.name FROM drivers od WHERE od.id=o.driver_id),
+                                    'Sem motorista'
+                                ) driver,
+                                COALESCE(
+                                    (SELECT CASE WHEN v.plate IS NOT NULL AND TRIM(v.plate) <> '' THEN v.name || ' - ' || v.plate ELSE v.name END
+                                     FROM route_orders ro JOIN routes r ON r.id=ro.route_id AND r.status <> 'Cancelada' JOIN vehicles v ON v.id=r.vehicle_id WHERE ro.order_id=o.id ORDER BY ro.id DESC LIMIT 1),
+                                    (SELECT CASE WHEN ov.plate IS NOT NULL AND TRIM(ov.plate) <> '' THEN ov.name || ' - ' || ov.plate ELSE ov.name END FROM vehicles ov WHERE ov.id=o.vehicle_id),
+                                    'Sem caminhão'
+                                ) vehicle,
+                                CASE
+                                  WHEN NULLIF(substr(COALESCE(o.invoiced_at,''),1,10),'') IS NOT NULL AND NULLIF(o.sale_date,'') IS NOT NULL
+                                       AND julianday(substr(o.invoiced_at,1,10)) >= julianday(o.sale_date)
+                                  THEN CAST(julianday(substr(o.invoiced_at,1,10)) - julianday(o.sale_date) AS INTEGER)
+                                  ELSE NULL
+                                END days_sale_to_inv,
+                                CASE
+                                  WHEN NULLIF(substr(COALESCE(o.delivered_at,''),1,10),'') IS NOT NULL AND NULLIF(substr(COALESCE(o.invoiced_at,''),1,10),'') IS NOT NULL
+                                       AND julianday(substr(o.delivered_at,1,10)) >= julianday(substr(o.invoiced_at,1,10))
+                                  THEN CAST(julianday(substr(o.delivered_at,1,10)) - julianday(substr(o.invoiced_at,1,10)) AS INTEGER)
+                                  ELSE NULL
+                                END days_inv_to_del,
                                 CASE
                                   WHEN NULLIF(substr(COALESCE(o.delivered_at,''),1,10),'') IS NOT NULL
                                    AND NULLIF(o.sale_date,'') IS NOT NULL
                                   THEN CAST(julianday(substr(o.delivered_at,1,10)) - julianday(o.sale_date) AS INTEGER)
                                   ELSE NULL
-                                END days_to_deliver
+                                END days_to_deliver,
+                                CASE
+                                  WHEN NULLIF(substr(COALESCE(o.delivered_at,''),1,10),'') IS NOT NULL AND NULLIF(substr(COALESCE(o.invoiced_at,''),1,10),'') IS NOT NULL AND NULLIF(o.sale_date,'') IS NOT NULL THEN
+                                      CASE
+                                          WHEN (julianday(substr(o.invoiced_at,1,10)) - julianday(o.sale_date)) > (julianday(substr(o.delivered_at,1,10)) - julianday(substr(o.invoiced_at,1,10))) THEN 'Comercial'
+                                          WHEN (julianday(substr(o.delivered_at,1,10)) - julianday(substr(o.invoiced_at,1,10))) > (julianday(substr(o.invoiced_at,1,10)) - julianday(o.sale_date)) THEN 'Logística'
+                                          ELSE 'Equilibrado'
+                                      END
+                                  WHEN o.status NOT IN ('Acertado','Entregue','Cancelado','Problema') THEN
+                                      CASE
+                                          WHEN (o.invoiced_at IS NULL OR TRIM(o.invoiced_at) = '') THEN 'Aguard. Faturamento'
+                                          ELSE 'Aguard. Entrega'
+                                      END
+                                  ELSE '—'
+                                END bottleneck_stage
                                FROM orders o
                                LEFT JOIN clients c ON c.id=o.client_id
-                               LEFT JOIN route_orders ro ON ro.order_id=o.id
-                               LEFT JOIN routes r ON r.id=ro.route_id AND r.status <> 'Cancelada'
-                               LEFT JOIN drivers d ON d.id=r.driver_id
-                               LEFT JOIN drivers od ON od.id=o.driver_id
                                {where_sql}
-                               ORDER BY o.id DESC{limit_sql}""",params).fetchall()
+                               ORDER BY o.id DESC{limit_sql}""", params).fetchall()
+
+    def get_operational_report_data(self, db, filters, can_view_financial=True):
+        def get_val(k, default=''):
+            v = filters.get(k, default)
+            if isinstance(v, list):
+                return v[0] if v else default
+            return str(v or default)
+
+        default_start = today()[:8] + '01'
+        default_end = today()
+        if not get_val('start') and not get_val('filtered'):
+            try:
+                check_curr = db.execute("SELECT COUNT(*) FROM orders WHERE (substr(delivered_at,1,10) >= ? OR sale_date >= ?)", [default_start, default_start]).fetchone()[0]
+                if check_curr == 0:
+                    default_start = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+            except Exception:
+                pass
+        start = get_val('start', '').strip() or default_start
+        end = get_val('end', '').strip() or default_end
+        date_type = get_val('date_type', 'operational').strip()
+        if date_type not in ('operational', 'delivery', 'route', 'sale', 'expected'):
+            date_type = 'operational'
+        driver_filter = get_val('driver', '').strip()
+        vehicle_filter = get_val('vehicle', '').strip()
+        route_filter = get_val('route', '').strip()
+        city_filter = get_val('city', '').strip()
+        seller_filter = get_val('seller', '').strip()
+        status_filter = get_val('status', '').strip()
+        sla_filter = get_val('sla_status', '').strip()
+
+        # Configuração de exibição (lê preferências do usuário ou padrão recomendado)
+        user_settings = {r['key']: r['value'] for r in db.execute('SELECT * FROM settings')}
+        is_customizer_submitted = 'customizer_present' in filters
+        op_keys = [
+            ('kpi_total_orders', '1'),
+            ('kpi_total_weight', '1'),
+            ('kpi_total_value', '1' if can_view_financial else '0'),
+            ('kpi_sla_rate', '1'),
+            ('kpi_delivered_ontime', '1'),
+            ('kpi_delivered_late', '1'),
+            ('kpi_pending_late', '1'),
+            ('kpi_avg_days', '1'),
+            ('kpi_lead_times', '1'),
+            ('sec_bottlenecks', '1'),
+            ('sec_drivers', '1'),
+            ('sec_vehicles', '1'),
+            ('sec_routes', '1'),
+            ('sec_cities', '1'),
+            ('sec_problems', '1'),
+            ('sec_orders', '1'),
+            ('col_financial', '1' if can_view_financial else '0'),
+            ('col_weight', '1'),
+            ('col_avg_days', '1'),
+            ('col_lead_times', '1'),
+            ('col_seller', '1'),
+            ('col_sla', '1'),
+        ]
+        config = {}
+        for k, def_val in op_keys:
+            if is_customizer_submitted:
+                config[k] = '1' if k in filters else '0'
+            else:
+                saved = user_settings.get(k, '')
+                config[k] = ('1' if str(saved).strip().lower() in ('1', 'true', 'on') else '0') if saved != '' else def_val
+
+        if not can_view_financial:
+            config['kpi_total_value'] = '0'
+            config['col_financial'] = '0'
+
+        where = []
+        params = []
+
+        op_date_expr = """COALESCE(
+            NULLIF(substr(o.delivered_at, 1, 10), ''),
+            (SELECT r.date FROM route_orders ro JOIN routes r ON r.id=ro.route_id AND r.status <> 'Cancelada' WHERE ro.order_id=o.id ORDER BY ro.id DESC LIMIT 1),
+            NULLIF(substr(o.invoiced_at, 1, 10), ''),
+            o.sale_date
+        )"""
+        route_date_expr = """(SELECT r.date FROM route_orders ro JOIN routes r ON r.id=ro.route_id AND r.status <> 'Cancelada' WHERE ro.order_id=o.id ORDER BY ro.id DESC LIMIT 1)"""
+
+        if date_type == 'delivery':
+            where.append("substr(COALESCE(o.delivered_at,''),1,10) BETWEEN ? AND ?")
+            params.extend([start, end])
+        elif date_type == 'expected':
+            where.append("o.expected_delivery_date BETWEEN ? AND ?")
+            params.extend([start, end])
+        elif date_type == 'sale':
+            where.append("o.sale_date BETWEEN ? AND ?")
+            params.extend([start, end])
+        elif date_type == 'route':
+            where.append(f"{route_date_expr} BETWEEN ? AND ?")
+            params.extend([start, end])
+        else: # operational (padrão)
+            date_type = 'operational'
+            where.append(f"{op_date_expr} BETWEEN ? AND ?")
+            params.extend([start, end])
+
+        driver_expr = """COALESCE(
+            (SELECT d.name FROM route_orders ro JOIN routes r ON r.id=ro.route_id AND r.status <> 'Cancelada' JOIN drivers d ON d.id=r.driver_id WHERE ro.order_id=o.id ORDER BY ro.id DESC LIMIT 1),
+            (SELECT od.name FROM drivers od WHERE od.id=o.driver_id),
+            'Sem motorista'
+        )"""
+
+        if driver_filter and driver_filter not in ('all', 'Todos', 'Todos os motoristas'):
+            where.append(f"{driver_expr} = ?")
+            params.append(driver_filter)
+
+        vehicle_expr = """COALESCE(
+            (SELECT CASE
+                WHEN v.plate IS NOT NULL AND TRIM(v.plate) <> '' THEN v.name || ' - ' || v.plate
+                ELSE v.name END
+             FROM route_orders ro
+             JOIN routes r ON r.id=ro.route_id AND r.status <> 'Cancelada'
+             JOIN vehicles v ON v.id=r.vehicle_id
+             WHERE ro.order_id=o.id ORDER BY ro.id DESC LIMIT 1),
+            (SELECT CASE
+                WHEN ov.plate IS NOT NULL AND TRIM(ov.plate) <> '' THEN ov.name || ' - ' || ov.plate
+                ELSE ov.name END
+             FROM vehicles ov WHERE ov.id=o.vehicle_id),
+            'Sem caminhão'
+        )"""
+
+        if vehicle_filter and vehicle_filter not in ('all', 'Todos', 'Todos os caminhões'):
+            where.append(f"{vehicle_expr} = ?")
+            params.append(vehicle_filter)
+
+        if route_filter and route_filter not in ('all', 'Todas', 'Todas as rotas'):
+            where.append("o.route_name = ?")
+            params.append(route_filter)
+
+        if city_filter and city_filter not in ('all', 'Todas', 'Todas as cidades'):
+            where.append("o.city = ?")
+            params.append(city_filter)
+
+        if seller_filter and seller_filter not in ('all', 'Todos', 'Todos os vendedores'):
+            where.append("o.seller_name = ?")
+            params.append(seller_filter)
+
+        # Status filtering limpo
+        if status_filter and status_filter not in ('', 'all', 'Todos'):
+            if status_filter == 'finalized':
+                where.append("o.status IN ('Acertado', 'Entregue')")
+            elif status_filter == 'open':
+                where.append("o.status IN ('Venda', 'Faturado', 'Carga Montada', 'Saiu para entrega', 'Agendado')")
+            elif status_filter == 'all_with_canceled':
+                pass # não filtra
+            else:
+                where.append("o.status = ?")
+                params.append(status_filter)
+        else:
+            where.append("o.status <> 'Cancelado'")
+
+        today_str = today()
+
+        # SLA filtering limpo
+        if sla_filter and sla_filter not in ('', 'all', 'Todas'):
+            if sla_filter == 'ontime':
+                where.append("((o.status IN ('Acertado','Entregue') AND substr(COALESCE(o.delivered_at,''),1,10) <= o.expected_delivery_date) OR (o.status NOT IN ('Acertado','Entregue','Problema','Cancelado') AND o.expected_delivery_date >= ?))")
+                params.append(today_str)
+            elif sla_filter == 'late':
+                where.append("((o.status IN ('Acertado','Entregue') AND substr(COALESCE(o.delivered_at,''),1,10) > o.expected_delivery_date) OR (o.status NOT IN ('Acertado','Entregue','Problema','Cancelado') AND o.expected_delivery_date < ?))")
+                params.append(today_str)
+            elif sla_filter == 'risk':
+                where.append("(o.status NOT IN ('Acertado','Entregue','Problema','Cancelado') AND o.expected_delivery_date BETWEEN ? AND date(?, '+2 days'))")
+                params.extend([today_str, today_str])
+
+        where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+        base_from = "FROM orders o"
+
+        # 1. Totais Globais
+        sql_totals = f"""
+        SELECT
+            COUNT(o.id) as total_orders,
+            COALESCE(SUM(o.weight_kg), 0) as total_weight,
+            COALESCE(SUM(o.total_value), 0) as total_value,
+            COALESCE(SUM(CASE WHEN o.status IN ('Acertado', 'Entregue') THEN 1 ELSE 0 END), 0) as delivered_orders,
+            COALESCE(SUM(CASE WHEN o.status IN ('Acertado', 'Entregue') AND substr(COALESCE(o.delivered_at,''),1,10) <= o.expected_delivery_date THEN 1 ELSE 0 END), 0) as delivered_ontime,
+            COALESCE(SUM(CASE WHEN o.status IN ('Acertado', 'Entregue') AND substr(COALESCE(o.delivered_at,''),1,10) > o.expected_delivery_date THEN 1 ELSE 0 END), 0) as delivered_late,
+            COALESCE(SUM(CASE WHEN o.status NOT IN ('Acertado', 'Entregue', 'Problema', 'Cancelado') AND o.expected_delivery_date < ? THEN 1 ELSE 0 END), 0) as pending_late,
+            COALESCE(SUM(CASE WHEN o.status NOT IN ('Acertado', 'Entregue', 'Problema', 'Cancelado') AND o.expected_delivery_date >= ? THEN 1 ELSE 0 END), 0) as pending_ontime,
+            COALESCE(SUM(CASE WHEN o.status = 'Problema' THEN 1 ELSE 0 END), 0) as problem_orders,
+            ROUND(AVG(CASE
+                WHEN NULLIF(substr(COALESCE(o.delivered_at,''),1,10),'') IS NOT NULL AND NULLIF(o.sale_date,'') IS NOT NULL
+                THEN julianday(substr(o.delivered_at,1,10)) - julianday(o.sale_date)
+            END), 1) as avg_days_delivery,
+            ROUND(AVG(CASE
+                WHEN NULLIF(substr(COALESCE(o.invoiced_at,''),1,10),'') IS NOT NULL AND NULLIF(o.sale_date,'') IS NOT NULL
+                     AND julianday(substr(o.invoiced_at,1,10)) >= julianday(o.sale_date)
+                THEN julianday(substr(o.invoiced_at,1,10)) - julianday(o.sale_date)
+            END), 1) as avg_days_sale_to_inv,
+            ROUND(AVG(CASE
+                WHEN NULLIF(substr(COALESCE(o.delivered_at,''),1,10),'') IS NOT NULL AND NULLIF(substr(COALESCE(o.invoiced_at,''),1,10),'') IS NOT NULL
+                     AND julianday(substr(o.delivered_at,1,10)) >= julianday(substr(o.invoiced_at,1,10))
+                THEN julianday(substr(o.delivered_at,1,10)) - julianday(substr(o.invoiced_at,1,10))
+            END), 1) as avg_days_inv_to_del,
+            COALESCE(SUM(CASE
+                WHEN NULLIF(substr(COALESCE(o.delivered_at,''),1,10),'') IS NOT NULL AND NULLIF(substr(COALESCE(o.invoiced_at,''),1,10),'') IS NOT NULL AND NULLIF(o.sale_date,'') IS NOT NULL
+                     AND (julianday(substr(o.invoiced_at,1,10)) - julianday(o.sale_date)) > (julianday(substr(o.delivered_at,1,10)) - julianday(substr(o.invoiced_at,1,10)))
+                THEN 1 ELSE 0
+            END), 0) as count_bottleneck_commercial,
+            COALESCE(SUM(CASE
+                WHEN NULLIF(substr(COALESCE(o.delivered_at,''),1,10),'') IS NOT NULL AND NULLIF(substr(COALESCE(o.invoiced_at,''),1,10),'') IS NOT NULL AND NULLIF(o.sale_date,'') IS NOT NULL
+                     AND (julianday(substr(o.delivered_at,1,10)) - julianday(substr(o.invoiced_at,1,10))) > (julianday(substr(o.invoiced_at,1,10)) - julianday(o.sale_date))
+                THEN 1 ELSE 0
+            END), 0) as count_bottleneck_logistics,
+            COALESCE(SUM(CASE
+                WHEN o.status NOT IN ('Acertado','Entregue','Problema','Cancelado') AND (o.invoiced_at IS NULL OR TRIM(o.invoiced_at) = '')
+                THEN 1 ELSE 0
+            END), 0) as pending_wait_invoice,
+            ROUND(AVG(CASE
+                WHEN o.status NOT IN ('Acertado','Entregue','Problema','Cancelado') AND (o.invoiced_at IS NULL OR TRIM(o.invoiced_at) = '') AND NULLIF(o.sale_date,'') IS NOT NULL
+                THEN julianday(?) - julianday(o.sale_date)
+            END), 1) as avg_days_waiting_invoice,
+            COALESCE(SUM(CASE
+                WHEN o.status NOT IN ('Acertado','Entregue','Problema','Cancelado') AND o.invoiced_at IS NOT NULL AND TRIM(o.invoiced_at) <> ''
+                THEN 1 ELSE 0
+            END), 0) as pending_wait_delivery,
+            ROUND(AVG(CASE
+                WHEN o.status NOT IN ('Acertado','Entregue','Problema','Cancelado') AND o.invoiced_at IS NOT NULL AND TRIM(o.invoiced_at) <> ''
+                THEN julianday(?) - julianday(substr(o.invoiced_at,1,10))
+            END), 1) as avg_days_waiting_delivery
+        {base_from}
+        {where_sql}
+        """
+        tot_row = db.execute(sql_totals, [today_str, today_str, today_str, today_str] + params).fetchone()
+        totals = dict(tot_row) if tot_row else {}
+        for nz_k in (
+            'total_orders', 'total_weight', 'total_value',
+            'delivered_orders', 'delivered_ontime', 'delivered_late',
+            'pending_late', 'pending_ontime', 'problem_orders',
+            'count_bottleneck_commercial', 'count_bottleneck_logistics',
+            'pending_wait_invoice', 'pending_wait_delivery'
+        ):
+            if totals.get(nz_k) is None:
+                totals[nz_k] = 0
+        del_orders = totals.get('delivered_orders', 0) or 0
+        ontime = totals.get('delivered_ontime', 0) or 0
+        late = totals.get('delivered_late', 0) or 0
+        if del_orders > 0:
+            totals['sla_rate'] = round((ontime / del_orders) * 100, 1)
+        else:
+            totals['sla_rate'] = 100.0 if late == 0 else 0.0
+
+        # Análise de Gargalo Principal e Percentual do Tempo por Etapa
+        s2i = totals.get('avg_days_sale_to_inv')
+        i2d = totals.get('avg_days_inv_to_del')
+        if s2i is not None and i2d is not None and (s2i > 0 or i2d > 0):
+            tot_cycle = (s2i or 0.0) + (i2d or 0.0)
+            totals['pct_time_commercial'] = round((s2i / tot_cycle * 100), 1) if tot_cycle > 0 else 50.0
+            totals['pct_time_logistics'] = round((i2d / tot_cycle * 100), 1) if tot_cycle > 0 else 50.0
+            if s2i > i2d:
+                totals['bottleneck_label'] = 'Comercial / Faturamento'
+                totals['bottleneck_severity'] = 'warning'
+                totals['bottleneck_desc'] = f'Os pedidos passam em média {s2i:.1f} dias aguardando faturamento ({totals["pct_time_commercial"]}%) vs {i2d:.1f} dias na entrega ({totals["pct_time_logistics"]}%).'
+            elif i2d > s2i:
+                totals['bottleneck_label'] = 'Logística / Expedição'
+                totals['bottleneck_severity'] = 'warning'
+                totals['bottleneck_desc'] = f'Os pedidos passam em média {i2d:.1f} dias entre faturamento e entrega ({totals["pct_time_logistics"]}%) vs {s2i:.1f} dias no faturamento ({totals["pct_time_commercial"]}%).'
+            else:
+                totals['bottleneck_label'] = 'Equilibrado'
+                totals['bottleneck_severity'] = 'info'
+                totals['bottleneck_desc'] = f'Tempos equilibrados entre faturamento ({s2i:.1f} dias) e entrega ({i2d:.1f} dias).'
+        else:
+            totals['pct_time_commercial'] = 50.0
+            totals['pct_time_logistics'] = 50.0
+            totals['bottleneck_label'] = 'Equilibrado'
+            totals['bottleneck_severity'] = 'info'
+            totals['bottleneck_desc'] = 'Tempos operacionais equilibrados no período filtrado.'
+
+        # 2. Por Motorista
+        sql_drivers = f"""
+        SELECT
+            {driver_expr} as driver_name,
+            COUNT(o.id) as total_orders,
+            COALESCE(SUM(CASE WHEN o.status IN ('Acertado', 'Entregue') THEN 1 ELSE 0 END), 0) as delivered_orders,
+            COALESCE(SUM(o.weight_kg), 0) as total_weight,
+            COALESCE(SUM(o.total_value), 0) as total_value,
+            COALESCE(SUM(CASE WHEN o.status IN ('Acertado', 'Entregue') AND substr(COALESCE(o.delivered_at,''),1,10) <= o.expected_delivery_date THEN 1 ELSE 0 END), 0) as ontime_count,
+            COALESCE(SUM(CASE WHEN o.status IN ('Acertado', 'Entregue') AND substr(COALESCE(o.delivered_at,''),1,10) > o.expected_delivery_date THEN 1 ELSE 0 END), 0) as late_count,
+            ROUND(AVG(CASE
+                WHEN NULLIF(substr(COALESCE(o.delivered_at,''),1,10),'') IS NOT NULL AND NULLIF(o.sale_date,'') IS NOT NULL
+                THEN julianday(substr(o.delivered_at,1,10)) - julianday(o.sale_date)
+            END), 1) as avg_days,
+            COALESCE(SUM(CASE WHEN (SELECT COUNT(*) FROM delivery_problems dp WHERE dp.order_id=o.id) > 0 THEN 1 ELSE 0 END), 0) as problems_count
+        {base_from}
+        {where_sql}
+        GROUP BY {driver_expr}
+        ORDER BY (CASE WHEN {driver_expr} = 'Sem motorista' THEN 1 ELSE 0 END), total_orders DESC
+        """
+        driver_rows = db.execute(sql_drivers, params).fetchall()
+        drivers = []
+        unassigned_driver = None
+        for r in driver_rows:
+            d_dict = dict(r)
+            for k in ('total_orders', 'delivered_orders', 'total_weight', 'total_value', 'ontime_count', 'late_count', 'problems_count'):
+                if d_dict.get(k) is None:
+                    d_dict[k] = 0
+            d_del = d_dict.get('delivered_orders', 0) or 0
+            d_on = d_dict.get('ontime_count', 0) or 0
+            d_lt = d_dict.get('late_count', 0) or 0
+            d_dict['sla_rate'] = round((d_on / d_del) * 100, 1) if d_del > 0 else (100.0 if d_lt == 0 else 0.0)
+            if d_dict.get('driver_name') == 'Sem motorista':
+                unassigned_driver = d_dict
+            else:
+                drivers.append(d_dict)
+
+        # 2.1 Por Caminhão / Veículo
+        sql_vehicles = f"""
+        SELECT
+            {vehicle_expr} as vehicle_name,
+            COALESCE(
+                (SELECT r.vehicle_id FROM route_orders ro JOIN routes r ON r.id=ro.route_id AND r.status <> 'Cancelada' WHERE ro.order_id=o.id ORDER BY ro.id DESC LIMIT 1),
+                o.vehicle_id,
+                0
+            ) as vehicle_id,
+            COUNT(o.id) as total_orders,
+            COALESCE(SUM(CASE WHEN o.status IN ('Acertado', 'Entregue') THEN 1 ELSE 0 END), 0) as delivered_orders,
+            COALESCE(SUM(o.weight_kg), 0) as total_weight,
+            COALESCE(SUM(o.total_value), 0) as total_value,
+            COALESCE(SUM(CASE WHEN o.status IN ('Acertado', 'Entregue') AND substr(COALESCE(o.delivered_at,''),1,10) <= o.expected_delivery_date THEN 1 ELSE 0 END), 0) as ontime_count,
+            COALESCE(SUM(CASE WHEN o.status IN ('Acertado', 'Entregue') AND substr(COALESCE(o.delivered_at,''),1,10) > o.expected_delivery_date THEN 1 ELSE 0 END), 0) as late_count,
+            COALESCE(COUNT(DISTINCT (SELECT ro.route_id FROM route_orders ro JOIN routes r ON r.id=ro.route_id AND r.status <> 'Cancelada' WHERE ro.order_id=o.id ORDER BY ro.id DESC LIMIT 1)), 0) as loads_count
+        {base_from}
+        {where_sql}
+        GROUP BY {vehicle_expr}
+        ORDER BY (CASE WHEN {vehicle_expr} = 'Sem caminhão' THEN 1 ELSE 0 END), total_orders DESC
+        """
+        veh_rows = db.execute(sql_vehicles, params).fetchall()
+        vehicles = []
+        unassigned_vehicle = None
+        v_meta = {v['id']: v for v in db.execute("SELECT id, name, plate, capacity_kg FROM vehicles").fetchall()}
+        for r in veh_rows:
+            v_dict = dict(r)
+            for k in ('total_orders', 'delivered_orders', 'total_weight', 'total_value', 'ontime_count', 'late_count', 'loads_count', 'capacity_kg'):
+                if v_dict.get(k) is None:
+                    v_dict[k] = 0
+            v_id = v_dict.get('vehicle_id', 0)
+            meta = v_meta.get(v_id)
+            if meta:
+                v_dict['plate'] = meta['plate'] or ''
+                v_dict['model'] = meta['name'] or ''
+                v_dict['capacity_kg'] = meta['capacity_kg'] or 0.0
+            else:
+                v_dict['plate'] = ''
+                v_dict['model'] = v_dict['vehicle_name']
+                v_dict['capacity_kg'] = 0.0
+
+            v_del = v_dict.get('delivered_orders', 0) or 0
+            v_on = v_dict.get('ontime_count', 0) or 0
+            v_lt = v_dict.get('late_count', 0) or 0
+            v_dict['sla_rate'] = round((v_on / v_del) * 100, 1) if v_del > 0 else (100.0 if v_lt == 0 else 0.0)
+
+            loads = v_dict.get('loads_count', 0) or 0
+            cap = v_dict.get('capacity_kg', 0.0) or 0.0
+            tot_cap = loads * cap
+            w = v_dict.get('total_weight', 0.0) or 0.0
+            v_dict['occupation_rate'] = round((w / tot_cap * 100), 1) if tot_cap > 0 else 0.0
+
+            if v_dict.get('vehicle_name') == 'Sem caminhão':
+                unassigned_vehicle = v_dict
+            else:
+                vehicles.append(v_dict)
+
+        # 3. Por Rota
+        sql_routes = f"""
+        SELECT
+            COALESCE(NULLIF(o.route_name,''), 'Sem rota') as route_name,
+            COUNT(o.id) as total_orders,
+            COALESCE(SUM(CASE WHEN o.status IN ('Acertado', 'Entregue') THEN 1 ELSE 0 END), 0) as delivered_orders,
+            COALESCE(SUM(o.weight_kg), 0) as total_weight,
+            COALESCE(SUM(o.total_value), 0) as total_value,
+            COALESCE(SUM(CASE WHEN o.status IN ('Acertado', 'Entregue') AND substr(COALESCE(o.delivered_at,''),1,10) <= o.expected_delivery_date THEN 1 ELSE 0 END), 0) as ontime_count,
+            COALESCE(SUM(CASE WHEN o.status IN ('Acertado', 'Entregue') AND substr(COALESCE(o.delivered_at,''),1,10) > o.expected_delivery_date THEN 1 ELSE 0 END), 0) as late_count,
+            ROUND(AVG(CASE
+                WHEN NULLIF(substr(COALESCE(o.invoiced_at,''),1,10),'') IS NOT NULL AND NULLIF(o.sale_date,'') IS NOT NULL
+                     AND julianday(substr(o.invoiced_at,1,10)) >= julianday(o.sale_date)
+                THEN julianday(substr(o.invoiced_at,1,10)) - julianday(o.sale_date)
+            END), 1) as avg_days_sale_to_inv,
+            ROUND(AVG(CASE
+                WHEN NULLIF(substr(COALESCE(o.delivered_at,''),1,10),'') IS NOT NULL AND NULLIF(substr(COALESCE(o.invoiced_at,''),1,10),'') IS NOT NULL
+                     AND julianday(substr(o.delivered_at,1,10)) >= julianday(substr(o.invoiced_at,1,10))
+                THEN julianday(substr(o.delivered_at,1,10)) - julianday(substr(o.invoiced_at,1,10))
+            END), 1) as avg_days_inv_to_del,
+            ROUND(AVG(CASE
+                WHEN NULLIF(substr(COALESCE(o.delivered_at,''),1,10),'') IS NOT NULL AND NULLIF(o.sale_date,'') IS NOT NULL
+                     AND julianday(substr(o.delivered_at,1,10)) >= julianday(o.sale_date)
+                THEN julianday(substr(o.delivered_at,1,10)) - julianday(o.sale_date)
+            END), 1) as avg_days_delivery
+        {base_from}
+        {where_sql}
+        GROUP BY COALESCE(NULLIF(o.route_name,''), 'Sem rota')
+        ORDER BY total_orders DESC
+        """
+        route_rows = db.execute(sql_routes, params).fetchall()
+        routes = []
+        for r in route_rows:
+            r_dict = dict(r)
+            for k in ('total_orders', 'delivered_orders', 'total_weight', 'total_value', 'ontime_count', 'late_count'):
+                if r_dict.get(k) is None:
+                    r_dict[k] = 0
+            r_del = r_dict.get('delivered_orders', 0) or 0
+            r_on = r_dict.get('ontime_count', 0) or 0
+            r_lt = r_dict.get('late_count', 0) or 0
+            r_dict['sla_rate'] = round((r_on / r_del) * 100, 1) if r_del > 0 else (100.0 if r_lt == 0 else 0.0)
+            s2i_r = r_dict.get('avg_days_sale_to_inv')
+            i2d_r = r_dict.get('avg_days_inv_to_del')
+            if s2i_r is not None and i2d_r is not None and (s2i_r > 0 or i2d_r > 0):
+                r_dict['bottleneck'] = 'Comercial' if s2i_r > i2d_r else ('Logística' if i2d_r > s2i_r else 'Equilibrado')
+            else:
+                r_dict['bottleneck'] = '—'
+            routes.append(r_dict)
+
+        # 4. Por Cidade (agrupado unicamente por cidade para não duplicar linhas)
+        sql_cities = f"""
+        SELECT
+            COALESCE(NULLIF(TRIM(o.city),''), 'Sem cidade') as city_name,
+            COUNT(o.id) as total_orders,
+            COALESCE(SUM(CASE WHEN o.status IN ('Acertado', 'Entregue') THEN 1 ELSE 0 END), 0) as delivered_orders,
+            COALESCE(SUM(o.weight_kg), 0) as total_weight,
+            COALESCE(SUM(o.total_value), 0) as total_value
+        {base_from}
+        {where_sql}
+        GROUP BY COALESCE(NULLIF(TRIM(o.city),''), 'Sem cidade')
+        ORDER BY total_orders DESC
+        """
+        rc_catalog = db.execute("SELECT route_name, city FROM route_cities WHERE active=1 AND route_name IS NOT NULL AND TRIM(route_name)<>''").fetchall()
+
+        def resolve_city_base_route(cname):
+            if not cname or cname == 'Sem cidade':
+                return 'Sem rota'
+            cn_key = normalized_text_key(cname)
+            for rc in rc_catalog:
+                if normalized_text_key(rc['city']) == cn_key:
+                    return rc['route_name'].strip()
+            for rc in rc_catalog:
+                rck = normalized_text_key(rc['city'])
+                if rck and (rck in cn_key or cn_key in rck):
+                    return rc['route_name'].strip()
+            fallback = db.execute("""
+                SELECT route_name, COUNT(*) as cnt FROM orders
+                WHERE UPPER(TRIM(city)) = UPPER(TRIM(?))
+                  AND route_name IS NOT NULL AND TRIM(route_name)<>''
+                  AND UPPER(TRIM(route_name)) NOT IN ('MISTA', 'SEM ROTA')
+                GROUP BY route_name ORDER BY cnt DESC LIMIT 1
+            """, (cname,)).fetchone()
+            if fallback and fallback['route_name']:
+                return fallback['route_name'].strip()
+            return 'Sem rota'
+
+        city_rows = db.execute(sql_cities, params).fetchall()
+        cities = []
+        for cr in city_rows:
+            cd = dict(cr)
+            for k in ('total_orders', 'delivered_orders', 'total_weight', 'total_value'):
+                if cd.get(k) is None:
+                    cd[k] = 0
+            cd['route_name'] = resolve_city_base_route(cd['city_name'])
+            cities.append(cd)
+
+        # 5. Problemas
+        sql_problems = f"""
+        SELECT
+            COALESCE(dp.problem_type, 'Sem motivo') as problem_type,
+            COUNT(*) as c
+        FROM delivery_problems dp
+        JOIN orders o ON o.id=dp.order_id
+        {where_sql}
+        GROUP BY dp.problem_type
+        ORDER BY c DESC
+        """
+        problems = [dict(r) for r in db.execute(sql_problems, params).fetchall()]
+
+        # 6. Pedidos Analíticos (limite 100)
+        sql_orders = f"""
+        SELECT
+            o.id, o.order_number, o.invoice_number, o.seller_name, o.payment_method, o.status,
+            o.route_name, o.city, o.weight_kg, o.total_value, o.sale_date, o.invoiced_at, o.delivered_at, o.expected_delivery_date,
+            c.name as client_name, {driver_expr} as driver_name,
+            CASE
+                WHEN NULLIF(substr(COALESCE(o.invoiced_at,''),1,10),'') IS NOT NULL AND NULLIF(o.sale_date,'') IS NOT NULL
+                     AND julianday(substr(o.invoiced_at,1,10)) >= julianday(o.sale_date)
+                THEN CAST(julianday(substr(o.invoiced_at,1,10)) - julianday(o.sale_date) AS INTEGER)
+                ELSE NULL
+            END as days_sale_to_inv,
+            CASE
+                WHEN NULLIF(substr(COALESCE(o.delivered_at,''),1,10),'') IS NOT NULL AND NULLIF(substr(COALESCE(o.invoiced_at,''),1,10),'') IS NOT NULL
+                     AND julianday(substr(o.delivered_at,1,10)) >= julianday(substr(o.invoiced_at,1,10))
+                THEN CAST(julianday(substr(o.delivered_at,1,10)) - julianday(substr(o.invoiced_at,1,10)) AS INTEGER)
+                ELSE NULL
+            END as days_inv_to_del,
+            CASE
+                WHEN NULLIF(substr(COALESCE(o.delivered_at,''),1,10),'') IS NOT NULL AND NULLIF(o.sale_date,'') IS NOT NULL
+                THEN CAST(julianday(substr(o.delivered_at,1,10)) - julianday(o.sale_date) AS INTEGER)
+                ELSE NULL
+            END as days_to_deliver,
+            CASE
+                WHEN NULLIF(substr(COALESCE(o.delivered_at,''),1,10),'') IS NOT NULL AND NULLIF(substr(COALESCE(o.invoiced_at,''),1,10),'') IS NOT NULL AND NULLIF(o.sale_date,'') IS NOT NULL THEN
+                    CASE
+                        WHEN (julianday(substr(o.invoiced_at,1,10)) - julianday(o.sale_date)) > (julianday(substr(o.delivered_at,1,10)) - julianday(substr(o.invoiced_at,1,10))) THEN 'Comercial'
+                        WHEN (julianday(substr(o.delivered_at,1,10)) - julianday(substr(o.invoiced_at,1,10))) > (julianday(substr(o.invoiced_at,1,10)) - julianday(o.sale_date)) THEN 'Logística'
+                        ELSE 'Equilibrado'
+                    END
+                WHEN o.status NOT IN ('Acertado','Entregue','Cancelado','Problema') THEN
+                    CASE
+                        WHEN (o.invoiced_at IS NULL OR TRIM(o.invoiced_at) = '') THEN 'Aguard. Faturamento'
+                        ELSE 'Aguard. Entrega'
+                    END
+                ELSE '—'
+            END as bottleneck_stage
+        {base_from}
+        LEFT JOIN clients c ON c.id=o.client_id
+        {where_sql}
+        ORDER BY o.id DESC
+        LIMIT 5000
+        """
+        orders = [dict(r) for r in db.execute(sql_orders, params).fetchall()]
+
+        date_type_labels = {
+            'operational': 'Data Operacional (Carga / Entrega)',
+            'delivery': 'Data da Entrega / Acerto',
+            'route': 'Data da Carga / Rota',
+            'sale': 'Data da Venda',
+            'expected': 'Previsão de Entrega (SLA)'
+        }
+        filter_desc_parts = [f"Período ({date_type_labels.get(date_type, 'Operacional')}): {brdate(start)} a {brdate(end)}"]
+        if route_filter: filter_desc_parts.append(f"Rota: {route_filter}")
+        if driver_filter: filter_desc_parts.append(f"Motorista: {driver_filter}")
+        if vehicle_filter: filter_desc_parts.append(f"Caminhão: {vehicle_filter}")
+        if city_filter: filter_desc_parts.append(f"Cidade: {city_filter}")
+        if seller_filter: filter_desc_parts.append(f"Vendedor: {seller_filter}")
+        if status_filter: filter_desc_parts.append(f"Status: {status_filter}")
+        if sla_filter != 'all':
+            sla_labels = {'ontime': 'No Prazo', 'late': 'Atrasados', 'risk': 'Em Risco'}
+            filter_desc_parts.append(f"SLA: {sla_labels.get(sla_filter, sla_filter)}")
+
+        clean_filters = {
+            'start': start,
+            'end': end,
+            'date_type': date_type,
+            'driver': driver_filter,
+            'vehicle': vehicle_filter,
+            'route': route_filter,
+            'city': city_filter,
+            'seller': seller_filter,
+            'status': status_filter,
+            'sla_status': sla_filter,
+        }
+
+        return {
+            "filters": clean_filters,
+            "filter_desc": " | ".join(filter_desc_parts),
+            "config": config,
+            "totals": totals,
+            "drivers": drivers,
+            "unassigned_driver": unassigned_driver,
+            "vehicles": vehicles,
+            "unassigned_vehicle": unassigned_vehicle,
+            "routes": routes,
+            "cities": cities,
+            "problems": problems,
+            "orders": orders,
+            "can_view_financial": can_view_financial
+        }
 
     def fetch_orders_for_table(self, db, where_sql='', params=(), limit=25):
         sql = """SELECT o.*,c.name client,c.farm_name,c.city client_city,
@@ -2867,6 +4351,8 @@ class App(BaseHTTPRequestHandler):
             if u and self.has_perm(u,'create_routes'):
                 return '<a class="btn small" href="/routes/new">Adicionar em carga</a>'
             return '<span class="muted">Sem permissão para carga</span>'
+        if st == 'Carga Montada':
+            return '<a class="btn small ghost" href="/routes" style="color:#6b21a8; border-color:#d8b4fe; background:#ede9fe; font-weight:600;">Ver carga</a>'
         if st == 'Saiu para entrega':
             if u and self.has_perm(u,'settle_routes'):
                 return '<a class="btn small" href="/load-settlement">Fazer acerto</a>'
@@ -2888,14 +4374,22 @@ class App(BaseHTTPRequestHandler):
                 action = "<span class='muted'>Aguardando faturamento por usuário autorizado.</span>"
             hint = 'Depois de faturar, o pedido entra na fila de montagem de carga.'
         elif st == 'Faturado':
-            step = '2/4 Faturado'
+            step = '2/5 Faturado'
             if u and self.has_perm(u,'create_routes'):
                 action = "<a class='btn' href='/routes'>Ir para Cargas/Rotas</a>"
             else:
                 action = "<span class='muted'>Aguardando planejamento de carga por usuário autorizado.</span>"
             hint = 'Monte a carga e defina sequência de entrega.'
+        elif st == 'Carga Montada':
+            step = '3/5 Carga Montada (Aguardando saída)'
+            rid = route_info['route_id'] if route_info else ''
+            if rid:
+                action = f"<a class='btn' href='/routes/{rid}' style='background:#7c3aed;color:#fff;'>Ver Carga #{rid} / Dar Saída</a>"
+            else:
+                action = "<a class='btn' href='/routes'>Ir para Cargas/Rotas</a>"
+            hint = 'A carga foi montada e está aguardando saída para iniciar a rota de entrega.'
         elif st == 'Saiu para entrega':
-            step = '3/4 Em rota'
+            step = '4/5 Em rota'
             route_name = str(route_info['route_name'] or '') if route_info else ''
             if u and self.has_perm(u,'settle_routes'):
                 action = f"<a class='btn' href='/load-settlement?q={quote(route_name)}'>Ir para Acerto de Carga</a>" if route_name else "<a class='btn' href='/load-settlement'>Ir para Acerto de Carga</a>"
@@ -2943,10 +4437,20 @@ class App(BaseHTTPRequestHandler):
         if not rows: return '<div class="empty"><b>Nenhum pedido encontrado.</b><span>Use filtros diferentes ou cadastre um novo pedido.</span></div>'
         can_view_financial = self.can_view_financial(u) if u else False
         weight_col_title = 'Peso / Valor' if can_view_financial else 'Peso'
-        head=f'<div class="table-wrap"><table class="orders-table"><thead><tr><th>Documento</th><th>Cliente / Fazenda</th><th>Rota / Cidade</th><th>Status</th><th>Prazo limite</th><th>{weight_col_title}</th><th>Ações</th></tr></thead><tbody>'
+        head=f'<div class="table-wrap"><table class="orders-table"><thead><tr><th>Documento</th><th>Cliente / Fazenda</th><th>Rota / Cidade</th><th>Status</th><th>Venda / Prazo</th><th>{weight_col_title}</th><th>Ações</th></tr></thead><tbody>'
         body=''
         can_edit = self.has_perm(u,'edit_orders') if u else False
-        can_delete = self.has_perm(u,'cancel_orders') if u else False
+        can_delete = bool(is_admin(u) or can_manage_catalog_deletions(u) or self.has_perm(u,'cancel_orders')) if u else False
+        
+        order_ids = [r['id'] for r in rows]
+        items_by_order = {}
+        if order_ids:
+            with conn() as db:
+                placeholders = ','.join('?' for _ in order_ids)
+                all_its = db.execute(f"SELECT order_id, product_name, quantity, unit, weight_kg FROM order_items WHERE order_id IN ({placeholders}) ORDER BY id", order_ids).fetchall()
+                for it in all_its:
+                    items_by_order.setdefault(it['order_id'], []).append(it)
+
         for r in rows:
             row_class = order_sla_row_class(r['expected_delivery_date'], r['status'])
             next_action = self.order_next_action(r, u=u)
@@ -2955,7 +4459,23 @@ class App(BaseHTTPRequestHandler):
             value_html = f'<br><small>{money_visible(can_view_financial, r["total_value"])}</small>' if can_view_financial else ''
             loc_url = r['delivery_location_link'] if ('delivery_location_link' in r.keys() and r['delivery_location_link']) else (r['location_link'] if 'location_link' in r.keys() else '')
             map_badge = f'<br><a href="{esc(loc_url)}" target="_blank" rel="noopener" class="btn small ghost" style="color:#0284c7; border-color:#0284c7; padding:1px 4px; font-size:0.72rem; margin-top:3px; display:inline-block;">📍 Ver no Mapa</a>' if loc_url else ''
-            body += f'''<tr class="{row_class}"><td><b class="order-no">{esc(r['order_number'])}</b><br><small>Faturamento: {esc(r['invoice_number'] or 'pendente')} · Carga: {esc(r['load_name'] or 'sem carga')} · Vendedor: {esc(r['seller_name'] or 'Não informado')}</small></td><td>{esc(r['client'] or 'Cliente não vinculado')}<br><small>{esc(r['farm_name'] or r['delivery_address'] or '')}</small></td><td>{esc(r['route_name'] or 'Sem rota')}<br><small>{esc(r['city'] or r['client_city'] or 'Sem cidade')}</small></td><td>{badge(r['status'])}{map_badge}</td><td>{brdate(r['expected_delivery_date'])}<br>{deadline_pill(r['expected_delivery_date'], r['status'])}</td><td><b>{fmt_num(r['weight_kg'])} kg</b>{value_html}</td><td class="row-actions">{next_action}<a class="btn small ghost" href="/orders/{r['id']}">Abrir</a>{edit_link}{delete_form}</td></tr>'''
+            
+            o_items = items_by_order.get(r['id'], [])
+            items_collapse = ''
+            if o_items:
+                it_list = ''.join(
+                    f"<li>{esc(it['product_name'])} <span class='muted'>({to_float(it['quantity']):.0f} {esc(it['unit'] or '')} - {fmt_num(it['weight_kg'])} kg)</span></li>"
+                    for it in o_items
+                )
+                items_collapse = f"""<details class='order-items-collapse' style='margin-top:4px; font-size:0.75rem;'>
+                    <summary style='cursor:pointer; color:#166534; font-weight:600;'>📦 Ver produtos ({len(o_items)}) ▾</summary>
+                    <ul style='margin:3px 0 0 14px; padding:0; list-style-type:disc; color:#334155; font-size:0.75rem;'>{it_list}</ul>
+                </details>"""
+
+            sale_dt_val = r['sale_date'] if ('sale_date' in r.keys() and r['sale_date']) else ''
+            sale_lbl = f"<small class='muted'>Venda: {brdate(sale_dt_val)}</small><br>" if sale_dt_val else ""
+            row_nf_badge = f"<span class='badge' style='background:#047857; color:#fff; font-size:0.75rem; font-weight:700; padding:1px 6px; border-radius:4px; margin-left:6px;'>🧾 NF {esc(r['invoice_number'])}</span>" if r['invoice_number'] else ""
+            body += f'''<tr class="{row_class}"><td><b class="order-no">{esc(r['order_number'])}</b>{row_nf_badge}<br><small>NF: {esc(r['invoice_number'] or 'Pendente')} · Carga: {esc(r['load_name'] or 'sem carga')} · Vendedor: {esc(resolve_seller_name(r['seller_name']))}</small>{items_collapse}</td><td>{esc(r['client'] or 'Cliente não vinculado')}<br><small>{esc(r['farm_name'] or r['delivery_address'] or '')}</small></td><td>{esc(r['route_name'] or 'Sem rota')}<br><small>{esc(r['city'] or r['client_city'] or 'Sem cidade')}</small></td><td>{badge(r['status'])}{map_badge}</td><td>{sale_lbl}<b>Limite: {brdate(r['expected_delivery_date'])}</b><br>{deadline_pill(r['expected_delivery_date'], r['status'])}</td><td><b>{fmt_num(r['weight_kg'])} kg</b>{value_html}</td><td class="row-actions">{next_action}<a class="btn small ghost" href="/orders/{r['id']}">Abrir</a>{edit_link}{delete_form}</td></tr>'''
         return head+body+'</tbody></table></div>'
 
     def orders(self,u):
@@ -2988,9 +4508,10 @@ class App(BaseHTTPRequestHandler):
         next_link = f"<a class='btn ghost small' href='/orders?page={page+1}{prev_prefix}'>Próxima página</a>" if page < total_pages else "<span class='muted'>Fim da lista</span>"
         history_hidden = "<input type='hidden' name='history' value='1'>" if history_mode else ""
         new_order_link = '<a class="btn" href="/orders/new">+ Novo pedido</a>' if self.has_perm(u,'create_orders') else ''
+        sync_carga_btn = '<a class="btn ghost" href="/orders/sync-carga-erp" style="color:#166534; border-color:#86efac; background:#f0fdf4; font-weight:700;" title="Sincronizar pedidos com entrega ao cliente diretamente do ERP">🔄 Buscar Pedidos ERP (Caminhão)</a>' if self.has_perm(u,'create_orders') else ''
         view_toggle = "<a class='btn ghost' href='/orders'>Pedidos em andamento</a>" if history_mode else "<a class='btn ghost' href='/orders?history=1'>Histórico de finalizados</a>"
         mode_label = 'Histórico de finalizados' if history_mode else 'Pedidos em andamento'
-        filt=f'''<div class="toolbar"><div>{new_order_link}{view_toggle}<a class="btn ghost" href="/orders?late=1">Atrasados</a><a class="btn ghost" href="/orders?near=1">Próximos do limite</a></div><div class="muted"><b>{mode_label}</b> · <b>{total_rows}</b> pedido(s)</div></div><form class="filters">{history_hidden}<input name="q" placeholder="Busca rápida por pedido, cliente, cidade ou observação" value="{esc(qs.get('q',[''])[0])}"><select name="status">{option(status_options,qs.get('status',[''])[0],True,'Todos status')}</select><select name="city">{option(cities,qs.get('city',[''])[0],True,'Todas cidades')}</select><select name="route">{option(routes,qs.get('route',[''])[0],True,'Todas rotas')}</select><select name="client_id">{client_opts}</select><input name="nf" placeholder="NF" value="{esc(nf)}"><label>Prazo de<input type="date" name="deadline_from" value="{esc(deadline_from)}"></label><label>até<input type="date" name="deadline_to" value="{esc(deadline_to)}"></label><button>Filtrar</button><a class="btn ghost" href="/orders{'?history=1' if history_mode else ''}">Limpar</a></form>'''
+        filt=f'''<div class="toolbar"><div>{new_order_link}{sync_carga_btn}{view_toggle}<a class="btn ghost" href="/orders?late=1">Atrasados</a><a class="btn ghost" href="/orders?near=1">Próximos do limite</a></div><div class="muted"><b>{mode_label}</b> · <b>{total_rows}</b> pedido(s)</div></div><form class="filters">{history_hidden}<input name="q" placeholder="Busca rápida por pedido, cliente, cidade ou observação" value="{esc(qs.get('q',[''])[0])}"><select name="status">{option(status_options,qs.get('status',[''])[0],True,'Todos status')}</select><select name="city">{option(cities,qs.get('city',[''])[0],True,'Todas cidades')}</select><select name="route">{option(routes,qs.get('route',[''])[0],True,'Todas rotas')}</select><select name="client_id">{client_opts}</select><input name="nf" placeholder="NF" value="{esc(nf)}"><label>Prazo de<input type="date" name="deadline_from" value="{esc(deadline_from)}"></label><label>até<input type="date" name="deadline_to" value="{esc(deadline_to)}"></label><button>Filtrar</button><a class="btn ghost" href="/orders{'?history=1' if history_mode else ''}">Limpar</a></form>'''
         pager = f"<div class='action-strip'>{prev_link}<span class='muted'>Página {page} de {total_pages}</span>{next_link}</div>" if total_pages > 1 else ''
         subtitle = 'Somente pedidos abertos aparecem nesta visão.' if not history_mode else 'Pedidos finalizados (acertado, problema ou cancelado).'
         return self.send_html(layout(u,'Pedidos',filt+self.table_orders(page_rows,u=u)+pager,subtitle))
@@ -3544,6 +5065,20 @@ document.addEventListener('DOMContentLoaded', function(){
             import traceback as _tb
             log_server_error('ERP_LOOKUP', e)
             return self.send_json({'found': False, 'message': 'Erro interno ao consultar ERP.'}, 500)
+
+    def handle_orders_sync_carga_erp(self, u):
+        """GET ou POST /orders/sync-carga-erp — sincroniza pedidos da view de carga do ERP."""
+        from urllib.parse import parse_qs, urlparse
+        res = sync_orders_from_carga_view()
+        qs = parse_qs(urlparse(self.path).query)
+        redirect_to = qs.get('redirect', ['/orders'])[0]
+        with conn() as db:
+            audit(db, u, 'Sincronizou pedidos da view de carga ERP', 'ERP', '', '', res.get('message', ''), source_ip=self.client_ip())
+            db.commit()
+        if 'application/json' in self.headers.get('Accept', '') or 'json' in qs:
+            return self.send_json(res)
+        return self.redirect(redirect_to)
+
     def order_edit(self,u,oid):
         with conn() as db: row=db.execute('SELECT * FROM orders WHERE id=?',(oid,)).fetchone()
         if not row:
@@ -3555,19 +5090,15 @@ document.addEventListener('DOMContentLoaded', function(){
         fallback = str(fallback_route or '').strip()
         if not city_txt:
             return fallback
-        row = db.execute(
-            """SELECT route_name
-               FROM route_cities
-               WHERE active=1
-                 AND LOWER(TRIM(COALESCE(city,'')))=LOWER(TRIM(?))
-                 AND route_name IS NOT NULL
-                 AND TRIM(route_name)<>''
-               ORDER BY COALESCE(delivery_order,9999), route_name, id
-               LIMIT 1""",
-            (city_txt,),
-        ).fetchone()
-        if row and str(row['route_name'] or '').strip():
-            return str(row['route_name']).strip()
+        c_key = normalized_text_key(city_txt)
+        rc_rows = db.execute("SELECT route_name, city FROM route_cities WHERE active=1 AND route_name IS NOT NULL AND TRIM(route_name)<>'' ORDER BY COALESCE(delivery_order,9999), route_name, id").fetchall()
+        for r in rc_rows:
+            if normalized_text_key(r['city']) == c_key:
+                return str(r['route_name']).strip()
+        for r in rc_rows:
+            rck = normalized_text_key(r['city'])
+            if rck and (rck in c_key or c_key in rck):
+                return str(r['route_name']).strip()
         return fallback
 
     def ensure_client_from_order(self, db, d):
@@ -3670,8 +5201,23 @@ document.addEventListener('DOMContentLoaded', function(){
                 raise ValueError('Não foi possível definir a rota automaticamente para a cidade selecionada. Atualize Cidades e Rotas-base.')
             self.ensure_unique_invoice(db, invoice_number, exclude_order_id=None)
             cid=self.ensure_client_from_order(db,d)
+            client_row = db.execute("SELECT latitude, longitude, location_link FROM clients WHERE id=?", (cid,)).fetchone() if cid else None
+            order_loc_link = (d.get('location_link') or '').strip()
+            order_lat, order_lng = extract_lat_lng(order_loc_link) if order_loc_link else (None, None)
+            
+            if not order_loc_link and client_row and client_row['location_link']:
+                order_loc_link = client_row['location_link']
+                order_lat = client_row['latitude']
+                order_lng = client_row['longitude']
+            elif order_loc_link and cid and (order_lat is not None and order_lng is not None):
+                db.execute("UPDATE clients SET latitude=?, longitude=?, location_link=?, updated_at=?, version=COALESCE(version,1)+1 WHERE id=?", (order_lat, order_lng, order_loc_link, now(), cid))
+                
+            if order_lat is None and client_row and client_row['latitude']:
+                order_lat = client_row['latitude']
+                order_lng = client_row['longitude']
+
             delivered_at = (d.get('delivered_at') or today()) if status in ('Acertado','Problema') else None
-            cur=db.execute('''INSERT INTO orders(order_number,client_id,seller_id,seller_name,status,urgency,sale_date,expected_delivery_date,invoice_limit_date,payment_method,total_value,weight_kg,delivery_address,location_link,route_name,city,notes,invoice_number,invoiced_at,driver_id,vehicle_id,delivered_at,created_at,updated_at,version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(order_no,cid,u['id'],seller_name,status,'Normal',sale,deadline,'',payload['payment_method'],value,weight,(d.get('delivery_address') or '').strip(),(d.get('location_link') or '').strip(),resolved_route_name,upper_text(d.get('city')),payload['notes'],invoice_number,invoiced_at_val,d.get('driver_id') or None,d.get('vehicle_id') or None,delivered_at,now(),now(),1))
+            cur=db.execute('''INSERT INTO orders(order_number,client_id,seller_id,seller_name,status,urgency,sale_date,expected_delivery_date,invoice_limit_date,payment_method,total_value,weight_kg,delivery_address,location_link,latitude,longitude,route_name,city,notes,invoice_number,invoiced_at,driver_id,vehicle_id,delivered_at,created_at,updated_at,version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(order_no,cid,u['id'],seller_name,status,'Normal',sale,deadline,'',payload['payment_method'],value,weight,(d.get('delivery_address') or '').strip(),order_loc_link,order_lat,order_lng,resolved_route_name,upper_text(d.get('city')),payload['notes'],invoice_number,invoiced_at_val,d.get('driver_id') or None,d.get('vehicle_id') or None,delivered_at,now(),now(),1))
             oid=cur.lastrowid
             db.execute('INSERT INTO order_items(order_id,product_code,product_name,quantity,unit,weight_kg,notes) VALUES(?,?,?,?,?,?,?)',(oid,'','Carga/volume informado no pedido',1,'kg',weight,d.get('notes')))
             if status=='Problema':
@@ -3718,7 +5264,14 @@ document.addEventListener('DOMContentLoaded', function(){
             delivered_at = oldrow['delivered_at']
             if status in ('Acertado','Problema') and not delivered_at:
                 delivered_at = today()
-            db.execute('''UPDATE orders SET order_number=?,client_id=?,seller_id=?,seller_name=?,status=?,urgency=?,sale_date=?,expected_delivery_date=?,invoice_limit_date=?,payment_method=?,total_value=?,weight_kg=?,delivery_address=?,location_link=?,route_name=?,city=?,notes=?,invoice_number=?,invoiced_at=?,driver_id=?,vehicle_id=?,delivered_at=?,updated_at=?,version=COALESCE(version,1)+1 WHERE id=?''',(order_no,cid,u['id'],seller_name,status,'Normal',sale,deadline,'',payload['payment_method'],value,weight,(d.get('delivery_address') or '').strip(),(d.get('location_link') or '').strip(),resolved_route_name,upper_text(d.get('city')),payload['notes'],invoice_number,d.get('invoiced_at'),d.get('driver_id') or None,d.get('vehicle_id') or None,delivered_at,now(),oid))
+                
+            edit_loc_link = (d.get('location_link') or '').strip()
+            edit_lat, edit_lng = extract_lat_lng(edit_loc_link) if edit_loc_link else (oldrow['latitude'] if 'latitude' in oldrow.keys() else None, oldrow['longitude'] if 'longitude' in oldrow.keys() else None)
+            
+            if edit_loc_link and cid and edit_lat is not None and edit_lng is not None:
+                db.execute("UPDATE clients SET latitude=?, longitude=?, location_link=?, updated_at=?, version=COALESCE(version,1)+1 WHERE id=?", (edit_lat, edit_lng, edit_loc_link, now(), cid))
+                
+            db.execute('''UPDATE orders SET order_number=?,client_id=?,seller_id=?,seller_name=?,status=?,urgency=?,sale_date=?,expected_delivery_date=?,invoice_limit_date=?,payment_method=?,total_value=?,weight_kg=?,delivery_address=?,location_link=?,latitude=?,longitude=?,route_name=?,city=?,notes=?,invoice_number=?,invoiced_at=?,driver_id=?,vehicle_id=?,delivered_at=?,updated_at=?,version=COALESCE(version,1)+1 WHERE id=?''',(order_no,cid,u['id'],seller_name,status,'Normal',sale,deadline,'',payload['payment_method'],value,weight,(d.get('delivery_address') or '').strip(),edit_loc_link,edit_lat,edit_lng,resolved_route_name,upper_text(d.get('city')),payload['notes'],invoice_number,d.get('invoiced_at'),d.get('driver_id') or None,d.get('vehicle_id') or None,delivered_at,now(),oid))
             item=db.execute('SELECT id FROM order_items WHERE order_id=? ORDER BY id LIMIT 1',(oid,)).fetchone()
             if item:
                 db.execute('UPDATE order_items SET weight_kg=?, notes=? WHERE id=?',(weight,d.get('notes'),item['id']))
@@ -3833,7 +5386,11 @@ document.addEventListener('DOMContentLoaded', function(){
                             WHERE o.id=?''',(oid,)).fetchone()
             if not r:
                 return self.fail(u,'Não encontrado','Pedido não encontrado.',404)
-            items=db.execute('SELECT * FROM order_items WHERE order_id=?',(oid,)).fetchall(); hist=db.execute('SELECT h.*,u.name user FROM order_history h LEFT JOIN users u ON u.id=h.user_id WHERE h.order_id=? ORDER BY h.id ASC',(oid,)).fetchall(); probs=db.execute('SELECT * FROM delivery_problems WHERE order_id=? ORDER BY id DESC',(oid,)).fetchall()
+            items=db.execute('SELECT * FROM order_items WHERE order_id=?',(oid,)).fetchall()
+            if _ERP_AVAILABLE and (not items or any('Carga/volume' in (it['product_name'] or '') for it in items)):
+                if enrich_order_items_from_erp(db, oid, r['order_number']):
+                    items=db.execute('SELECT * FROM order_items WHERE order_id=?',(oid,)).fetchall()
+            hist=db.execute('SELECT h.*,u.name user FROM order_history h LEFT JOIN users u ON u.id=h.user_id WHERE h.order_id=? ORDER BY h.id ASC',(oid,)).fetchall(); probs=db.execute('SELECT * FROM delivery_problems WHERE order_id=? ORDER BY id DESC',(oid,)).fetchall()
             receipt=db.execute('SELECT * FROM delivery_receipts WHERE order_id=? ORDER BY id DESC LIMIT 1',(oid,)).fetchone()
             route_info=self.order_route_info(db,oid)
 
@@ -3897,10 +5454,124 @@ document.addEventListener('DOMContentLoaded', function(){
                 </div>
             </section>'''
 
+        # Análise de Lead Time & Gargalo do Pedido
+        d_sale = None
+        d_inv = None
+        d_del = None
+        try:
+            if r['sale_date']:
+                d_sale = datetime.strptime(str(r['sale_date'])[:10], '%Y-%m-%d').date()
+        except Exception:
+            pass
+        try:
+            if r['invoiced_at']:
+                d_inv = datetime.strptime(str(r['invoiced_at'])[:10], '%Y-%m-%d').date()
+        except Exception:
+            pass
+        try:
+            if r['delivered_at']:
+                d_del = datetime.strptime(str(r['delivered_at'])[:10], '%Y-%m-%d').date()
+        except Exception:
+            pass
+
+        # Fallback de faturamento para pedidos já faturados sem invoiced_at preenchido
+        if not d_inv and normalize_order_status(r['status']) in ('Faturado', 'Saiu para entrega', 'Acertado'):
+            try:
+                if r['updated_at']:
+                    d_inv = datetime.strptime(str(r['updated_at'])[:10], '%Y-%m-%d').date()
+                elif d_sale:
+                    d_inv = d_sale
+            except Exception:
+                d_inv = d_sale
+
+        days_s2i = (d_inv - d_sale).days if (d_sale and d_inv) else None
+        days_i2d = (d_del - d_inv).days if (d_inv and d_del) else None
+        days_tot = (d_del - d_sale).days if (d_sale and d_del) else None
+
+        today_dt = date.today()
+        if d_del:
+            if days_s2i is not None and days_i2d is not None:
+                if days_s2i > days_i2d:
+                    bot_stage = "Comercial"
+                    bot_desc = f"Faturamento demorou mais ({days_s2i}d no faturamento vs {days_i2d}d na entrega)"
+                    bot_color = "#2563eb"
+                elif days_i2d > days_s2i:
+                    bot_stage = "Logística"
+                    bot_desc = f"Expedição/entrega demorou mais ({days_i2d}d na logística vs {days_s2i}d no faturamento)"
+                    bot_color = "#d97706"
+                else:
+                    bot_stage = "Equilibrado"
+                    bot_desc = f"Tempos iguais nas duas etapas ({days_s2i}d em cada)"
+                    bot_color = "#15803d"
+            elif days_s2i is not None:
+                bot_stage = "Comercial"
+                bot_desc = f"Venda faturada em {days_s2i} dia(s)"
+                bot_color = "#2563eb"
+            elif days_i2d is not None:
+                bot_stage = "Logística"
+                bot_desc = f"Entregue em {days_i2d} dia(s) após faturar"
+                bot_color = "#d97706"
+            else:
+                bot_stage = "Concluído"
+                bot_desc = "Pedido entregue e concluído"
+                bot_color = "#15803d"
+        elif normalize_order_status(r['status']) == 'Cancelado':
+            bot_stage = "Cancelado"
+            bot_desc = "Pedido cancelado"
+            bot_color = "#64748b"
+        elif normalize_order_status(r['status']) == 'Venda' or not d_inv:
+            wait_days = (today_dt - d_sale).days if d_sale else 0
+            bot_stage = "Comercial"
+            bot_desc = f"Aguardando faturamento há {wait_days} dia(s)"
+            bot_color = "#b91c1c" if wait_days > 2 else "#2563eb"
+        else:
+            wait_days = (today_dt - d_inv).days
+            bot_stage = "Logística"
+            bot_desc = f"Aguardando carga/entrega há {wait_days} dia(s) após faturamento"
+            bot_color = "#b91c1c" if wait_days > 3 else "#d97706"
+
+        fat_label = brdate(r['invoiced_at']) if r['invoiced_at'] else ('Concluído' if normalize_order_status(r['status']) in ('Faturado', 'Saiu para entrega', 'Acertado') else 'Pendente')
+
+        lead_time_panel = f'''<section class="panel" style="border-left:5px solid {bot_color};">
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                <h2 style="margin:0; font-size:1.05rem; color:#1e293b; display:flex; align-items:center; gap:8px;">
+                    <span>⏱️</span> Análise de Lead Time &amp; Gargalo
+                </h2>
+                <span class="badge" style="background:{bot_color}; color:#fff; font-weight:700; font-size:0.85rem; padding:4px 10px; border-radius:12px;">
+                    Gargalo: {esc(bot_stage)}
+                </span>
+            </div>
+            <p style="margin:6px 0 12px 0; color:#475569; font-size:0.88rem;">{esc(bot_desc)}</p>
+            <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:12px;">
+                <div style="background:#f1f5f9; padding:10px 14px; border-radius:8px; border:1px solid #e2e8f0;">
+                    <div style="font-size:0.75rem; text-transform:uppercase; color:#64748b; font-weight:700;">1. Comercial (Venda ➔ Fat.)</div>
+                    <div style="font-size:1.25rem; font-weight:800; color:#1e293b; margin-top:2px;">
+                        {f"{days_s2i} dia(s)" if days_s2i is not None else ("Aguardando..." if normalize_order_status(r['status']) == 'Venda' else "0 dia(s)")}
+                    </div>
+                    <div style="font-size:0.75rem; color:#64748b; margin-top:2px;">Venda: {brdate(r['sale_date']) or '—'} ➔ Fat: {fat_label}</div>
+                </div>
+                <div style="background:#f1f5f9; padding:10px 14px; border-radius:8px; border:1px solid #e2e8f0;">
+                    <div style="font-size:0.75rem; text-transform:uppercase; color:#64748b; font-weight:700;">2. Logística (Fat. ➔ Entrega)</div>
+                    <div style="font-size:1.25rem; font-weight:800; color:#1e293b; margin-top:2px;">
+                        {f"{days_i2d} dia(s)" if days_i2d is not None else ("Em andamento..." if d_inv and not d_del else "—")}
+                    </div>
+                    <div style="font-size:0.75rem; color:#64748b; margin-top:2px;">Fat: {brdate(r['invoiced_at']) or '—'} ➔ Entr: {brdate(r['delivered_at']) or 'Pendente'}</div>
+                </div>
+                <div style="background:#f1f5f9; padding:10px 14px; border-radius:8px; border:1px solid #e2e8f0;">
+                    <div style="font-size:0.75rem; text-transform:uppercase; color:#64748b; font-weight:700;">Ciclo Total (Venda ➔ Entrega)</div>
+                    <div style="font-size:1.25rem; font-weight:800; color:{'#15803d' if days_tot is not None else '#1e293b'}; margin-top:2px;">
+                        {f"{days_tot} dia(s)" if days_tot is not None else "Em andamento"}
+                    </div>
+                    <div style="font-size:0.75rem; color:#64748b; margin-top:2px;">Limite acordado: {brdate(r['expected_delivery_date']) or '—'}</div>
+                </div>
+            </div>
+        </section>'''
+
         # --- Linha do tempo visual usando order_history real ---
         flow_steps = [
             ('Venda',           '📝', 'Pedido criado'),
             ('Faturado',        '🧾', 'Faturamento'),
+            ('Carga Montada',   '📦', 'Carga montada (Aguardando saída)'),
             ('Saiu para entrega','🚚', 'Saiu em rota'),
             ('Acertado',        '✅', 'Acerto finalizado'),
         ]
@@ -3916,7 +5587,7 @@ document.addEventListener('DOMContentLoaded', function(){
             status_to_hist['Problema'] = {'date': str(r_delivered_at)[:10], 'time': '', 'user': ''}
 
         current_status = normalize_order_status(r['status'])
-        flow_order = ['Venda','Faturado','Saiu para entrega','Acertado']
+        flow_order = ['Venda','Faturado','Carga Montada','Saiu para entrega','Acertado']
         current_idx = flow_order.index(current_status) if current_status in flow_order else -1
         is_late = r['expected_delivery_date'] and str(r['expected_delivery_date']) < today() and current_status not in ('Acertado','Problema','Cancelado')
 
@@ -3942,9 +5613,9 @@ document.addEventListener('DOMContentLoaded', function(){
         hist_rows=''.join(f'<li><b>{esc(h["action"])}</b> · {esc(h["old_status"] or "—")} → {esc(h["new_status"] or "—")}<br><small>{brdate(h["created_at"])} {esc(str(h["created_at"])[11:16])} · {esc(h["user"] or "Sistema")} · {esc(h["notes"] or "")}</small></li>' for h in reversed(hist)) or '<li>Sem histórico.</li>'
         item_rows=''.join(f'<tr><td>{esc(it["product_code"] or "—")}</td><td>{esc(it["product_name"])}</td><td>{esc(it["quantity"])} {esc(it["unit"] or "")}</td><td>{fmt_num(it["weight_kg"])} kg</td><td>{esc(it["notes"] or "")}</td></tr>' for it in items) or '<tr><td colspan="5">Sem itens cadastrados.</td></tr>'
         prob_rows=''.join(f'<li><b>{esc(p["problem_type"])}</b><br><small>{esc(p["description"])} · {brdate(p["created_at"])}</small></li>' for p in probs) or '<li>Nenhum problema registrado.</li>'
-        if is_god(u):
-            delete_action = f"""<form method='post' action='/orders/{oid}/delete' class='inline-form needs-confirm' data-confirm-text='⚠️ ATENÇÃO GOD: Confirma apagar definitivamente este pedido #{esc(r["order_number"])} e remover todos os seus vínculos de faturamento e carga?'>
-                <button class='danger-btn' style='background:#dc2626;border-color:#b91c1c;font-weight:800;'>⚡ Excluir Definitivamente (GOD Override)</button>
+        if is_admin(u) or can_manage_catalog_deletions(u):
+            delete_action = f"""<form method='post' action='/orders/{oid}/delete' class='inline-form needs-confirm' data-confirm-text='⚠️ ATENÇÃO: Confirma apagar definitivamente este pedido #{esc(r["order_number"])} e remover todos os seus vínculos de faturamento e carga?'>
+                <button class='danger-btn' style='background:#dc2626;border-color:#b91c1c;font-weight:800;'>⚡ Excluir Definitivamente (Controle Total)</button>
             </form>"""
         else:
             delete_action = f"""<form method='post' action='/orders/{oid}/delete' class='inline-form needs-confirm' data-confirm-text='Confirma apagar este pedido definitivamente?'>
@@ -3972,9 +5643,26 @@ document.addEventListener('DOMContentLoaded', function(){
             if route_info and normalize_route_status(route_info['route_status']) == 'Em rota':
                 reopen_targets.insert(0,'Saiu para entrega')
             reopen_form = f"""<section class='panel no-print'><h2>Reabertura controlada</h2><form method='post' action='/orders/{oid}/reopen' class='form compact needs-confirm' data-confirm-text='Confirma reabrir este pedido finalizado?'><div class='grid3'><label>Destino<select name='target_status'>{option(reopen_targets,'Faturado')}</select></label><label class='full'>Motivo obrigatório<textarea name='reason' required placeholder='Descreva o motivo operacional da reabertura...'></textarea></label></div><button class='danger-btn'>Reabrir pedido</button></form></section>"""
-        content=f'''<section class="order-hero"><div><span>{esc(r['order_number'])}</span><h2>{esc(r['client'] or 'Cliente não informado')}</h2><p>{esc(r['farm_name'] or r['delivery_address'] or '')}</p></div><div>{badge(r['status'])}{deadline_pill(r['expected_delivery_date'],r['status'])}</div></section>{assisted}{actions}{receipt_panel}
+
+        # Badge e campos detalhados de Nota Fiscal
+        has_nf = bool(r['invoice_number'] and str(r['invoice_number']).strip() not in ('', '0', '0.0', 'None', 'null'))
+        if has_nf:
+            nf_hero_badge = f'''<span class="badge" style="background:#047857; color:#fff; font-size:0.95rem; font-weight:800; padding:6px 14px; border-radius:8px; display:inline-flex; align-items:center; gap:6px; box-shadow:0 1px 2px rgba(0,0,0,0.12);">🧾 Nota Fiscal: Nº {esc(r['invoice_number'])}</span>'''
+            nf_field_html = f'''<p><b>Nota Fiscal (NF)</b><strong style="color:#047857; font-size:1.1rem; font-weight:800;">🧾 Nº {esc(r['invoice_number'])}</strong></p>'''
+            fat_date_html = f'''<p><b>Data Faturamento</b><strong style="color:#1e293b;">{brdate(r['invoiced_at']) if r['invoiced_at'] else 'Confirmado no ERP'}</strong></p>'''
+        else:
+            is_fat_status = normalize_order_status(r['status']) in ('Faturado', 'Saiu para entrega', 'Acertado')
+            if is_fat_status:
+                nf_hero_badge = f'''<span class="badge" style="background:#fef3c7; color:#92400e; border:1px solid #fde68a; font-size:0.85rem; font-weight:700; padding:5px 12px; border-radius:8px;">⏳ Faturado (NF Pendente de sincronização)</span>'''
+                nf_field_html = f'''<p><b>Nota Fiscal (NF)</b><span style="color:#b45309; font-weight:700;">Aguardando retorno do número de NF do ERP</span></p>'''
+            else:
+                nf_hero_badge = f'''<span class="badge" style="background:#f1f5f9; color:#475569; border:1px solid #cbd5e1; font-size:0.85rem; font-weight:700; padding:5px 12px; border-radius:8px;">📝 Pedido em Venda (Não Faturado)</span>'''
+                nf_field_html = f'''<p><b>Nota Fiscal (NF)</b><span class="muted">Pendente (Aguardando faturamento no ERP)</span></p>'''
+            fat_date_html = f'''<p><b>Data Faturamento</b><span class="muted">—</span></p>'''
+
+        content=f'''<section class="order-hero"><div><span>{esc(r['order_number'])}</span><h2>{esc(r['client'] or 'Cliente não informado')}</h2><p>{esc(r['farm_name'] or r['delivery_address'] or '')}</p></div><div style="display:flex; flex-direction:column; align-items:flex-end; gap:6px;"><div>{badge(r['status'])}{deadline_pill(r['expected_delivery_date'],r['status'])}</div><div>{nf_hero_badge}</div></div></section>{assisted}{actions}{receipt_panel}{lead_time_panel}
         <section class="panel"><h2>Linha do Tempo</h2><div class="order-timeline">{timeline_steps}</div></section>
-        <div class="detail-grid"><section class="panel"><h2>Dados do pedido</h2><div class="info-grid"><p><b>Documento fiscal</b>{esc(r['invoice_number'] or 'Pendente')}</p><p><b>Venda</b>{brdate(r['sale_date'])}</p><p><b>Prazo limite</b>{brdate(r['expected_delivery_date'])}</p><p><b>Peso</b>{fmt_num(r['weight_kg'])} kg</p>{value_info}<p><b>Vendedor</b>{esc(r['seller_name'] or 'Não informado')}</p><p><b>Cadastrante</b>{esc(r['seller'] or '—')}</p></div></section><section class="panel"><h2>Entrega</h2><div class="info-grid"><p><b>Cidade</b>{esc(r['city'] or r['client_city'] or '—')}</p><p><b>Rota</b>{esc(r['route_name'] or '—')}</p><p><b>Motorista</b>{esc(r['driver'] or '—')}</p><p><b>Veículo</b>{esc((r['vehicle'] or '')+' '+(r['plate'] or ''))}</p><p><b>Recebido por</b>{esc(r['delivered_to'] or '—')}</p><p><b>Entrega em</b>{brdate(r['delivered_at'])}</p></div></section></div><section class="panel"><h2>Itens</h2><table><thead><tr><th>Código</th><th>Produto</th><th>Qtd</th><th>Peso</th><th>Obs.</th></tr></thead><tbody>{item_rows}</tbody></table></section><div class="detail-grid"><section class="panel"><h2>Histórico completo</h2><ul class="timeline-list">{hist_rows}</ul></section><section class="panel"><h2>Problemas registrados</h2><ul class="problems">{prob_rows}</ul></section></div>{problem_form}{schedule_form}{reopen_form}'''
+        <div class="detail-grid"><section class="panel"><h2>Dados do pedido</h2><div class="info-grid">{nf_field_html}{fat_date_html}<p><b>Venda</b>{brdate(r['sale_date'])}</p><p><b>Prazo limite</b>{brdate(r['expected_delivery_date'])}</p><p><b>Peso</b>{fmt_num(r['weight_kg'])} kg</p>{value_info}<p><b>Vendedor</b>{esc(resolve_seller_name(r['seller_name']))}</p><p><b>Cadastrante</b>{esc(r['seller'] or '—')}</p></div></section><section class="panel"><h2>Entrega</h2><div class="info-grid"><p><b>Cidade</b>{esc(r['city'] or r['client_city'] or '—')}</p><p><b>Rota</b>{esc(r['route_name'] or '—')}</p><p><b>Motorista</b>{esc(r['driver'] or '—')}</p><p><b>Veículo</b>{esc((r['vehicle'] or '')+' '+(r['plate'] or ''))}</p><p><b>Recebido por</b>{esc(r['delivered_to'] or '—')}</p><p><b>Entrega em</b>{brdate(r['delivered_at'])}</p></div></section></div><section class="panel"><h2>Itens</h2><table><thead><tr><th>Código</th><th>Produto</th><th>Qtd</th><th>Peso</th><th>Obs.</th></tr></thead><tbody>{item_rows}</tbody></table></section><div class="detail-grid"><section class="panel"><h2>Histórico completo</h2><ul class="timeline-list">{hist_rows}</ul></section><section class="panel"><h2>Problemas registrados</h2><ul class="problems">{prob_rows}</ul></section></div>{problem_form}{schedule_form}{reopen_form}'''
         return self.send_html(layout(u,f'Pedido {r["order_number"]}',content,'Acompanhamento completo do pedido'))
 
 
@@ -3994,7 +5682,7 @@ document.addEventListener('DOMContentLoaded', function(){
                 db.execute("UPDATE route_orders SET status='Com problema' WHERE order_id=?",(oid,))
             elif new=='Saiu para entrega':
                 db.execute("UPDATE route_orders SET status='Em rota' WHERE order_id=?",(oid,))
-            elif new in ('Venda','Faturado','Agendado'):
+            elif new in ('Venda','Faturado','Carga Montada','Agendado'):
                 db.execute("UPDATE route_orders SET status='Pendente' WHERE order_id=? AND status<>'Entregue'",(oid,))
             elif new=='Acertado':
                 db.execute("UPDATE route_orders SET status='Entregue' WHERE order_id=?",(oid,))
@@ -4112,52 +5800,50 @@ document.addEventListener('DOMContentLoaded', function(){
         self.redirect(f'/orders/{oid}')
 
     def post_order_delete(self, u, oid):
+        if not (is_admin(u) or can_manage_catalog_deletions(u) or self.has_perm(u, 'cancel_orders')):
+            return self.fail(u, 'Acesso negado', 'Seu usuário não tem permissão para apagar pedidos.', 403)
         with conn() as db:
             row=db.execute('SELECT id,order_number,status FROM orders WHERE id=?',(oid,)).fetchone()
             if not row:
                 return self.fail(u,'Não encontrado','Pedido não encontrado.',404)
             order_status=normalize_order_status(row['status'])
 
-            # GOD OVERRIDE: GOD pode apagar qualquer pedido em qualquer status
-            if is_god(u):
-                db.execute('DELETE FROM route_orders WHERE order_id=?', (oid,))
-                db.execute('DELETE FROM delivery_receipts WHERE order_id=?', (oid,))
-                db.execute('DELETE FROM delivery_problems WHERE order_id=?', (oid,))
-                db.execute('DELETE FROM order_items WHERE order_id=?', (oid,))
-                db.execute('DELETE FROM order_history WHERE order_id=?', (oid,))
-                db.execute('DELETE FROM orders WHERE id=?', (oid,))
-                audit(db, u, 'Excluiu pedido (GOD Override)', 'Pedidos', row['order_number'], order_status, 'Exclusão forçada GOD')
-                db.commit()
-                return self.redirect('/orders')
+            # Controle Total: GOD, Admin e usuários com permissão total de gerenciamento
+            has_total_control = bool(is_admin(u) or can_manage_catalog_deletions(u) or is_god(u))
 
-            if order_status not in ('Venda','Cancelado'):
-                return self.fail(
-                    u,
-                    'Exclusão bloqueada',
-                    f'Pedido em status "{order_status}" não pode ser apagado. Cancele o pedido e remova vínculos antes de apagar.',
-                    400,
-                )
-            active_route_link=db.execute("""SELECT COUNT(*) c
-                                            FROM route_orders ro
-                                            JOIN routes r ON r.id=ro.route_id
-                                            WHERE ro.order_id=? AND r.status IN ('Planejada','Em rota')""",(oid,)).fetchone()['c']
-            if active_route_link:
-                return self.fail(
-                    u,
-                    'Exclusão bloqueada',
-                    'Este pedido está vinculado a carga ativa e não pode ser apagado.',
-                    400,
-                )
-            any_route_link=db.execute('SELECT COUNT(*) c FROM route_orders WHERE order_id=?',(oid,)).fetchone()['c']
-            if any_route_link:
-                return self.fail(
-                    u,
-                    'Exclusão bloqueada',
-                    'Este pedido possui histórico de carga e não pode ser apagado. Mantenha-o no histórico para auditoria.',
-                    400,
-                )
-            db.execute('DELETE FROM orders WHERE id=?',(oid,))
-            audit(db,u,'Apagou pedido','Pedidos',row['order_number'],order_status,'')
+            if not has_total_control:
+                if order_status not in ('Venda','Cancelado'):
+                    return self.fail(
+                        u,
+                        'Exclusão bloqueada',
+                        f'Pedido em status "{order_status}" não pode ser apagado por seu perfil. Cancele o pedido antes de apagar ou solicite a um administrador.',
+                        400,
+                    )
+                active_route_link=db.execute("""SELECT COUNT(*) c
+                                                FROM route_orders ro
+                                                JOIN routes r ON r.id=ro.route_id
+                                                WHERE ro.order_id=? AND r.status IN ('Planejada','Em rota')""",(oid,)).fetchone()['c']
+                if active_route_link:
+                    return self.fail(
+                        u,
+                        'Exclusão bloqueada',
+                        'Este pedido está vinculado a uma carga ativa (Planejada/Em rota) e não pode ser apagado.',
+                        400,
+                    )
+
+            # Limpeza completa em cascata de todas as tabelas vinculadas antes de excluir o pedido
+            db.execute('DELETE FROM driver_delivery_operations WHERE order_id=?', (oid,))
+            db.execute('DELETE FROM route_orders WHERE order_id=?', (oid,))
+            db.execute('DELETE FROM delivery_receipts WHERE order_id=?', (oid,))
+            db.execute('DELETE FROM delivery_problems WHERE order_id=?', (oid,))
+            db.execute('DELETE FROM attachments WHERE order_id=?', (oid,))
+            db.execute('DELETE FROM order_items WHERE order_id=?', (oid,))
+            db.execute('DELETE FROM order_history WHERE order_id=?', (oid,))
+            db.execute('DELETE FROM orders WHERE id=?', (oid,))
+            db.execute('INSERT OR REPLACE INTO deleted_orders (order_number, deleted_at, deleted_by, reason) VALUES (?, ?, ?, ?)', (row['order_number'], now(), u['id'], 'Exclusão pelo usuário'))
+
+            audit_detail = 'Exclusão com controle total (GOD/Admin Override)' if has_total_control else 'Exclusão padrão'
+            audit(db, u, 'Apagou pedido', 'Pedidos', row['order_number'], order_status, audit_detail)
             db.commit()
         self.redirect('/orders')
 
@@ -4186,7 +5872,7 @@ document.addEventListener('DOMContentLoaded', function(){
                               FROM route_orders ro
                               JOIN orders o ON o.id=ro.order_id
                               WHERE ro.route_id=?""",(rid,)).fetchall()
-            target_order_status = 'Saiu para entrega' if new_route == 'Em rota' else 'Faturado'
+            target_order_status = 'Saiu para entrega' if new_route == 'Em rota' else 'Carga Montada'
             target_ro_status = 'Em rota' if new_route == 'Em rota' else 'Pendente'
             for ro in ros:
                 old_order=normalize_order_status(ro['status'])
@@ -4208,18 +5894,21 @@ document.addEventListener('DOMContentLoaded', function(){
                 return self.fail(u,'Não encontrado','Carga não encontrada.',404)
             route_status=normalize_route_status(route['status'])
 
-            # GOD OVERRIDE: GOD pode apagar qualquer carga em qualquer status
-            if is_god(u):
-                ros=db.execute("SELECT order_id, status FROM route_orders WHERE route_id=?", (rid,)).fetchall()
+            # GOD/Admin OVERRIDE: GOD e Admin podem apagar qualquer carga em qualquer status
+            if is_god(u) or is_admin(u) or can_manage_catalog_deletions(u):
+                ros=db.execute("SELECT ro.order_id, o.status FROM route_orders ro JOIN orders o ON o.id=ro.order_id WHERE ro.route_id=?", (rid,)).fetchall()
                 for ro in ros:
                     old_order=normalize_order_status(ro['status'])
-                    if old_order == 'Saiu para entrega':
+                    if old_order in ('Saiu para entrega', 'Carga Montada'):
                         self.ensure_order_status(db, ro['order_id'], 'Faturado')
+                        db.execute("UPDATE orders SET status='Faturado',updated_at=?,version=COALESCE(version,1)+1 WHERE id=?",(now(),ro['order_id']))
+                        add_hist(db,ro['order_id'],u['id'],old_order,'Faturado','Carga apagada: pedido retornou para faturado',route['name'])
+                db.execute("DELETE FROM driver_delivery_operations WHERE route_id=?", (rid,))
                 db.execute("DELETE FROM route_orders WHERE route_id=?", (rid,))
                 db.execute("DELETE FROM delivery_receipts WHERE route_id=?", (rid,))
                 db.execute("DELETE FROM delivery_problems WHERE route_id=?", (rid,))
                 db.execute("DELETE FROM routes WHERE id=?", (rid,))
-                audit(db, u, 'Apagou carga (GOD Override)', 'Rotas', route['route_name'] or f"#{rid}", route_status, 'Exclusão forçada GOD')
+                audit(db, u, 'Apagou carga (Controle Total)', 'Rotas', route['route_name'] or f"#{rid}", route_status, 'Exclusão forçada com controle total')
                 db.commit()
                 return self.redirect('/routes')
 
@@ -4245,10 +5934,14 @@ document.addEventListener('DOMContentLoaded', function(){
                     )
             for ro in ros:
                 old_order=normalize_order_status(ro['status'])
-                if old_order == 'Saiu para entrega':
+                if old_order in ('Saiu para entrega', 'Carga Montada'):
                     self.ensure_order_status(db,ro['order_id'],'Faturado')
                     db.execute("UPDATE orders SET status='Faturado',updated_at=?,version=COALESCE(version,1)+1 WHERE id=?",(now(),ro['order_id']))
                     add_hist(db,ro['order_id'],u['id'],old_order,'Faturado','Carga apagada: pedido retornou para faturado',route['name'])
+            db.execute("DELETE FROM driver_delivery_operations WHERE route_id=?", (rid,))
+            db.execute("DELETE FROM route_orders WHERE route_id=?", (rid,))
+            db.execute("DELETE FROM delivery_receipts WHERE route_id=?", (rid,))
+            db.execute("DELETE FROM delivery_problems WHERE route_id=?", (rid,))
             db.execute('DELETE FROM routes WHERE id=?',(rid,))
             audit(db,u,'Apagou carga','Rotas',route['name'],route_status,'')
             db.commit()
@@ -4323,8 +6016,8 @@ document.addEventListener('DOMContentLoaded', function(){
                 <input type="hidden" name="redirect" value="/faturamento">
                 <div class="invoice-main">
                     <div class="invoice-order-block"><span class="label">Pedido</span><b>{esc(r['order_number'])}</b>{badge(r['status'])}</div>
-                    <div class="invoice-client-block"><span class="label">Cliente</span><b>{esc(r['client'] or 'Cliente não informado')}</b><small>Vendedor: {esc(r['seller_name'] or 'Não informado')} · {esc(r['city'] or r['client_city'] or 'Cidade não informada')} · {fmt_num(r['weight_kg'])} kg</small></div>
-                    <div class="invoice-sla-block"><span class="label">SLA</span>{deadline_pill(r['expected_delivery_date'],r['status'])}<small>Prazo limite: {brdate(r['expected_delivery_date'])}</small></div>
+                    <div class="invoice-client-block"><span class="label">Cliente</span><b>{esc(r['client'] or 'Cliente não informado')}</b><small>Vendedor: {esc(resolve_seller_name(r['seller_name']))} · {esc(r['city'] or r['client_city'] or 'Cidade não informada')} · {fmt_num(r['weight_kg'])} kg</small></div>
+                    <div class="invoice-sla-block"><span class="label">Venda / SLA</span><small class="muted">Venda: {brdate(r['sale_date'])}</small><small>Prazo limite: {brdate(r['expected_delivery_date'])}</small>{deadline_pill(r['expected_delivery_date'],r['status'])}</div>
                 </div>
                 <div class="invoice-action-grid">
                     <label class="inv-input"><span>Nota fiscal</span><input name="invoice_number" placeholder="Número da NF" required autocomplete="off"></label>
@@ -4343,12 +6036,29 @@ document.addEventListener('DOMContentLoaded', function(){
 
     def expedicao(self,u):
         with conn() as db:
-            rows=db.execute("""SELECT o.*,c.name client,c.farm_name,c.city client_city FROM orders o LEFT JOIN clients c ON c.id=o.client_id WHERE o.status='Faturado' ORDER BY o.expected_delivery_date,o.id DESC""").fetchall()
+            rows=db.execute("""SELECT o.*,c.name client,c.farm_name,c.city client_city,
+                                      r.id route_id, r.name route_name_load
+                               FROM orders o
+                               LEFT JOIN clients c ON c.id=o.client_id
+                               LEFT JOIN route_orders ro ON ro.order_id=o.id
+                               LEFT JOIN routes r ON r.id=ro.route_id AND r.status IN ('Planejada','Em rota')
+                               WHERE o.status IN ('Faturado', 'Carga Montada')
+                               ORDER BY o.expected_delivery_date,o.id DESC""").fetchall()
         lanes=[]
-        for st,next_st,label in [('Faturado','Faturado','Aguardando saída em carga')]:
-            lane=''.join(f'''<article class="kanban-card"><div>{badge(r['status'])}</div><h3>{esc(r['order_number'])}</h3><p>{esc(r['client'] or '')}<br><small>Vendedor: {esc(r['seller_name'] or 'Não informado')} · {esc(r['city'] or r['client_city'] or '')} · {fmt_num(r['weight_kg'])} kg · {deadline_pill(r['expected_delivery_date'],r['status'])}</small></p><div class="row-actions"><a class="btn small ghost" href="/orders/{r['id']}">Abrir</a><a class="btn small" href="/routes/new">{label}</a></div></article>''' for r in rows if r['status']==st)
-            lanes.append(f'<section class="kanban-lane"><h2>{esc(st)}</h2>{lane or "<div class=empty>Fila vazia</div>"}</section>')
-        return self.send_html(layout(u,'Expedição / Separação','<div class="kanban">'+''.join(lanes)+'</div>','Painel visual de faturados aguardando saída em carga'))
+        configs = [
+            ('Faturado', 'Aguardando montagem de carga', '/routes/new', 'Montar Carga'),
+            ('Carga Montada', 'Carga montada (Aguardando saída)', '/routes', 'Ver Carga'),
+        ]
+        for st, lane_title, default_url, default_btn_text in configs:
+            lane_cards = []
+            for r in rows:
+                if r['status'] == st:
+                    card_url = f"/routes/{r['route_id']}" if (st == 'Carga Montada' and r['route_id']) else default_url
+                    card_btn_text = f"Carga #{r['route_id']}" if (st == 'Carga Montada' and r['route_id']) else default_btn_text
+                    load_info = f"<br><small style='color:#6b21a8; font-weight:600;'>📦 {esc(r['route_name_load'] or f'Carga #{r['route_id']}')}</small>" if (st == 'Carga Montada' and r['route_id']) else ""
+                    lane_cards.append(f'''<article class="kanban-card"><div>{badge(r['status'])}</div><h3>{esc(r['order_number'])}</h3><p>{esc(r['client'] or '')}{load_info}<br><small>Vendedor: {esc(resolve_seller_name(r['seller_name']))} · Venda: {brdate(r['sale_date'])} · Limite: {brdate(r['expected_delivery_date'])} · {esc(r['city'] or r['client_city'] or '')} · {fmt_num(r['weight_kg'])} kg · {deadline_pill(r['expected_delivery_date'],r['status'])}</small></p><div class="row-actions"><a class="btn small ghost" href="/orders/{r['id']}">Abrir</a><a class="btn small" href="{card_url}">{card_btn_text}</a></div></article>''')
+            lanes.append(f'<section class="kanban-lane"><h2>{esc(lane_title)} ({len(lane_cards)})</h2>{"".join(lane_cards) or "<div class=empty>Fila vazia</div>"}</section>')
+        return self.send_html(layout(u,'Expedição / Separação','<div class="kanban">'+''.join(lanes)+'</div>','Painel visual de faturados e cargas aguardando saída'))
 
     def validate_phone(self, value, field='telefone'):
         raw = (value or '').strip()
@@ -4647,6 +6357,7 @@ document.addEventListener('DOMContentLoaded', function(){
 
     def routes(self,u):
         qs=parse_qs(urlparse(self.path).query)
+        q=qs.get('q',[''])[0].strip()
         hist_page=max(1,parse_int(qs.get('hist_page',['1'])[0],1))
         hist_size=12
         hist_offset=(hist_page-1)*hist_size
@@ -4654,9 +6365,48 @@ document.addEventListener('DOMContentLoaded', function(){
             self.recalc_all_routes(db)
             regularized=self.ensure_in_route_loads(db)
             self.recalc_all_routes(db)
-            active_routes=db.execute("""SELECT r.*,d.name driver,v.name vehicle,v.plate,COUNT(ro.id) orders_count FROM routes r LEFT JOIN drivers d ON d.id=r.driver_id LEFT JOIN vehicles v ON v.id=r.vehicle_id LEFT JOIN route_orders ro ON ro.route_id=r.id WHERE r.status IN ('Planejada','Em rota') GROUP BY r.id ORDER BY CASE r.status WHEN 'Planejada' THEN 0 WHEN 'Em rota' THEN 1 ELSE 2 END,r.date DESC,r.id DESC""").fetchall()
-            closed_routes=db.execute(f"""SELECT r.*,d.name driver,v.name vehicle,v.plate,COUNT(ro.id) orders_count FROM routes r LEFT JOIN drivers d ON d.id=r.driver_id LEFT JOIN vehicles v ON v.id=r.vehicle_id LEFT JOIN route_orders ro ON ro.route_id=r.id WHERE r.status IN ('Acertada','Com problema') GROUP BY r.id ORDER BY r.date DESC,r.id DESC LIMIT {hist_size} OFFSET {hist_offset}""").fetchall()
-            closed_count=db.execute("SELECT COUNT(*) c FROM routes WHERE status IN ('Acertada','Com problema')").fetchone()['c']
+            
+            # Filtro por busca unificada 'q' se preenchido
+            q_like = f"%{q}%" if q else None
+            
+            if q:
+                active_routes=db.execute("""
+                    SELECT r.*,d.name driver,v.name vehicle,v.plate,COUNT(ro.id) orders_count 
+                    FROM routes r 
+                    LEFT JOIN drivers d ON d.id=r.driver_id 
+                    LEFT JOIN vehicles v ON v.id=r.vehicle_id 
+                    LEFT JOIN route_orders ro ON ro.route_id=r.id 
+                    WHERE r.status IN ('Planejada','Em rota') 
+                      AND (r.name LIKE ? OR r.route_name LIKE ? OR d.name LIKE ? OR v.plate LIKE ? OR CAST(r.id AS TEXT)=?)
+                    GROUP BY r.id 
+                    ORDER BY CASE r.status WHEN 'Planejada' THEN 0 WHEN 'Em rota' THEN 1 ELSE 2 END,r.date DESC,r.id DESC
+                """,(q_like, q_like, q_like, q_like, q)).fetchall()
+                
+                closed_routes=db.execute(f"""
+                    SELECT r.*,d.name driver,v.name vehicle,v.plate,COUNT(ro.id) orders_count 
+                    FROM routes r 
+                    LEFT JOIN drivers d ON d.id=r.driver_id 
+                    LEFT JOIN vehicles v ON v.id=r.vehicle_id 
+                    LEFT JOIN route_orders ro ON ro.route_id=r.id 
+                    WHERE r.status IN ('Acertada','Com problema')
+                      AND (r.name LIKE ? OR r.route_name LIKE ? OR d.name LIKE ? OR v.plate LIKE ? OR CAST(r.id AS TEXT)=?)
+                    GROUP BY r.id 
+                    ORDER BY r.date DESC,r.id DESC LIMIT {hist_size} OFFSET {hist_offset}
+                """,(q_like, q_like, q_like, q_like, q)).fetchall()
+                
+                closed_count=db.execute("""
+                    SELECT COUNT(DISTINCT r.id) c 
+                    FROM routes r 
+                    LEFT JOIN drivers d ON d.id=r.driver_id 
+                    LEFT JOIN vehicles v ON v.id=r.vehicle_id 
+                    WHERE r.status IN ('Acertada','Com problema')
+                      AND (r.name LIKE ? OR r.route_name LIKE ? OR d.name LIKE ? OR v.plate LIKE ? OR CAST(r.id AS TEXT)=?)
+                """,(q_like, q_like, q_like, q_like, q)).fetchone()['c']
+            else:
+                active_routes=db.execute("""SELECT r.*,d.name driver,v.name vehicle,v.plate,COUNT(ro.id) orders_count FROM routes r LEFT JOIN drivers d ON d.id=r.driver_id LEFT JOIN vehicles v ON v.id=r.vehicle_id LEFT JOIN route_orders ro ON ro.route_id=r.id WHERE r.status IN ('Planejada','Em rota') GROUP BY r.id ORDER BY CASE r.status WHEN 'Planejada' THEN 0 WHEN 'Em rota' THEN 1 ELSE 2 END,r.date DESC,r.id DESC""").fetchall()
+                closed_routes=db.execute(f"""SELECT r.*,d.name driver,v.name vehicle,v.plate,COUNT(ro.id) orders_count FROM routes r LEFT JOIN drivers d ON d.id=r.driver_id LEFT JOIN vehicles v ON v.id=r.vehicle_id LEFT JOIN route_orders ro ON ro.route_id=r.id WHERE r.status IN ('Acertada','Com problema') GROUP BY r.id ORDER BY r.date DESC,r.id DESC LIMIT {hist_size} OFFSET {hist_offset}""").fetchall()
+                closed_count=db.execute("SELECT COUNT(*) c FROM routes WHERE status IN ('Acertada','Com problema')").fetchone()['c']
+            
             ready=db.execute("""SELECT COUNT(*) c,COALESCE(SUM(weight_kg),0) w
                                 FROM orders o
                                 WHERE o.status='Faturado'
@@ -4668,48 +6418,184 @@ document.addEventListener('DOMContentLoaded', function(){
                                 )""").fetchone()
             inroute=db.execute("SELECT COUNT(*) c FROM routes WHERE status='Em rota'").fetchone()
             late_ready=db.execute("SELECT COUNT(*) c FROM orders WHERE status='Faturado' AND expected_delivery_date<?",(today(),)).fetchone()
-            available_ready=db.execute("""SELECT o.id,o.order_number,o.seller_name,o.expected_delivery_date,o.weight_kg,o.city,o.route_name,c.name client
-                                          FROM orders o
-                                          LEFT JOIN clients c ON c.id=o.client_id
-                                          WHERE o.status='Faturado'
-                                          AND NOT EXISTS (
-                                              SELECT 1
-                                              FROM route_orders ro
-                                              JOIN routes ar ON ar.id=ro.route_id
-                                              WHERE ro.order_id=o.id AND ar.status IN ('Planejada','Em rota')
-                                          )
-                                          ORDER BY CASE WHEN o.expected_delivery_date<? THEN 0 ELSE 1 END,o.expected_delivery_date,o.id DESC
-                                          LIMIT 40""",(today(),)).fetchall()
+            
+            if q:
+                available_ready=db.execute("""
+                    SELECT o.id,o.order_number,o.invoice_number,o.seller_name,o.sale_date,o.expected_delivery_date,o.weight_kg,o.city,o.route_name,c.name client
+                    FROM orders o
+                    LEFT JOIN clients c ON c.id=o.client_id
+                    WHERE o.status='Faturado'
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM route_orders ro
+                        JOIN routes ar ON ar.id=ro.route_id
+                        WHERE ro.order_id=o.id AND ar.status IN ('Planejada','Em rota')
+                    )
+                    AND (o.order_number LIKE ? OR c.name LIKE ? OR o.city LIKE ? OR o.route_name LIKE ?)
+                    ORDER BY CASE WHEN o.expected_delivery_date<? THEN 0 ELSE 1 END,o.expected_delivery_date,o.id DESC
+                    LIMIT 40
+                """,(q_like, q_like, q_like, q_like, today())).fetchall()
+            else:
+                available_ready=db.execute("""SELECT o.id,o.order_number,o.invoice_number,o.seller_name,o.sale_date,o.expected_delivery_date,o.weight_kg,o.city,o.route_name,c.name client
+                                              FROM orders o
+                                              LEFT JOIN clients c ON c.id=o.client_id
+                                              WHERE o.status='Faturado'
+                                              AND NOT EXISTS (
+                                                  SELECT 1
+                                                  FROM route_orders ro
+                                                  JOIN routes ar ON ar.id=ro.route_id
+                                                  WHERE ro.order_id=o.id AND ar.status IN ('Planejada','Em rota')
+                                              )
+                                              ORDER BY CASE WHEN o.expected_delivery_date<? THEN 0 ELSE 1 END,o.expected_delivery_date,o.id DESC
+                                              LIMIT 40""",(today(),)).fetchall()
             db.commit()
-        lanes={'Planejada':'','Em rota':'','Acertada':''}
+
         can_edit_routes = self.has_perm(u,'edit_routes')
         can_cancel_routes = self.has_perm(u,'cancel_routes')
         can_settle_routes = self.has_perm(u,'settle_routes')
         can_create_routes = self.has_perm(u,'create_routes')
-        def route_card(r, closed=False):
-            pct=(float(r['total_weight'] or 0)/float(r['capacity'] or 1))*100
-            actions=f"<a class='btn small' href='/routes/{r['id']}'>Abrir operação</a>"
-            if not closed and r['status']=='Planejada' and can_edit_routes:
-                actions += f"<form method='post' action='/routes/{r['id']}/dispatch'><button class='small'>Marcar saída</button></form>"
-            if not closed and r['status']=='Em rota' and can_settle_routes:
-                actions += f"<a class='btn small ghost' href='/load-settlement?q={quote(r['name'])}'>Acerto</a>"
-            if not closed and r['status'] in ('Planejada','Em rota') and can_cancel_routes:
-                actions += f"<form method='post' action='/routes/{r['id']}/cancel' class='inline-mini needs-confirm' data-confirm-text='Confirma cancelar esta carga?'><input name='reason' placeholder='Motivo' required><button class='danger-btn small'>Cancelar</button></form>"
-            if can_cancel_routes:
-                actions += f"<form method='post' action='/routes/{r['id']}/delete' class='inline-mini needs-confirm' data-confirm-text='Confirma apagar esta carga definitivamente?'><button class='danger-btn small'>Apagar</button></form>"
-            return f"""<article class='route-card ops-card {'closed-card' if closed else ''}'><div class='route-head'><div><h2>{esc(r['name'])}</h2><small>Carga #{r['id']} · {brdate(r['date'])} · {esc(r['route_name'] or 'Rota livre')}</small></div>{badge(r['status'])}</div><div class='capacity'><span style='width:{min(pct,100):.0f}%'></span></div><small>{fmt_num(r['total_weight'])} kg / {fmt_num(r['capacity'])} kg · {pct:.0f}% usado {'· acima da capacidade' if pct>100 else ''}</small><div class='route-meta'><span><b>Motorista:</b> {esc(r['driver'] or 'Definir motorista')}</span><span><b>Veículo:</b> {esc((r['vehicle'] or 'Definir veículo')+' '+(r['plate'] or ''))}</span><span><b>Pedidos:</b> {r['orders_count']}</span></div><div class='route-actions'>{actions}</div></article>"""
-        for r in active_routes:
-            lanes[r['status'] if r['status'] in lanes else 'Planejada'] += route_card(r)
-        for r in closed_routes:
-            lanes['Acertada'] += route_card(r, True)
+
+        def render_route_table(r_list, is_closed=False):
+            if not r_list:
+                return f"<div class='empty'>Nenhuma carga {'finalizada' if is_closed else 'nesta etapa'}.</div>"
+            trs = []
+            for r in r_list:
+                pct = (float(r['total_weight'] or 0)/float(r['capacity'] or 1))*100
+                cap_text = f"{fmt_num(r['total_weight'])} / {fmt_num(r['capacity'])} kg ({pct:.0f}%)"
+                cap_badge = f"<span class='badge {'danger' if pct>100 else 'ok'}' style='font-size:0.8rem;'>{cap_text}</span>"
+                
+                actions = f"<a class='btn small ghost' href='/routes/{r['id']}'>Abrir</a>"
+                if not is_closed and r['status']=='Planejada' and can_edit_routes:
+                    actions += f" <form method='post' action='/routes/{r['id']}/dispatch' style='display:inline;'><button class='btn small primary'>Marcar saída</button></form>"
+                if not is_closed and r['status']=='Em rota' and can_settle_routes:
+                    actions += f" <a class='btn small' style='background:#15803d;color:#fff;' href='/load-settlement?q={quote(r['name'])}'>Acerto</a>"
+                if not is_closed and r['status'] in ('Planejada','Em rota') and can_cancel_routes:
+                    actions += f" <form method='post' action='/routes/{r['id']}/cancel' class='inline-mini needs-confirm' data-confirm-text='Confirma cancelar esta carga?' style='display:inline;'><input name='reason' placeholder='Motivo' required style='width:90px;'><button class='danger-btn small'>Cancelar</button></form>"
+                if can_cancel_routes:
+                    actions += f" <form method='post' action='/routes/{r['id']}/delete' class='inline-mini needs-confirm' data-confirm-text='Confirma apagar esta carga definitivamente?' style='display:inline;'><button class='danger-btn small'>Apagar</button></form>"
+                
+                trs.append(
+                    f"<tr>"
+                    f"<td><b>{esc(r['name'])}</b><br><small class='muted'>Carga #{r['id']}</small></td>"
+                    f"<td>{brdate(r['date'])}</td>"
+                    f"<td><b>{esc(r['route_name'] or 'Rota livre')}</b></td>"
+                    f"<td>{esc(r['driver'] or 'Definir motorista')}</td>"
+                    f"<td>{esc((r['vehicle'] or 'Definir veículo')+' '+(r['plate'] or ''))}</td>"
+                    f"<td><span class='badge neutral'>{r['orders_count']} pedidos</span></td>"
+                    f"<td>{cap_badge}</td>"
+                    f"<td>{badge(r['status'])}</td>"
+                    f"<td style='white-space:nowrap;'>{actions}</td>"
+                    f"</tr>"
+                )
+            return f"<div class='table-wrap'><table><thead><tr><th>Carga</th><th>Data</th><th>Rota</th><th>Motorista</th><th>Veículo</th><th>Qtd Pedidos</th><th>Peso / Capacidade</th><th>Status</th><th>Ações</th></tr></thead><tbody>{''.join(trs)}</tbody></table></div>"
+
+        planejadas = [r for r in active_routes if r['status'] == 'Planejada']
+        em_rota = [r for r in active_routes if r['status'] == 'Em rota']
+
         regularized_notice = f'<div class="alert info">{regularized} carga(s) em rota foram regularizadas automaticamente porque havia pedidos com status <b>Saiu para entrega</b> sem vínculo de carga.</div>' if regularized else ''
-        ready_rows=''.join(f"<tr><td><b>{esc(o['order_number'])}</b><br><small>Vendedor: {esc(o['seller_name'] or 'Não informado')}</small></td><td>{esc(o['client'] or 'Cliente não informado')}</td><td>{esc(o['city'] or 'Sem cidade')} · {esc(o['route_name'] or 'Sem rota')}</td><td>{fmt_num(o['weight_kg'])} kg</td><td>{deadline_pill(o['expected_delivery_date'],'Faturado')}</td><td><a class='btn small ghost' href='/orders/{o['id']}'>Abrir</a></td></tr>" for o in available_ready) or "<tr><td colspan='6'>Nenhum pedido disponível para montar carga.</td></tr>"
-        hist_prev=f"<a class='btn small ghost' href='/routes?hist_page={hist_page-1}'>Página anterior</a>" if hist_page>1 else "<span class='muted'>Página anterior</span>"
+        ready_tr_list = []
+        for o in available_ready:
+            o_sale_dt = o['sale_date'] if ('sale_date' in o.keys() and o['sale_date']) else ''
+            o_sale = f"<small class='muted'>Venda: {brdate(o_sale_dt)}</small><br>" if o_sale_dt else ""
+            o_nf_pill = f"<span class='badge' style='background:#047857; color:#fff; font-size:0.75rem; font-weight:700; padding:1px 5px; border-radius:4px; margin-left:4px;'>🧾 NF {esc(o['invoice_number'])}</span>" if o['invoice_number'] else ""
+            ready_tr_list.append(
+                f"<tr><td><b>{esc(o['order_number'])}</b>{o_nf_pill}<br><small class='muted'>Vendedor: {esc(resolve_seller_name(o['seller_name']))}</small></td>"
+                f"<td>{esc(o['client'] or 'Cliente não informado')}</td>"
+                f"<td>{esc(o['city'] or 'Sem cidade')} · <b>{esc(o['route_name'] or 'Sem rota')}</b></td>"
+                f"<td>{fmt_num(o['weight_kg'])} kg</td>"
+                f"<td>{o_sale}<b>Limite: {brdate(o['expected_delivery_date'])}</b><br>{deadline_pill(o['expected_delivery_date'],'Faturado')}</td>"
+                f"<td><a class='btn small ghost' href='/orders/{o['id']}'>Abrir</a></td></tr>"
+            )
+        ready_rows = ''.join(ready_tr_list) or "<tr><td colspan='6' class='empty'>Nenhum pedido disponível para montar carga.</td></tr>"
+        hist_prev=f"<a class='btn small ghost' href='/routes?hist_page={hist_page-1}&q={quote(q)}'>Página anterior</a>" if hist_page>1 else "<span class='muted'>Página anterior</span>"
         has_next=(hist_page*hist_size)<closed_count
-        hist_next=f"<a class='btn small ghost' href='/routes?hist_page={hist_page+1}'>Próxima página</a>" if has_next else "<span class='muted'>Fim do histórico</span>"
-        create_route_cta = "<a class='btn route-cta' href='/routes/new'>+ Criar nova carga</a>" if can_create_routes else "<span class='muted'>Sem permissão para criar carga</span>"
-        content=f"""{regularized_notice}<div class='route-command clean-metrics'><div class='route-kpi'><small>Faturados sem carga</small><b>{ready['c']}</b><span>{fmt_num(ready['w'])} kg aguardando planejamento</span></div><div class='route-kpi'><small>Cargas em rota</small><b>{inroute['c']}</b><span>Cargas já liberadas para entrega</span></div><div class='route-kpi danger'><small>Faturados atrasados</small><b>{late_ready['c']}</b><span>Entram primeiro na carga</span></div>{create_route_cta}</div><section class='panel route-flow clean-panel'><h2>Como operar cargas e rotas</h2><div class='route-steps vertical-friendly'><span>1 Conferir faturados</span><span>2 Criar carga</span><span>3 Escolher veículo</span><span>4 Ordenar entregas</span><span>5 Sair para entrega</span><span>6 Fazer acerto</span></div></section><div class='route-stack'><section class='route-section'><div class='section-title'><div><h2>1) Pedidos disponíveis para montar carga</h2><p>Pedidos faturados e sem vínculo de carga.</p></div><span class='badge blue'>{len(available_ready)} na lista</span></div><div class='table-wrap'><table><thead><tr><th>Pedido</th><th>Cliente</th><th>Cidade/Rota</th><th>Peso</th><th>SLA</th><th>Ação</th></tr></thead><tbody>{ready_rows}</tbody></table></div></section><section class='route-section'><div class='section-title'><div><h2>2) Cargas planejadas</h2><p>Cargas montadas, mas ainda não saíram para entrega.</p></div><span class='badge blue'>Planejamento</span></div><div class='route-card-grid'>{lanes['Planejada'] or '<div class="empty">Nenhuma carga planejada.</div>'}</div></section><section class='route-section'><div class='section-title'><div><h2>3) Cargas em rota</h2><p>Cargas que já saíram e precisam de baixa operacional.</p></div><span class='badge ok'>Operação ativa</span></div><div class='route-card-grid'>{lanes['Em rota'] or '<div class="empty">Nenhuma carga em rota.</div>'}</div></section><details class='route-section route-archive'><summary><div><h2>4) Histórico de cargas</h2><p>Cargas acertadas e com problema. Exibição paginada.</p></div><span class='badge neutral'>{closed_count} no histórico</span></summary><div class='route-card-grid'>{lanes['Acertada'] or '<div class="empty">Nenhuma carga finalizada.</div>'}</div><div class='action-strip'>{hist_prev}{hist_next}</div></details></div>"""
-        return self.send_html(layout(u,'Cargas e Rotas',content,'Central logística para montar cargas, controlar capacidade e baixar entregas'))
+        hist_next=f"<a class='btn small ghost' href='/routes?hist_page={hist_page+1}&q={quote(q)}'>Próxima página</a>" if has_next else "<span class='muted'>Fim do histórico</span>"
+        create_route_btn = f"<a class='btn primary' href='/routes/new' style='font-weight:700;'>＋ Criar Nova Carga</a>" if can_create_routes else ""
+
+        # Ribbon horizontal de métricas super compacto (altura reduzida)
+        metrics_ribbon = f"""
+        <div class='metrics-ribbon' style='display:flex; gap:12px; align-items:center; background:#ffffff; border:1px solid var(--border); border-radius:var(--radius-sm); padding:10px 16px; margin-bottom:14px; box-shadow:var(--shadow-sm); flex-wrap:wrap;'>
+          <div style='display:flex; align-items:center; gap:8px;'>
+            <span style='color:var(--muted); font-size:0.85rem; font-weight:600;'>Faturados sem carga:</span>
+            <strong style='font-size:1.1rem; color:var(--text);'>{ready['c']}</strong>
+            <span style='font-size:0.85rem; color:var(--muted);'>({fmt_num(ready['w'])} kg aguardando)</span>
+          </div>
+          <div style='width:1px; height:20px; background:var(--border);'></div>
+          <div style='display:flex; align-items:center; gap:8px;'>
+            <span style='color:var(--muted); font-size:0.85rem; font-weight:600;'>Cargas em rota:</span>
+            <strong style='font-size:1.1rem; color:#166534;'>{inroute['c']}</strong>
+            <span style='font-size:0.85rem; color:var(--muted);'>(Em trânsito)</span>
+          </div>
+          <div style='width:1px; height:20px; background:var(--border);'></div>
+          <div style='display:flex; align-items:center; gap:8px;'>
+            <span style='color:{'#dc2626' if late_ready['c']>0 else 'var(--muted)'}; font-size:0.85rem; font-weight:600;'>Faturados atrasados:</span>
+            <strong style='font-size:1.1rem; color:{'#dc2626' if late_ready['c']>0 else 'var(--text)'};'>{late_ready['c']}</strong>
+            <span style='font-size:0.85rem; color:var(--muted);'>(Prioridade na carga)</span>
+          </div>
+        </div>
+        """
+
+        content=f"""
+        {regularized_notice}
+        {metrics_ribbon}
+        <div class='route-stack'>
+          <section class='route-section' style='background:#fff; border:1px solid var(--border); border-radius:var(--radius); padding:16px; margin-bottom:16px;'>
+            <div class='section-title' style='display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;'>
+              <div>
+                <h2 style='font-size:1.05rem; margin:0;'>1) Pedidos disponíveis para montar carga</h2>
+                <small class='muted'>Pedidos faturados aguardando inclusão em carga.</small>
+              </div>
+              <span class='badge blue'>{len(available_ready)} pedidos</span>
+            </div>
+            <div class='table-wrap'>
+              <table>
+                <thead><tr><th>Pedido</th><th>Cliente</th><th>Cidade / Rota</th><th>Peso</th><th>Venda / Prazo</th><th>Ação</th></tr></thead>
+                <tbody>{ready_rows}</tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class='route-section' style='background:#fff; border:1px solid var(--border); border-radius:var(--radius); padding:16px; margin-bottom:16px;'>
+            <div class='section-title' style='display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;'>
+              <div>
+                <h2 style='font-size:1.05rem; margin:0;'>2) Cargas planejadas</h2>
+                <small class='muted'>Cargas montadas aguardando saída para entrega.</small>
+              </div>
+              <span class='badge blue'>{len(planejadas)} planejadas</span>
+            </div>
+            {render_route_table(planejadas, is_closed=False)}
+          </section>
+
+          <section class='route-section' style='background:#fff; border:1px solid var(--border); border-radius:var(--radius); padding:16px; margin-bottom:16px;'>
+            <div class='section-title' style='display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;'>
+              <div>
+                <h2 style='font-size:1.05rem; margin:0;'>3) Cargas em rota</h2>
+                <small class='muted'>Cargas em trânsito com motoristas.</small>
+              </div>
+              <span class='badge ok'>{len(em_rota)} em rota</span>
+            </div>
+            {render_route_table(em_rota, is_closed=False)}
+          </section>
+
+          <details class='route-section route-archive' style='background:#fff; border:1px solid var(--border); border-radius:var(--radius); padding:16px;'>
+            <summary style='cursor:pointer; display:flex; justify-content:space-between; align-items:center;'>
+              <div>
+                <h2 style='font-size:1.05rem; margin:0; display:inline-block;'>4) Histórico de cargas finalizadas</h2>
+                <p class='muted' style='margin:2px 0 0;'>Cargas acertadas e finalizadas.</p>
+              </div>
+              <span class='badge neutral'>{closed_count} no histórico</span>
+            </summary>
+            <div style='margin-top:14px;'>
+              {render_route_table(closed_routes, is_closed=True)}
+            </div>
+          </details>
+        </div>
+        """
+        return self.send_html(layout(u,'Cargas e Rotas',content,'Central logística para montar cargas, controlar capacidade e baixar entregas',search_action='/routes',search_placeholder='Buscar cargas por código, motorista, veículo, rota...',search_q=q,head_actions_extra=create_route_btn))
+
+    def registro_viagens(self, u):
+        from app_core.domains.trip_registry_dispatch import render_registro_viagens_page
+        render_registro_viagens_page(self, u, layout_func=layout)
 
     def route_new(self,u):
         with conn() as db:
@@ -4721,7 +6607,7 @@ document.addEventListener('DOMContentLoaded', function(){
                 LEFT JOIN clients c ON c.id=o.client_id
                 LEFT JOIN route_orders ro ON ro.order_id=o.id
                 LEFT JOIN routes r ON r.id=ro.route_id AND r.status NOT IN ('Acertada','Com problema','Cancelada')
-                WHERE o.status IN ('Faturado','Saiu para entrega')
+                WHERE o.status IN ('Faturado','Carga Montada','Saiu para entrega')
                 GROUP BY o.id
                 ORDER BY CASE WHEN o.expected_delivery_date<? THEN 0 ELSE 1 END,o.expected_delivery_date,o.route_name,o.city
             """,(today(),)).fetchall()
@@ -4729,15 +6615,47 @@ document.addEventListener('DOMContentLoaded', function(){
             if 'Mista' not in route_names:
                 route_names.insert(0, 'Mista')
         vehicle_options=''.join(f"<option value='{v['id']}' data-capacity='{esc(v['capacity_kg'] if v['capacity_kg'] is not None else (v['capacity'] or 0))}'>{esc(v['name'])} - {esc(v['plate'] or 'sem placa')} - {fmt_num(v['capacity_kg'] if v['capacity_kg'] is not None else v['capacity'])}kg</option>" for v in vehicles)
+        
+        order_ids = [o['id'] for o in orders]
+        items_by_order = {}
+        if order_ids:
+            with conn() as db:
+                placeholders = ','.join('?' for _ in order_ids)
+                all_its = db.execute(f"SELECT order_id, product_name, quantity, unit, weight_kg FROM order_items WHERE order_id IN ({placeholders}) ORDER BY id", order_ids).fetchall()
+                for it in all_its:
+                    items_by_order.setdefault(it['order_id'], []).append(it)
+
         checks=''
         for o in orders:
             move = f"<em class='load-current'>Já está em {esc(o['current_load'])}. Ao selecionar, será transferido para esta nova carga.</em>" if o['current_load'] else ''
             route_value = str(o['route_name'] or '')
-            checks += f"""<label class='check load-check' data-route="{esc(route_value)}"><input type='checkbox' name='order_{o['id']}' data-route="{esc(route_value)}" data-weight='{float(o['weight_kg'] or 0)}'> <span><b>{esc(o['order_number'])}</b> - {esc(o['client'] or '')}<small>Vendedor: {esc(o['seller_name'] or 'Não informado')} · {esc(o['city'] or '')} · {esc(route_value or 'Sem rota')} · {deadline_pill(o['expected_delivery_date'],o['status'])} · {fmt_num(o['weight_kg'])} kg</small>{move}</span></label>"""
+            o_items = items_by_order.get(o['id'], [])
+            items_details = ''
+            if o_items:
+                it_rows = ''.join(
+                    f"<tr><td style='padding:2px 4px;'>{esc(it['product_name'])}</td><td style='padding:2px 4px;text-align:right;'>{to_float(it['quantity']):.0f} {esc(it['unit'] or '')}</td><td style='padding:2px 4px;text-align:right;'>{fmt_num(it['weight_kg'])} kg</td></tr>"
+                    for it in o_items
+                )
+                items_details = f"""<details class='order-items-collapse' style='margin-top:4px; font-size:0.8rem; background:rgba(0,0,0,0.02); border:1px solid #e2e8f0; border-radius:5px; padding:3px 6px;' onclick='event.stopPropagation();'>
+                    <summary style='cursor:pointer; color:#166534; font-weight:600;'>📦 Ver produtos ({len(o_items)} itens) ▾</summary>
+                    <table style='width:100%; margin-top:4px; font-size:0.75rem; border-collapse:collapse;'>
+                        <thead><tr style='border-bottom:1px solid #cbd5e1; color:#64748b;'><th style='text-align:left;'>Produto</th><th style='text-align:right;'>Qtd</th><th style='text-align:right;'>Peso</th></tr></thead>
+                        <tbody>{it_rows}</tbody>
+                    </table>
+                </details>"""
+
+            o_sale_dt = o['sale_date'] if ('sale_date' in o.keys() and o['sale_date']) else ''
+            sale_str = f"Venda: {brdate(o_sale_dt)} · " if o_sale_dt else ""
+            o_exp_dt = o['expected_delivery_date'] if ('expected_delivery_date' in o.keys() and o['expected_delivery_date']) else ''
+            deadline_str = f"Limite: {brdate(o_exp_dt)} · " if o_exp_dt else ""
+            o_has_nf = bool(o['invoice_number'] and str(o['invoice_number']).strip() not in ('', '0', '0.0', 'None', 'null'))
+            o_nf_pill = f"<span class='badge' style='background:#047857; color:#fff; font-size:0.75rem; font-weight:700; padding:2px 6px; border-radius:4px; margin-left:6px;'>🧾 NF {esc(o['invoice_number'])}</span>" if o_has_nf else "<span class='badge' style='background:#fef3c7; color:#92400e; border:1px solid #fde68a; font-size:0.72rem; padding:1px 5px; border-radius:4px; margin-left:6px;'>Sem NF</span>"
+            o_nf_text = f"NF: {esc(o['invoice_number'])} · " if o_has_nf else "Sem NF · "
+            checks += f"""<label class='check load-check' data-route="{esc(route_value)}"><input type='checkbox' name='order_{o['id']}' data-route="{esc(route_value)}" data-weight='{float(o['weight_kg'] or 0)}'> <span><b>{esc(o['order_number'])}</b>{o_nf_pill} - {esc(o['client'] or '')}<small>{o_nf_text}Vendedor: {esc(resolve_seller_name(o['seller_name']))} · {sale_str}{deadline_str}{esc(o['city'] or '')} · {esc(route_value or 'Sem rota')} · {deadline_pill(o['expected_delivery_date'],o['status'])} · {fmt_num(o['weight_kg'])} kg</small>{move}{items_details}</span></label>"""
         if not route_names:
             route_names = ['Rota livre']
         route_select=''.join(f"<option value='{esc(r)}'>{esc(r)}</option>" for r in route_names)
-        content=f"""<form method='post' action='/routes/new' class='form route-builder'><section class='builder-left'><fieldset><legend>1. Dados da carga</legend><div class='grid3'><label>Nome da carga<input name='name' required value='Carga {datetime.now().strftime('%d/%m %H:%M')}'></label><label>Data<input type='date' name='date' value='{today()}' required></label><label>Rota<select name='route_name' id='loadRouteSelect' required><option value=''>Selecione a rota</option>{route_select}</select><small>Selecione a rota principal desta carga.</small></label><label class='full route-lock-box'><span class='checkbox-label'><input type='checkbox' id='routeLockToggle' value='1'> Travar rota</span><small>Marcado: exibe só pedidos da rota selecionada. Desmarcado: exibe todos os pedidos elegíveis.</small></label><label>Motorista<select name='driver_id' required>{row_options(drivers,None,lambda r:r['name'])}</select></label><label>Veículo<select name='vehicle_id' id='vehicle_id' required><option value=''>Selecione veículo</option>{vehicle_options}</select></label><label>Capacidade kg<input id='capacity' name='capacity' type='text' inputmode='decimal' data-mask='decimal' data-decimals='2' value='{esc(get_setting('load_capacity_kg','11000'))}' required></label><label class='full'>Observações<textarea name='notes' placeholder='Instruções para entrega, restrições, ordem de prioridade...'></textarea></label></div></fieldset><div class='load-summary'><div><b>Pedidos selecionados: <span id='selectedCount'>0</span></b><small>Total previsto: <span id='selectedWeight'>0</span> kg</small></div><div class='load-capacity'><div class='capacity'><span id='capacityBar' style='width:0%'></span></div><small id='capacityAlert'>Capacidade dentro do limite</small></div></div><div class='alert info'>Resumo antes de salvar: confira quantidade de pedidos, peso total e capacidade do veículo.</div><button>Confirmar montagem da carga</button></section><section class='builder-right'><h2>2. Pedidos elegíveis para carga</h2><p class='muted'>Com <b>Travar rota</b> marcado, a lista mostra somente pedidos da rota escolhida. Desmarcado, exibe todos os pedidos elegíveis.</p><div class='checks'>{checks or '<div class=empty>Nenhum pedido faturado para carga. Conclua o faturamento antes de criar rota.</div>'}</div></section></form>"""
+        content=f"""<form method='post' action='/routes/new' class='form route-builder'><section class='builder-left'><fieldset><legend>1. Dados da carga</legend><div class='grid3'><label>Nome da carga<input name='name' required value='Carga {datetime.now().strftime('%d/%m %H:%M')}'></label><label>Data<input type='date' name='date' value='{today()}' required></label><label>Rota<select name='route_name' id='loadRouteSelect' required><option value=''>Selecione a rota</option>{route_select}</select><small>Selecione a rota principal desta carga.</small></label><label class='full route-lock-box'><span class='checkbox-label'><input type='checkbox' id='routeLockToggle' value='1'> Travar rota</span><small>Marcado: exibe só pedidos da rota selecionada. Desmarcado: exibe todos os pedidos elegíveis.</small></label><label>Motorista<select name='driver_id' required>{row_options(drivers,None,lambda r:r['name'])}</select></label><label>Veículo<select name='vehicle_id' id='vehicle_id' required><option value=''>Selecione veículo</option>{vehicle_options}</select></label><label>Capacidade kg<input id='capacity' name='capacity' type='text' inputmode='decimal' data-mask='decimal' data-decimals='2' value='{esc(get_setting('load_capacity_kg','11000'))}' required></label><label class='full'>Observações<textarea name='notes' placeholder='Instruções para entrega, restrições, ordem de prioridade...'></textarea></label></div></fieldset><div class='load-summary'><div><b>Pedidos selecionados: <span id='selectedCount'>0</span></b><small>Total previsto: <span id='selectedWeight'>0</span> kg</small></div><div class='load-capacity'><div class='capacity'><span id='capacityBar' style='width:0%'></span></div><small id='capacityAlert'>Capacidade dentro do limite</small></div></div><div class='alert info'>Resumo antes de salvar: confira quantidade de pedidos, peso total e capacidade do veículo.</div><button>Confirmar montagem da carga</button></section><section class='builder-right'><div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;'><h2 style='margin:0;'>2. Pedidos elegíveis para carga</h2><a class='btn small ghost' href='/orders/sync-carga-erp?redirect=/routes/new' style='color:#166534; border-color:#86efac; background:#f0fdf4; font-weight:700;' title='Puxar pedidos novos do ERP agora'>🔄 Atualizar ERP</a></div><p class='muted'>Com <b>Travar rota</b> marcado, a lista mostra somente pedidos da rota escolhida. Desmarcado, exibe todos os pedidos elegíveis.</p><div class='checks'>{checks or '<div class=empty>Nenhum pedido faturado para carga. Conclua o faturamento antes de criar rota.</div>'}</div></section></form>"""
         return self.send_html(layout(u,'Nova Carga/Rota',content,'Montagem guiada de carga com capacidade e pedidos disponíveis'))
 
     def post_route(self,u):
@@ -4773,7 +6691,7 @@ document.addEventListener('DOMContentLoaded', function(){
                     if not order:
                         raise ValueError('Pedido selecionado não foi encontrado. Atualize a tela e tente novamente.')
                     st=normalize_order_status(order['status'])
-                    if st not in ('Faturado','Saiu para entrega'):
+                    if st not in ('Faturado','Carga Montada','Saiu para entrega'):
                         raise ValueError(f'Pedido {order["order_number"]} não está elegível para carga. Status atual: {st}.')
                     order_route = str(order['route_name'] or '').strip()
                     if not order_route:
@@ -4802,9 +6720,10 @@ document.addEventListener('DOMContentLoaded', function(){
                               )""",(oid,))
                 db.execute('INSERT INTO route_orders(route_id,order_id,delivery_order,status) VALUES(?,?,?,?)',(rid,oid,i,'Pendente'))
                 old=normalize_order_status(db.execute('SELECT status FROM orders WHERE id=?',(oid,)).fetchone()['status'])
-                if old != 'Faturado':
-                    db.execute("UPDATE orders SET status='Faturado',updated_at=?,version=COALESCE(version,1)+1 WHERE id=?",(now(),oid))
-                    add_hist(db,oid,u['id'],old,'Faturado','Pedido transferido para nova carga',f'Carga {rid}')
+                if old != 'Carga Montada':
+                    self.ensure_order_status(db,oid,'Carga Montada')
+                    db.execute("UPDATE orders SET status='Carga Montada',updated_at=?,version=COALESCE(version,1)+1 WHERE id=?",(now(),oid))
+                    add_hist(db,oid,u['id'],old,'Carga Montada','Carga montada (Aguardando saída)',f'Carga {rid}')
             for old_rid in old_routes:
                 if old_rid != rid: self.recalc_route_weight(db,old_rid)
             self.recalc_route_weight(db,rid)
@@ -4815,17 +6734,17 @@ document.addEventListener('DOMContentLoaded', function(){
         with conn() as db:
             r=db.execute("SELECT r.*,d.name driver,v.name vehicle,v.plate FROM routes r LEFT JOIN drivers d ON d.id=r.driver_id LEFT JOIN vehicles v ON v.id=r.vehicle_id WHERE r.id=?",(rid,)).fetchone()
             target_route = str(r['route_name'] or '').strip() if r else ''
-            ros=db.execute("""SELECT ro.*,o.order_number,o.seller_name,o.status,o.weight_kg,o.city,o.route_name,o.delivery_address,
-                                     o.expected_delivery_date,o.receipt_photo,o.delivery_location_link,c.name client,c.farm_name,
+            ros=db.execute("""SELECT ro.*,o.order_number,o.invoice_number,o.seller_name,o.status AS order_status,o.weight_kg,o.city,o.route_name,o.delivery_address,
+                                     o.expected_delivery_date,o.sale_date,o.receipt_photo,o.delivery_location_link,c.name client,c.farm_name,
                                      (SELECT COUNT(*) FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.image_data IS NOT NULL) has_photo,
                                      (SELECT COUNT(*) FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.digital_signature IS NOT NULL) has_sig,
                                      (SELECT delivery_location_link FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.delivery_location_link IS NOT NULL AND dr.delivery_location_link!='' LIMIT 1) dr_loc_link
                               FROM route_orders ro JOIN orders o ON o.id=ro.order_id LEFT JOIN clients c ON c.id=o.client_id WHERE ro.route_id=? ORDER BY ro.delivery_order,ro.id""",(rid,)).fetchall()
             if target_route.lower().strip() == 'mista':
-                available=db.execute("""SELECT o.id,o.order_number,o.seller_name,c.name client,o.city,o.route_name,o.weight_kg
+                available=db.execute("""SELECT o.id,o.order_number,o.invoice_number,o.seller_name,c.name client,o.city,o.route_name,o.weight_kg
                                         FROM orders o
                                         LEFT JOIN clients c ON c.id=o.client_id
-                                        WHERE o.status IN ('Faturado','Saiu para entrega')
+                                        WHERE o.status IN ('Faturado','Carga Montada','Saiu para entrega')
                                           AND NOT EXISTS (
                                               SELECT 1
                                               FROM route_orders ro2
@@ -4835,10 +6754,10 @@ document.addEventListener('DOMContentLoaded', function(){
                                           )
                                         ORDER BY o.expected_delivery_date,o.city""").fetchall()
             else:
-                available=db.execute("""SELECT o.id,o.order_number,o.seller_name,c.name client,o.city,o.route_name,o.weight_kg
+                available=db.execute("""SELECT o.id,o.order_number,o.invoice_number,o.seller_name,c.name client,o.city,o.route_name,o.weight_kg
                                         FROM orders o
                                         LEFT JOIN clients c ON c.id=o.client_id
-                                        WHERE o.status IN ('Faturado','Saiu para entrega')
+                                        WHERE o.status IN ('Faturado','Carga Montada','Saiu para entrega')
                                           AND LOWER(TRIM(COALESCE(o.route_name,'')))=LOWER(TRIM(?))
                                           AND NOT EXISTS (
                                               SELECT 1
@@ -4860,14 +6779,46 @@ document.addEventListener('DOMContentLoaded', function(){
         can_settle_routes = self.has_perm(u,'settle_routes')
         settlement_link = f"<a class='btn small ghost' href='/load-settlement?q={quote(r['name'])}'>Acerto da carga</a>" if can_settle_routes else "<span class='muted'>Sem permissão para acerto</span>"
         pct=(float(r['total_weight'] or 0)/float(r['capacity'] or 1))*100
+        
+        order_ids = [ro['order_id'] for ro in ros]
+        items_by_order = {}
+        if order_ids:
+            with conn() as db:
+                placeholders = ','.join('?' for _ in order_ids)
+                all_its = db.execute(f"SELECT order_id, product_name, quantity, unit, weight_kg, status, problem_notes FROM order_items WHERE order_id IN ({placeholders}) ORDER BY id", order_ids).fetchall()
+                for it in all_its:
+                    items_by_order.setdefault(it['order_id'], []).append(it)
+
         def _render_route_order(ro):
             loc_url, is_gps, loc_type = order_map_info(ro)
             map_html = f'<br><a href="{esc(loc_url)}" target="_blank" rel="noopener" class="btn small ghost" style="color:#0369a1; border-color:#0369a1; padding:1px 4px; font-size:0.75rem; margin-top:3px; display:inline-block;">📍 Mapa ({esc(loc_type)})</a>' if loc_url else ''
             photo_btn = f'<br><a href="/orders/{ro["order_id"]}/receipt-image" target="_blank" class="btn small ghost" style="color:#059669; border-color:#059669; padding:1px 4px; font-size:0.75rem; margin-top:3px; display:inline-block;">📷 Canhoto</a>' if (ro['has_photo'] or ro['receipt_photo']) else ''
             sig_btn = f'<a href="/orders/{ro["order_id"]}/signature-image" target="_blank" class="btn small ghost" style="color:#0284c7; border-color:#0284c7; padding:1px 4px; font-size:0.75rem; margin-top:3px; display:inline-block;">✍️ Assinatura</a>' if ro['has_sig'] else ''
-            return f"""<tr><td><input form='seqForm' type='number' name='seq_{ro['id']}' value='{ro['delivery_order']}' class='seq' {'readonly' if not can_edit else ''}></td><td><a href='/orders/{ro['order_id']}'><b>{esc(ro['order_number'])}</b></a><br><small>{esc(ro['client'] or '')} · Vendedor: {esc(ro['seller_name'] or 'Não informado')}</small></td><td>{esc(ro['city'] or '')}<br><small>{esc(ro['route_name'] or '')}</small></td><td>{badge(ro['status'])}{photo_btn}{sig_btn}{map_html}</td><td>{deadline_pill(ro['expected_delivery_date'],ro['status'])}</td><td>{fmt_num(ro['weight_kg'])} kg</td><td><div class='route-actions'>{f"<form method='post' action='/routes/{rid}/remove/{ro['id']}' class='inline-mini'><button class='danger-btn'>Remover</button></form>" if can_edit else "<span class='muted'>Carga finalizada</span>"}</div></td></tr>"""
+            
+            o_items = items_by_order.get(ro['order_id'], [])
+            items_collapse = ''
+            if o_items:
+                it_list_parts = []
+                for it in o_items:
+                    is_prob = (it['status'] == 'Problema') if ('status' in it.keys() and it['status']) else False
+                    prob_tag = f" <b style='color:#dc2626;'>[{esc(it['status'])}: {esc(it['problem_notes'])}]</b>" if is_prob else ""
+                    qty_num = to_float(it['quantity'])
+                    it_list_parts.append(
+                        f"<li>{esc(it['product_name'])} <span class='muted'>({qty_num:.0f} {esc(it['unit'] or '')} - {fmt_num(it['weight_kg'])} kg)</span>{prob_tag}</li>"
+                    )
+                it_list = ''.join(it_list_parts)
+                items_collapse = f"""<details class='order-items-collapse' style='margin-top:3px; font-size:0.75rem;'>
+                    <summary style='cursor:pointer; color:#166534; font-weight:600;'>📦 Ver produtos ({len(o_items)}) ▾</summary>
+                    <ul style='margin:3px 0 0 14px; padding:0; list-style-type:disc; color:#334155; font-size:0.75rem;'>{it_list}</ul>
+                </details>"""
+
+            ro_sale_dt = ro['sale_date'] if ('sale_date' in ro.keys() and ro['sale_date']) else ''
+            sale_lbl = f"<small class='muted'>Venda: {brdate(ro_sale_dt)}</small><br>" if ro_sale_dt else ""
+            ro_has_nf = bool(ro['invoice_number'] and str(ro['invoice_number']).strip() not in ('', '0', '0.0', 'None', 'null'))
+            ro_nf_pill = f"<span class='badge' style='background:#047857; color:#fff; font-size:0.75rem; font-weight:700; padding:1px 6px; border-radius:4px; margin-left:4px;'>🧾 NF {esc(ro['invoice_number'])}</span>" if ro_has_nf else "<span class='badge' style='background:#fef3c7; color:#92400e; border:1px solid #fde68a; font-size:0.72rem; padding:1px 5px; border-radius:4px; margin-left:4px;'>Sem NF</span>"
+            return f"""<tr><td><input form='seqForm' type='number' name='seq_{ro['id']}' value='{ro['delivery_order']}' class='seq' {'readonly' if not can_edit else ''}></td><td><a href='/orders/{ro['order_id']}'><b>{esc(ro['order_number'])}</b></a>{ro_nf_pill}<br><small>{esc(ro['client'] or '')} · Vendedor: {esc(resolve_seller_name(ro['seller_name']))}</small>{items_collapse}</td><td>{esc(ro['city'] or '')}<br><small>{esc(ro['route_name'] or '')}</small></td><td>{badge(ro['status'])}{photo_btn}{sig_btn}{map_html}</td><td>{sale_lbl}<b>Limite: {brdate(ro['expected_delivery_date'])}</b><br>{deadline_pill(ro['expected_delivery_date'],ro['order_status'])}</td><td>{fmt_num(ro['weight_kg'])} kg</td><td><div class='route-actions'>{f"<form method='post' action='/routes/{rid}/remove/{ro['id']}' class='inline-mini'><button class='danger-btn'>Remover</button></form>" if can_edit else "<span class='muted'>Carga finalizada</span>"}</div></td></tr>"""
         rows=''.join(_render_route_order(ro) for ro in ros)
-        add_opts=''.join(f"<option value='{a['id']}'>{esc(a['order_number'])} - {esc(a['client'] or '')} - Vendedor: {esc(a['seller_name'] or 'Não informado')} - {esc(a['city'] or '')} - {fmt_num(a['weight_kg'])}kg</option>" for a in available)
+        add_opts=''.join(f"<option value='{a['id']}'>{esc(a['order_number'])} (NF: {esc(a['invoice_number'] or 'Sem NF')}) - {esc(a['client'] or '')} - Vendedor: {esc(resolve_seller_name(a['seller_name']))} - {esc(a['city'] or '')} - {fmt_num(a['weight_kg'])}kg</option>" for a in available)
         lock_notice = '<div class="alert info">Carga finalizada: edição de pedidos e sequência está bloqueada para preservar o histórico.</div>' if not can_edit else ''
         dispatch_action = f"<form method='post' action='/routes/{rid}/dispatch'><button>1. Marcar saída</button></form>" if can_dispatch else "<span class='muted'>Saída já registrada</span>"
         cancel_action = f"""<form method='post' action='/routes/{rid}/cancel' class='inline-form needs-confirm' data-confirm-text='Confirma cancelar esta carga? Todos pedidos não finalizados voltarão para Faturado.'><input name='reason' placeholder='Motivo do cancelamento' required><button class='danger-btn'>Cancelar carga</button></form>""" if can_cancel else ""
@@ -4889,7 +6840,13 @@ document.addEventListener('DOMContentLoaded', function(){
         reopen_panel=''
         if can_manage_reopen(u) and route_status in FINAL_ROUTE_STATUSES:
             reopen_panel=f"""<section class='panel no-print'><h2>Reabertura controlada da carga</h2><form method='post' action='/routes/{rid}/reopen' class='form compact needs-confirm' data-confirm-text='Confirma reabrir esta carga finalizada?'><div class='grid3'><label>Destino<select name='target_status'>{option(['Planejada','Em rota'],'Planejada')}</select></label><label class='full'>Motivo obrigatório<textarea name='reason' required placeholder='Descreva o motivo da reabertura da carga...'></textarea></label></div><button class='danger-btn'>Reabrir carga</button></form></section>"""
-        content=f"""{lock_notice}<section class='route-hero'><div><h2>{esc(r['name'])}</h2><p>{brdate(r['date'])} - {esc(r['route_name'] or 'Sem rota')} - {esc(r['driver'] or 'Sem motorista')} - {esc((r['vehicle'] or '')+' '+(r['plate'] or ''))}</p></div><div>{badge(r['status'])}<b>{fmt_num(r['total_weight'])} / {fmt_num(r['capacity'])} kg</b></div></section>{assisted}<div class='route-control-grid'><section class='panel'><h2>Capacidade</h2><div class='capacity big'><span style='width:{min(pct,100):.0f}%'></span></div><p><b>{pct:.0f}% usado</b> - {fmt_num(r['total_weight'])} kg carregados de {fmt_num(r['capacity'])} kg</p>{'<div class="alert danger">Carga acima da capacidade do veículo.</div>' if pct>100 else '<div class="alert success">Carga dentro da capacidade.</div>'}</section><section class='panel no-print'><h2>Ações principais</h2><div class='action-strip clean'>{dispatch_action}{delete_action}</div>{cancel_action}</section>{add_panel}</div>{edit_meta_panel}<form id='seqForm' method='post' action='/routes/{rid}/sequence'></form><section class='panel'><div class='section-title'><h2>Sequência de entrega</h2>{save_seq_btn}</div><div class='table-wrap'><table><thead><tr><th>Seq.</th><th>Pedido</th><th>Cidade/Rota</th><th>Status</th><th>Prazo limite</th><th>Peso</th><th>Ações</th></tr></thead><tbody>{rows or '<tr><td colspan=7>Nenhum pedido nesta carga.</td></tr>'}</tbody></table></div></section>{reopen_panel}"""
+        arrival_info = ''
+        if r['arrival_location_link'] or r['arrival_at']:
+            arr_date = brdate(r['arrival_at']) if r['arrival_at'] else '—'
+            arr_time = str(r['arrival_at'])[11:16] if r['arrival_at'] and len(str(r['arrival_at'])) >= 16 else ''
+            arr_maps = f'<a href="{esc(r["arrival_location_link"])}" target="_blank" rel="noopener" class="btn small primary" style="background:#166534; border-color:#166534; color:#ffffff; font-weight:700; padding:4px 10px; border-radius:6px; margin-left:8px; display:inline-flex; align-items:center; gap:4px;">🏁 Ver Local da Chegada no Google Maps</a>' if r['arrival_location_link'] else ''
+            arrival_info = f'<div class="alert success" style="margin-top:10px; background:#f0fdf4; border-color:#86efac; color:#166534;">🏁 <b>Chegada na Loja Registrada:</b> {arr_date} {arr_time} {arr_maps}</div>'
+        content=f"""{lock_notice}<section class='route-hero'><div><h2>{esc(r['name'])}</h2><p>{brdate(r['date'])} - {esc(r['route_name'] or 'Sem rota')} - {esc(r['driver'] or 'Sem motorista')} - {esc((r['vehicle'] or '')+' '+(r['plate'] or ''))}</p>{arrival_info}</div><div>{badge(r['status'])}<b>{fmt_num(r['total_weight'])} / {fmt_num(r['capacity'])} kg</b></div></section>{assisted}<div class='route-control-grid'><section class='panel'><h2>Capacidade</h2><div class='capacity big'><span style='width:{min(pct,100):.0f}%'></span></div><p><b>{pct:.0f}% usado</b> - {fmt_num(r['total_weight'])} kg carregados de {fmt_num(r['capacity'])} kg</p>{'<div class="alert danger">Carga acima da capacidade do veículo.</div>' if pct>100 else '<div class="alert success">Carga dentro da capacidade.</div>'}</section><section class='panel no-print'><h2>Ações principais</h2><div class='action-strip clean'>{dispatch_action}{delete_action}</div>{cancel_action}</section>{add_panel}</div>{edit_meta_panel}<form id='seqForm' method='post' action='/routes/{rid}/sequence'></form><section class='panel'><div class='section-title'><h2>Sequência de entrega</h2>{save_seq_btn}</div><div class='table-wrap'><table><thead><tr><th>Seq.</th><th>Pedido</th><th>Cidade/Rota</th><th>Status</th><th>Venda / Prazo</th><th>Peso</th><th>Ações</th></tr></thead><tbody>{rows or '<tr><td colspan=7>Nenhum pedido nesta carga.</td></tr>'}</tbody></table></div></section>{reopen_panel}"""
         return self.send_html(layout(u,'Operação da Carga',content,'Painel de saída, sequência, capacidade e baixa de entregas'))
 
     def post_route_dispatch(self,u,rid):
@@ -5011,7 +6968,7 @@ document.addEventListener('DOMContentLoaded', function(){
                 order=db.execute("SELECT status,weight_kg,order_number,route_name FROM orders WHERE id=?",(oid,)).fetchone()
                 if not order:
                     return self.fail(u,'Não encontrado','Pedido não encontrado.',404)
-                if normalize_order_status(order['status']) not in ('Faturado','Saiu para entrega'):
+                if normalize_order_status(order['status']) not in ('Faturado','Carga Montada','Saiu para entrega'):
                     return self.fail(u,'Pedido inelegível','Somente pedidos faturados ou em rota podem ser adicionados à carga.',400)
                 order_route = str(order['route_name'] or '').strip()
                 route_name = str(route['route_name'] or '').strip()
@@ -5045,7 +7002,7 @@ document.addEventListener('DOMContentLoaded', function(){
                 seq=db.execute('SELECT COALESCE(MAX(delivery_order),0)+1 n FROM route_orders WHERE route_id=?',(rid,)).fetchone()['n']
                 ro_status='Em rota' if route['status']=='Em rota' else 'Pendente'
                 db.execute('INSERT INTO route_orders(route_id,order_id,delivery_order,status) VALUES(?,?,?,?)',(rid,oid,seq,ro_status))
-                new_order_status='Saiu para entrega' if route['status']=='Em rota' else 'Faturado'
+                new_order_status='Saiu para entrega' if route['status']=='Em rota' else 'Carga Montada'
                 old_status=normalize_order_status(order['status'])
                 if old_status != new_order_status:
                     self.ensure_order_status(db,oid,new_order_status)
@@ -5076,7 +7033,7 @@ document.addEventListener('DOMContentLoaded', function(){
             db.execute('DELETE FROM route_orders WHERE id=? AND route_id=?',(roid,rid))
             if order:
                 old=normalize_order_status(order['status'])
-                if old=='Saiu para entrega':
+                if old in ('Saiu para entrega', 'Carga Montada'):
                     self.ensure_order_status(db,ro['order_id'],'Faturado')
                     db.execute("UPDATE orders SET status='Faturado',updated_at=?,version=COALESCE(version,1)+1 WHERE id=?",(now(),ro['order_id']))
                     add_hist(db,ro['order_id'],u['id'],old,'Faturado','Removido da carga',f'Carga {rid}')
@@ -5089,12 +7046,76 @@ document.addEventListener('DOMContentLoaded', function(){
     def load_settlement(self,u):
         qs=parse_qs(urlparse(self.path).query); q=qs.get('q',[''])[0].strip()
         can_view_financial = self.can_view_financial(u)
-        search_box=f"""<section class='panel settlement-search'><h2>Buscar carga</h2><form method='get' action='/load-settlement' class='inline-form'><input name='q' value='{esc(q)}' placeholder='Digite o número/nome da carga. Ex.: CG-20260515-002' autofocus><button>Buscar carga</button></form><p class='muted'>Use esta tela quando a carga voltou ou quando o responsável precisa fechar todos os pedidos da carga em uma única conferência.</p></section>"""
+        
         if not q:
             with conn() as db:
-                recent=db.execute("""SELECT r.*,COUNT(ro.id) orders_count FROM routes r LEFT JOIN route_orders ro ON ro.route_id=r.id WHERE r.status='Em rota' GROUP BY r.id ORDER BY r.date DESC,r.id DESC LIMIT 10""").fetchall()
-            cards=''.join(f"<a class='settlement-card' href='/load-settlement?q={quote(r['name'])}'><b>{esc(r['name'])}</b><span>{badge(r['status'])}</span><small>{brdate(r['date'])} · {r['orders_count']} pedidos</small></a>" for r in recent) or '<div class="empty">Nenhuma carga ativa encontrada.</div>'
-            return self.send_html(layout(u,'Acerto de carga',search_box+f"<section class='panel'><h2>Cargas ativas recentes</h2><div class='settlement-grid'>{cards}</div></section>",'Fechamento operacional da carga e baixa final das entregas'))
+                recent=db.execute("""
+                    SELECT r.*, d.name driver, v.name vehicle, v.plate, COUNT(ro.id) orders_count, COALESCE(SUM(o.weight_kg), 0) total_kg
+                    FROM routes r 
+                    LEFT JOIN drivers d ON d.id=r.driver_id
+                    LEFT JOIN vehicles v ON v.id=r.vehicle_id
+                    LEFT JOIN route_orders ro ON ro.route_id=r.id 
+                    LEFT JOIN orders o ON o.id=ro.order_id
+                    WHERE r.status IN ('Em rota','Aguardando Chegada') 
+                    GROUP BY r.id 
+                    ORDER BY CASE r.status WHEN 'Aguardando Chegada' THEN 0 ELSE 1 END, r.date DESC, r.id DESC 
+                    LIMIT 40
+                """).fetchall()
+            
+            trs = []
+            for r in recent:
+                w = r['total_weight'] or r['total_kg'] or 0
+                trs.append(
+                    f"<tr>"
+                    f"<td><b>{esc(r['name'])}</b><br><small class='muted'>Carga #{r['id']}</small></td>"
+                    f"<td>{brdate(r['date'])}</td>"
+                    f"<td><b>{esc(r['route_name'] or 'Rota livre')}</b></td>"
+                    f"<td>{esc(r['driver'] or 'Não atribuído')}</td>"
+                    f"<td>{esc((r['vehicle'] or '')+' '+(r['plate'] or '')) or 'Não informado'}</td>"
+                    f"<td><span class='badge neutral'>{r['orders_count']} pedidos</span></td>"
+                    f"<td><b>{fmt_num(w)} kg</b></td>"
+                    f"<td>{badge(r['status'])}</td>"
+                    f"<td><a class='btn small primary' href='/load-settlement?q={quote(r['name'])}' style='font-weight:700;'>Conferir / Fazer Acerto</a></td>"
+                    f"</tr>"
+                )
+            
+            table_html = f"""
+            <div class='table-wrap'>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Carga</th>
+                    <th>Data</th>
+                    <th>Rota</th>
+                    <th>Motorista</th>
+                    <th>Veículo</th>
+                    <th>Qtd Pedidos</th>
+                    <th>Peso Total</th>
+                    <th>Status</th>
+                    <th>Ação</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {''.join(trs) if trs else "<tr><td colspan='9' class='empty'>Nenhuma carga ativa ou aguardando chegada no momento.</td></tr>"}
+                </tbody>
+              </table>
+            </div>
+            """
+            
+            content = f"""
+            <section class='panel clean-panel' style='background:#fff; border:1px solid var(--border); border-radius:var(--radius); padding:16px;'>
+              <div class='section-title' style='display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;'>
+                <div>
+                  <h2 style='font-size:1.1rem; margin:0;'>Cargas ativas e aguardando chegada</h2>
+                  <small class='muted'>Selecione uma carga abaixo ou pesquise pelo código na barra superior para realizar a conferência e baixa.</small>
+                </div>
+                <span class='badge ok'>{len(recent)} cargas ativas</span>
+              </div>
+              {table_html}
+            </section>
+            """
+            return self.send_html(layout(u,'Acerto de Carga',content,'Fechamento operacional da carga e baixa final das entregas',search_action='/load-settlement',search_placeholder='Buscar carga para acerto por número, nome ou motorista...',search_q=q))
+        
         with conn() as db:
             r=db.execute("""SELECT r.*,d.name driver,v.name vehicle,v.plate
                             FROM routes r
@@ -5103,7 +7124,7 @@ document.addEventListener('DOMContentLoaded', function(){
                             WHERE CAST(r.id AS TEXT)=? OR r.name=? OR r.name LIKE ?
                             ORDER BY r.id DESC LIMIT 1""",(q,q,f'%{q}%')).fetchone()
             if not r:
-                return self.send_html(layout(u,'Acerto de carga',search_box+'<div class="alert danger">Carga não encontrada. Confira o código/nome e tente novamente.</div>','Fechamento operacional da carga e baixa final das entregas'))
+                return self.send_html(layout(u,'Acerto de Carga',f'<div class="alert danger">Carga "{esc(q)}" não encontrada. Confira o código/nome e tente novamente.</div><div style="margin-top:14px;"><a class="btn ghost" href="/load-settlement">← Ver todas as cargas ativas</a></div>','Fechamento operacional da carga e baixa final das entregas',search_action='/load-settlement',search_placeholder='Buscar carga para acerto por número, nome ou motorista...',search_q=q))
             rows=db.execute("""SELECT ro.*,o.id order_id,o.order_number,o.seller_name,o.status,o.weight_kg,o.total_value,
                                       o.payment_method,o.delivered_at,o.final_notes,o.city,o.route_name,o.receipt_photo,
                                       o.delivery_location_link,c.name client,c.farm_name,
@@ -5112,9 +7133,94 @@ document.addEventListener('DOMContentLoaded', function(){
                                       (SELECT delivery_location_link FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.delivery_location_link IS NOT NULL AND dr.delivery_location_link!='' LIMIT 1) dr_loc_link
                                FROM route_orders ro JOIN orders o ON o.id=ro.order_id LEFT JOIN clients c ON c.id=o.client_id WHERE ro.route_id=? ORDER BY ro.delivery_order,ro.id""",(r['id'],)).fetchall()
         route_status = normalize_route_status(r['status'])
+        
+        order_ids = [ro['order_id'] for ro in rows]
+        items_by_order = {}
+        if order_ids:
+            with conn() as db:
+                placeholders = ','.join('?' for _ in order_ids)
+                all_its = db.execute(f"SELECT * FROM order_items WHERE order_id IN ({placeholders}) ORDER BY id", order_ids).fetchall()
+                for it in all_its:
+                    items_by_order.setdefault(it['order_id'], []).append(it)
+
+        with conn() as db:
+            expenses_rows = db.execute("SELECT * FROM trip_expenses WHERE route_id=? ORDER BY id", (r['id'],)).fetchall()
+            has_start_photo = bool(r['odometer_start_photo'] or db.execute("SELECT 1 FROM trip_photos WHERE route_id=? AND photo_type='start' LIMIT 1", (r['id'],)).fetchone())
+            has_end_photo = bool(r['odometer_end_photo'] or db.execute("SELECT 1 FROM trip_photos WHERE route_id=? AND photo_type='end' LIMIT 1", (r['id'],)).fetchone())
+
+        exp_badges = []
+        exp_total_sum = 0
+        for ex in expenses_rows:
+            tot = float(ex['total_value'] or 0)
+            exp_total_sum += tot
+            note_str = f" ({esc(ex['notes'])})" if ex['notes'] else ""
+            exp_badges.append(f"<span style='background:#f1f5f9; border:1px solid #cbd5e1; border-radius:6px; padding:3px 8px; font-size:0.8rem;'><b>{esc(ex['expense_type'])}:</b> R$ {tot:,.2f}{note_str}</span>")
+        
+        exp_html = f"<div style='display:flex; flex-wrap:wrap; gap:6px; margin-top:6px;'>{''.join(exp_badges)}</div><div style='font-size:0.85rem; font-weight:700; color:#1e3a8a; margin-top:6px;'>Total Despesas: R$ {exp_total_sum:,.2f}</div>" if expenses_rows else "<span class='muted'>Nenhuma despesa lançada nesta viagem.</span>"
+
+        has_driver_sig = bool(r['driver_signature'])
+        start_photo_btn = f"<a href='/routes/{r['id']}/odometer-photo/start' target='_blank' class='btn small ghost' style='color:#0369a1; border-color:#0369a1; font-weight:700;'>📸 Odômetro Inicial</a>" if has_start_photo else "<span class='muted'>Sem foto</span>"
+        end_photo_btn = f"<a href='/routes/{r['id']}/odometer-photo/end' target='_blank' class='btn small ghost' style='color:#166534; border-color:#166534; font-weight:700;'>📸 Odômetro Final</a>" if has_end_photo else "<span class='muted'>Sem foto</span>"
+        sig_badge = f"<span style='color:#166534; font-weight:700;'>✅ Assinada</span>" if has_driver_sig else "<span class='muted'>Pendente</span>"
+
+        km_start_display = f"{float(r['km_start']):,.0f} km" if r['km_start'] else "Não informado"
+        km_end_display = f"{float(r['km_end']):,.0f} km" if r['km_end'] else "Não informado"
+        km_tot_display = f"{float(r['km_total']):,.0f} km" if r['km_total'] else "—"
+
+        telemetry_card_html = f"""
+        <section class='panel' style='background:#f8fafc; border:1px solid #cbd5e1; border-radius:10px; padding:16px; margin:16px 0;'>
+          <div style='display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px; border-bottom:1px solid #e2e8f0; padding-bottom:8px;'>
+            <div>
+              <h3 style='margin:0; font-size:1.05rem; color:#1e3a8a; display:flex; align-items:center; gap:8px;'>
+                <span>📋</span> Ficha de Telemetria e Fechamento da Viagem
+              </h3>
+              <small class='muted'>Dados operacionais de odômetro, fotos comprobatórias, despesas de rota e assinatura do motorista.</small>
+            </div>
+            <div style='display:flex; gap:8px;'>
+              <a href='/routes/{r['id']}/trip-sheet-pdf' target='_blank' class='btn small primary' style='font-weight:700; background:#166534; border-color:#166534; display:flex; align-items:center; gap:6px;'>
+                <span>📄</span> Imprimir Ficha de Viagem Oficial (PDF)
+              </a>
+            </div>
+          </div>
+
+          <div style='display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:12px; margin-bottom:12px;'>
+            <div style='background:#fff; border:1px solid #e2e8f0; border-radius:8px; padding:10px;'>
+              <span style='font-size:0.75rem; font-weight:700; color:#64748b; text-transform:uppercase;'>KM Inicial & Foto</span>
+              <div style='font-size:1.1rem; font-weight:800; color:#0f172a; margin:4px 0;'>{km_start_display}</div>
+              <div>{start_photo_btn}</div>
+              <small class='muted'>Saída: {esc(r['departure_time'] or '—')}</small>
+            </div>
+
+            <div style='background:#fff; border:1px solid #e2e8f0; border-radius:8px; padding:10px;'>
+              <span style='font-size:0.75rem; font-weight:700; color:#64748b; text-transform:uppercase;'>KM Final & Foto</span>
+              <div style='font-size:1.1rem; font-weight:800; color:#0f172a; margin:4px 0;'>{km_end_display}</div>
+              <div>{end_photo_btn}</div>
+              <small class='muted'>Chegada: {esc(r['arrival_time'] or r['arrival_at'] or '—')}</small>
+            </div>
+
+            <div style='background:#fff; border:1px solid #e2e8f0; border-radius:8px; padding:10px;'>
+              <span style='font-size:0.75rem; font-weight:700; color:#64748b; text-transform:uppercase;'>Total Percorrido</span>
+              <div style='font-size:1.3rem; font-weight:800; color:#166534; margin:4px 0;'>{km_tot_display}</div>
+              <small class='muted'>Destino: {esc(r['destination'] or 'T.O. / Operação')}</small>
+            </div>
+
+            <div style='background:#fff; border:1px solid #e2e8f0; border-radius:8px; padding:10px;'>
+              <span style='font-size:0.75rem; font-weight:700; color:#64748b; text-transform:uppercase;'>Equipe & Assinatura</span>
+              <div style='font-size:0.88rem; font-weight:700; margin:4px 0;'>Ajudante: {esc(r['helper_name'] or 'Sem ajudante')}</div>
+              <div style='font-size:0.85rem;'>Ficha: {sig_badge}</div>
+            </div>
+          </div>
+
+          <div style='background:#fff; border:1px solid #e2e8f0; border-radius:8px; padding:12px;'>
+            <b style='font-size:0.85rem; color:#334155; text-transform:uppercase;'>💰 Despesas Declaradas da Viagem</b>
+            {exp_html}
+          </div>
+        </section>
+        """
+
         if not rows:
             body='<div class="empty">Esta carga não possui pedidos vinculados.</div>'
-        elif route_status != 'Em rota':
+        elif route_status not in ('Em rota', 'Aguardando Chegada'):
             cards_list = []
             for ro in rows:
                 photo_btn = f"<a class='btn small ghost' style='color:#059669; border-color:#059669; font-weight:700;' href='/orders/{ro['order_id']}/receipt-image' target='_blank'>📷 Ver Foto do Canhoto</a>" if (ro['has_photo'] or ro['receipt_photo']) else ""
@@ -5122,13 +7228,30 @@ document.addEventListener('DOMContentLoaded', function(){
                 loc_url = ro['dr_loc_link'] if ('dr_loc_link' in ro.keys() and ro['dr_loc_link']) else (ro['delivery_location_link'] if 'delivery_location_link' in ro.keys() else None)
                 map_btn = f"<a class='btn small ghost' style='color:#0369a1; border-color:#0369a1; font-weight:700;' href='{esc(loc_url)}' target='_blank'>🌐 Ver Mapa no Google Maps</a>" if loc_url else ""
                 btns_html = f"<div class='full' style='display:flex;gap:10px;margin-top:6px;flex-wrap:wrap;'>{photo_btn}{sig_btn}{map_btn}</div>" if (photo_btn or sig_btn or map_btn) else ""
+                
+                o_items = items_by_order.get(ro['order_id'], [])
+                items_block = ''
+                if o_items:
+                    it_rows = ''.join(
+                        f"<tr><td style='padding:4px 6px;'>{esc(it['product_name'])}</td><td style='padding:4px 6px; text-align:center;'>{to_float(it['quantity']):.0f} {esc(it['unit'] or '')}</td><td style='padding:4px 6px; text-align:center;'>{badge(it['status'] or 'Entregue')}</td><td style='padding:4px 6px;'>{esc(it['problem_notes'] or '—')}</td></tr>"
+                        for it in o_items
+                    )
+                    items_block = f"""<details class='settlement-items-collapse' style='margin-top:8px; border:1px solid #e2e8f0; border-radius:6px; background:#f8fafc; padding:6px 10px;'>
+                        <summary style='cursor:pointer; font-weight:700; color:#166534; font-size:0.83rem;'>📦 Produtos da entrega ({len(o_items)} itens) ▾</summary>
+                        <table style='width:100%; border-collapse:collapse; margin-top:6px; font-size:0.8rem;'>
+                            <thead><tr style='border-bottom:1px solid #cbd5e1; color:#64748b;'><th style='text-align:left; padding:3px 6px;'>Produto</th><th style='text-align:center; padding:3px 6px;'>Qtd</th><th style='text-align:center; padding:3px 6px;'>Status</th><th style='text-align:left; padding:3px 6px;'>Ocorrência</th></tr></thead>
+                            <tbody>{it_rows}</tbody>
+                        </table>
+                    </details>"""
+
                 cards_list.append(
-                    f"<article class='settlement-order'><div class='settlement-main'><div><b>{esc(ro['order_number'])}</b><small>{esc(ro['client'] or '')} · {esc(ro['city'] or '')} · Vendedor: {esc(ro['seller_name'] or 'Não informado')} · {fmt_num(ro['weight_kg'])} kg · {money_visible(can_view_financial, ro['total_value'])}</small></div>{badge(ro['status'])}</div><div class='settlement-fields'><label>Método pagamento<input value='{esc(ro['payment_method'] or 'Não informado')}' readonly></label><label>Data entrega/ocorrência<input value='{esc(brdate(ro['delivered_at']))}' readonly></label><label class='full'>Observação final<textarea readonly>{esc(ro['final_notes'] or 'Sem observação')}</textarea></label>{btns_html}</div></article>"
+                    f"<article class='settlement-order'><div class='settlement-main'><div><b>{esc(ro['order_number'])}</b><small>{esc(ro['client'] or '')} · {esc(ro['city'] or '')} · Vendedor: {esc(ro['seller_name'] or 'Não informado')} · {fmt_num(ro['weight_kg'])} kg · {money_visible(can_view_financial, ro['total_value'])}</small></div>{badge(ro['status'])}</div><div class='settlement-fields'><label>Método pagamento<input value='{esc(ro['payment_method'] or 'Não informado')}' readonly></label><label>Data entrega/ocorrência<input value='{esc(brdate(ro['delivered_at']))}' readonly></label><label class='full'>Observação final<textarea readonly>{esc(ro['final_notes'] or 'Sem observação')}</textarea></label>{btns_html}</div>{items_block}</article>"
                 )
             cards = ''.join(cards_list)
-            body=f"""<section class='panel'><div class='alert info'>Carga já finalizada em status <b>{esc(route_status)}</b>. Edição bloqueada para preservar o histórico.</div><section class='route-hero settlement-hero'><div><h2>{esc(r['name'])}</h2><p>Carga #{r['id']} · {brdate(r['date'])} · {esc(r['route_name'] or 'Rota livre')} · {esc(r['driver'] or 'Sem motorista')} · {esc((r['vehicle'] or '')+' '+(r['plate'] or ''))}</p></div><div>{badge(r['status'])}<b>{fmt_num(r['total_weight'])} kg</b></div></section><div class='settlement-list'>{cards}</div><div class='form-actions'><a class='btn ghost' href='/load-settlement/{r['id']}/print-report'>Relatório compacto (1 página)</a><a class='btn ghost' href='/routes/{r['id']}'>Voltar para operação da carga</a></div></section>"""
+            body=f"""<section class='panel'><div class='alert info'>Carga já finalizada em status <b>{esc(route_status)}</b>. Edição bloqueada para preservar o histórico.</div><section class='route-hero settlement-hero'><div><h2>{esc(r['name'])}</h2><p>Carga #{r['id']} · {brdate(r['date'])} · {esc(r['route_name'] or 'Rota livre')} · {esc(r['driver'] or 'Sem motorista')} · {esc((r['vehicle'] or '')+' '+(r['plate'] or ''))}</p></div><div>{badge(r['status'])}<b>{fmt_num(r['total_weight'])} kg</b></div></section>{telemetry_card_html}<div class='settlement-list'>{cards}</div><div class='form-actions'><a class='btn ghost' href='/load-settlement/{r['id']}/print-report'>Relatório compacto (1 página)</a><a class='btn ghost' href='/routes/{r['id']}'>Voltar para operação da carga</a></div></section>"""
         else:
             trs=''
+            arrival_notice = '<div class="alert warning" style="background:#fef3c7; border-color:#fde047; color:#92400e; margin-bottom:1rem; padding:12px 16px; border-radius:8px; font-size:0.95rem;">🏁 <b>Carga Aguardando Registro de Chegada:</b> As entregas desta carga foram concluídas pelo motorista no aplicativo mobile. O acerto e conferência dos pedidos pode ser realizado abaixo.</div>' if route_status == 'Aguardando Chegada' else ''
             for ro in rows:
                 delivered_date=(ro['delivered_at'] or today())[:10]
                 photo_btn = f"<a class='btn small ghost' style='color:#059669; border-color:#059669; font-weight:700;' href='/orders/{ro['order_id']}/receipt-image' target='_blank'>📷 Ver Foto do Canhoto</a>" if (ro['has_photo'] or ro['receipt_photo']) else ""
@@ -5136,8 +7259,121 @@ document.addEventListener('DOMContentLoaded', function(){
                 loc_url = ro['dr_loc_link'] if ('dr_loc_link' in ro.keys() and ro['dr_loc_link']) else (ro['delivery_location_link'] if 'delivery_location_link' in ro.keys() else None)
                 map_btn = f"<a class='btn small ghost' style='color:#0369a1; border-color:#0369a1; font-weight:700;' href='{esc(loc_url)}' target='_blank'>🌐 Ver Mapa no Google Maps</a>" if loc_url else ""
                 rec_btns = f"<div class='full' style='display:flex;gap:10px;margin-top:6px;flex-wrap:wrap;'>{photo_btn}{sig_btn}{map_btn}</div>" if (photo_btn or sig_btn or map_btn) else ""
-                trs += f"""<article class='settlement-order'><div class='settlement-main'><label class='settlement-check'><input type='checkbox' name='ok_{ro['order_id']}' class='settlement-ok' required> <span>Checklist conferido</span></label><div><b>{esc(ro['order_number'])}</b><small>{esc(ro['client'] or '')} · {esc(ro['city'] or '')} · Vendedor: {esc(ro['seller_name'] or 'Não informado')} · {fmt_num(ro['weight_kg'])} kg · {money_visible(can_view_financial, ro['total_value'])}</small></div>{badge(ro['status'])}</div><div class='settlement-fields'><label>Resultado<select name='result_{ro['order_id']}' class='settlement-result'><option value='entregue'>Entregue</option><option value='problema'>Registrar problema</option></select></label><label>Data entrega/ocorrência<input type='date' name='date_{ro['order_id']}' value='{esc(delivered_date)}' required></label><label>Método pagamento<select name='pay_{ro['order_id']}'>{payment_method_options(ro['payment_method'] or '')}</select></label><label>Tipo de problema<select name='ptype_{ro['order_id']}'>{option(PROBLEM_TYPES,'Outro motivo')}</select></label><label class='full'>Observação do acerto<textarea name='obs_{ro['order_id']}' placeholder='Recebedor, divergência, comprovante ou descrição do problema...'>{esc(ro['final_notes'] or '')}</textarea></label>{rec_btns}</div></article>"""
-            body=f"""<form method='post' action='/load-settlement/{r['id']}/finish' class='settlement-form needs-confirm' data-confirm-text='Confirma concluir a carga? A baixa será aplicada em todos os pedidos conferidos.'><section class='route-hero settlement-hero'><div><h2>{esc(r['name'])}</h2><p>Carga #{r['id']} · {brdate(r['date'])} · {esc(r['route_name'] or 'Rota livre')} · {esc(r['driver'] or 'Sem motorista')} · {esc((r['vehicle'] or '')+' '+(r['plate'] or ''))}</p></div><div>{badge(r['status'])}<b>{fmt_num(r['total_weight'])} kg</b></div></section><div class='settlement-tools'><div style='display: flex; align-items: center; gap: 15px; flex-wrap: wrap;'><label class='settlement-check'><input type='checkbox' id='markAllDelivered'> <span>Marcar todos como entregues</span></label><button type='button' id='btnSetDateSelected' class='btn' style='font-size: 13px; padding: 6px 12px; height: auto;'>Definir Data para Selecionados</button></div><small class='muted'>Se houver problema em algum pedido, troque o resultado para <b>Registrar problema</b>.</small></div><div class='alert info'>Marque todos os checklists para liberar a conclusão. Ao concluir, cada pedido será baixado como <b>entregue</b> ou <b>problema</b> conforme selecionado.</div><div class='settlement-list'>{trs}</div><div class='form-actions sticky-actions'><button class='success-btn'>Concluir Carga</button><a class='btn ghost' href='/routes/{r['id']}'>Voltar para operação da carga</a></div></form>
+                
+                o_items = items_by_order.get(ro['order_id'], [])
+                items_block = ''
+                if o_items:
+                    it_rows = ''
+                    for it in o_items:
+                        it_id = it['id']
+                        is_prob = (it['status'] == 'Problema')
+                        it_prob_text = it['problem_notes'] or ''
+                        sel_ok = 'selected' if not is_prob else ''
+                        sel_prob = 'selected' if is_prob else ''
+                        prob_style = 'block' if is_prob else 'none'
+                        prob_req = 'required' if is_prob else ''
+
+                        it_rows += f"""<tr style='border-bottom:1px solid #e2e8f0;'>
+                            <td style='padding:6px 8px; vertical-align:middle;'>
+                                <b>{esc(it['product_name'])}</b>
+                                <br><small class='muted'>{esc(it['product_code'] or '')} {f"· {esc(it['notes'])}" if it['notes'] else ""}</small>
+                            </td>
+                            <td style='padding:6px 8px; text-align:center; vertical-align:middle;'>
+                                <b>{to_float(it['quantity']):.0f}</b> {esc(it['unit'] or '')}
+                                <br><small class='muted'>{fmt_num(it['weight_kg'])} kg</small>
+                            </td>
+                            <td style='padding:6px 8px; text-align:center; vertical-align:middle;'>
+                                <select name='item_status_{it_id}' class='form-control item-status-selector' data-item-id='{it_id}' data-order-id='{ro['order_id']}' style='padding:4px 8px; font-size:0.82rem; border-radius:4px;'>
+                                    <option value='Entregue' {sel_ok}>✅ Entregue</option>
+                                    <option value='Problema' {sel_prob}>❌ Problema</option>
+                                </select>
+                            </td>
+                            <td style='padding:6px 8px; vertical-align:middle;'>
+                                <div id='item_prob_wrap_{it_id}' style='display:{prob_style};'>
+                                    <input type='text' name='item_problem_{it_id}' id='item_problem_{it_id}' class='form-control item-problem-input' value='{esc(it_prob_text)}' placeholder='⚠️ Descreva obrigatoriamente o que aconteceu com este produto...' style='width:100%; border:1px solid #ef4444; background:#fef2f2; font-size:0.82rem; padding:5px 8px; border-radius:4px;' {prob_req}>
+                                </div>
+                                <span id='item_ok_badge_{it_id}' class='muted' style='display:{'none' if is_prob else 'inline'}; font-size:0.75rem;'>Item sem ocorrência</span>
+                            </td>
+                        </tr>"""
+
+                    items_block = f"""<details class='settlement-items-collapse' open style='margin-top:10px; border:1px solid #cbd5e1; border-radius:6px; background:#f8fafc; padding:8px 10px;'>
+                        <summary style='cursor:pointer; font-weight:700; color:#166534; font-size:0.85rem;'>📦 Conferência por Produto ({len(o_items)} itens) ▾</summary>
+                        <div style='overflow-x:auto; margin-top:6px;'>
+                            <table style='width:100%; border-collapse:collapse; background:#ffffff; border-radius:4px; font-size:0.82rem;'>
+                                <thead>
+                                    <tr style='background:#f1f5f9; color:#475569; text-align:left; font-size:0.75rem; text-transform:uppercase;'>
+                                        <th style='padding:6px 8px;'>Produto</th>
+                                        <th style='padding:6px 8px; text-align:center;'>Qtd</th>
+                                        <th style='padding:6px 8px; text-align:center;'>Status</th>
+                                        <th style='padding:6px 8px;'>Ocorrência no Produto</th>
+                                    </tr>
+                                </thead>
+                                <tbody>{it_rows}</tbody>
+                            </table>
+                        </div>
+                    </details>"""
+
+                trs += f"""<article class='settlement-order'><div class='settlement-main'><label class='settlement-check'><input type='checkbox' name='ok_{ro['order_id']}' class='settlement-ok' required> <span>Checklist conferido</span></label><div><b>{esc(ro['order_number'])}</b><small>{esc(ro['client'] or '')} · {esc(ro['city'] or '')} · Vendedor: {esc(ro['seller_name'] or 'Não informado')} · {fmt_num(ro['weight_kg'])} kg · {money_visible(can_view_financial, ro['total_value'])}</small></div>{badge(ro['status'])}</div><div class='settlement-fields'><label>Resultado<select name='result_{ro['order_id']}' class='settlement-result'><option value='entregue'>Entregue</option><option value='problema'>Registrar problema</option></select></label><label>Data entrega/ocorrência<input type='date' name='date_{ro['order_id']}' value='{esc(delivered_date)}' required></label><label>Método pagamento<select name='pay_{ro['order_id']}'>{payment_method_options(ro['payment_method'] or '')}</select></label><label>Tipo de problema<select name='ptype_{ro['order_id']}'>{option(PROBLEM_TYPES,'Outro motivo')}</select></label><label class='full'>Observação do acerto<textarea name='obs_{ro['order_id']}' placeholder='Recebedor, divergência, comprovante ou descrição do problema...'>{esc(ro['final_notes'] or '')}</textarea></label>{rec_btns}</div>{items_block}</article>"""
+            
+            settlement_js = """<script>
+            document.addEventListener('DOMContentLoaded', function() {
+                document.querySelectorAll('.item-status-selector').forEach(function(sel) {
+                    sel.addEventListener('change', function() {
+                        var itemId = this.dataset.itemId;
+                        var orderId = this.dataset.orderId;
+                        var wrap = document.getElementById('item_prob_wrap_' + itemId);
+                        var badge = document.getElementById('item_ok_badge_' + itemId);
+                        var input = document.getElementById('item_problem_' + itemId);
+                        if (this.value === 'Problema') {
+                            if (wrap) wrap.style.display = 'block';
+                            if (badge) badge.style.display = 'none';
+                            if (input) {
+                                input.required = true;
+                                input.focus();
+                            }
+                            var orderResult = document.querySelector('select[name="result_' + orderId + '"]');
+                            if (orderResult) {
+                                orderResult.value = 'problema';
+                            }
+                        } else {
+                            if (wrap) wrap.style.display = 'none';
+                            if (badge) badge.style.display = 'inline';
+                            if (input) {
+                                input.required = false;
+                            }
+                        }
+                    });
+                });
+
+                var form = document.querySelector('.settlement-form');
+                if (form) {
+                    form.addEventListener('submit', function(e) {
+                        var invalidInput = null;
+                        document.querySelectorAll('.item-status-selector').forEach(function(sel) {
+                            if (sel.value === 'Problema') {
+                                var itemId = sel.dataset.itemId;
+                                var input = document.getElementById('item_problem_' + itemId);
+                                if (input && !input.value.trim()) {
+                                    invalidInput = input;
+                                    var details = input.closest('details');
+                                    if (details) details.open = true;
+                                }
+                            }
+                        });
+                        if (invalidInput) {
+                            e.preventDefault();
+                            alert('Atenção: É obrigatório descrever o que aconteceu com todos os produtos marcados com problema!');
+                            invalidInput.focus();
+                            invalidInput.style.borderColor = '#b91c1c';
+                            invalidInput.style.boxShadow = '0 0 0 3px rgba(220, 38, 38, 0.3)';
+                            return false;
+                        }
+                    });
+                }
+            });
+            </script>"""
+
+            body=f"""<form method='post' action='/load-settlement/{r['id']}/finish' class='settlement-form needs-confirm' data-confirm-text='Confirma concluir a carga? A baixa será aplicada em todos os pedidos conferidos.'>{arrival_notice}<section class='route-hero settlement-hero'><div><h2>{esc(r['name'])}</h2><p>Carga #{r['id']} · {brdate(r['date'])} · {esc(r['route_name'] or 'Rota livre')} · {esc(r['driver'] or 'Sem motorista')} · {esc((r['vehicle'] or '')+' '+(r['plate'] or ''))}</p></div><div>{badge(r['status'])}<b>{fmt_num(r['total_weight'])} kg</b></div></section>{telemetry_card_html}<div class='settlement-tools'><div style='display: flex; align-items: center; gap: 15px; flex-wrap: wrap;'><label class='settlement-check'><input type='checkbox' id='markAllDelivered'> <span>Marcar todos como entregues</span></label><button type='button' id='btnSetDateSelected' class='btn' style='font-size: 13px; padding: 6px 12px; height: auto;'>Definir Data para Selecionados</button></div><small class='muted'>Se houver problema em algum pedido, troque o resultado para <b>Registrar problema</b>.</small></div><div class='alert info'>Marque todos os checklists para liberar a conclusão. Ao concluir, cada pedido será baixado como <b>entregue</b> ou <b>problema</b> conforme selecionado.</div><div class='settlement-list'>{trs}</div><div class='form-actions sticky-actions'><button class='success-btn'>Concluir Carga</button><a class='btn ghost' href='/routes/{r['id']}'>Voltar para operação da carga</a></div></form>{settlement_js}
             <div class='settlement-date-overlay' id='settlementDateOverlay'>
               <div class='settlement-date-modal' role='dialog' aria-modal='true' aria-labelledby='settlementDateTitle'>
                 <button type='button' class='settlement-date-close' id='settlementDateClose' aria-label='Fechar'>&times;</button>
@@ -5157,7 +7393,7 @@ document.addEventListener('DOMContentLoaded', function(){
                 </form>
               </div>
             </div>"""
-        return self.send_html(layout(u,'Acerto de carga',search_box+body,'Fechamento operacional da carga e baixa final das entregas'))
+        return self.send_html(layout(u,'Acerto de Carga',body,'Fechamento operacional da carga e baixa final das entregas',search_action='/load-settlement',search_placeholder='Buscar carga para acerto por número, nome ou motorista...',search_q=q))
 
     def post_load_settlement_set_date(self, u, rid):
         d = self.post_data()
@@ -5172,8 +7408,8 @@ document.addEventListener('DOMContentLoaded', function(){
             r = db.execute('SELECT * FROM routes WHERE id=?', (rid,)).fetchone()
             if not r:
                 return self.fail(u, 'Não encontrado', 'Carga não encontrada.', 404)
-            if normalize_route_status(r['status']) != 'Em rota':
-                return self.fail(u, 'Operação inválida', 'Somente cargas em rota podem ter as datas de pedidos alteradas.', 400)
+            if normalize_route_status(r['status']) not in ('Em rota', 'Aguardando Chegada'):
+                return self.fail(u, 'Operação inválida', 'Somente cargas em rota ou aguardando chegada podem ter as datas de pedidos alteradas.', 400)
                 
             placeholders = ','.join('?' for _ in order_ids)
             ros = db.execute(
@@ -5235,6 +7471,1573 @@ document.addEventListener('DOMContentLoaded', function(){
         self.end_headers()
         self.wfile.write("OK".encode('utf-8'))
 
+    def map_view(self, u):
+        can_view_financial = self.can_view_financial(u)
+        with conn() as db:
+            routes = db.execute("SELECT DISTINCT route_name FROM orders WHERE route_name IS NOT NULL AND route_name!='' AND status NOT IN ('Cancelado', 'Acertado', 'Entregue') ORDER BY route_name").fetchall()
+            cities = db.execute("SELECT DISTINCT city FROM orders WHERE city IS NOT NULL AND city!='' AND status NOT IN ('Cancelado', 'Acertado', 'Entregue') ORDER BY city").fetchall()
+            drivers = db.execute("SELECT id, name FROM drivers WHERE active=1 ORDER BY name").fetchall()
+            vehicles = db.execute("SELECT id, name, plate, capacity_kg, capacity FROM vehicles WHERE active=1 ORDER BY name").fetchall()
+
+        route_names = [r['route_name'] for r in routes]
+        if 'Mista' not in route_names:
+            route_names.insert(0, 'Mista')
+
+        route_options = ''.join(f"<option value='{esc(r)}'>{esc(r)}</option>" for r in route_names)
+        city_options = ''.join(f"<option value='{esc(c['city'])}'>{esc(c['city'])}</option>" for c in cities)
+        driver_options = '<option value="">Selecione o motorista</option>' + ''.join(f"<option value='{d['id']}'>{esc(d['name'])}</option>" for d in drivers)
+        vehicle_options = '<option value="">Selecione o veículo</option>' + ''.join(
+            f"<option value='{v['id']}' data-capacity='{esc(v['capacity_kg'] if v['capacity_kg'] is not None else (v['capacity'] or 11000))}'>{esc(v['name'])} ({esc(v['plate'] or 'sem placa')}) - {fmt_num(v['capacity_kg'] if v['capacity_kg'] is not None else (v['capacity'] or 0))} kg</option>"
+            for v in vehicles
+        )
+        
+        default_load_name = f"Carga {datetime.now().strftime('%d/%m %H:%M')}"
+        default_capacity = esc(get_setting('load_capacity_kg', '11000'))
+
+        content = f"""
+        <div id='mapPageContainer' class='map-page-container' style='display:grid; grid-template-columns: 360px 1fr; gap:12px; height:calc(100vh - 130px); min-height:550px; position:relative;'>
+          
+          <!-- Painel Lateral / Gaveta de Pedidos e Montagem de Cargas -->
+          <div id='mapSidebarPanel' class='map-sidebar-panel' style='background:#ffffff; border:1px solid var(--border); border-radius:var(--radius); padding:12px; display:flex; flex-direction:column; gap:10px; height:100%; box-shadow:var(--shadow-sm); overflow:hidden; transition:all 0.2s ease-in-out;'>
+            
+            <!-- Barra Superior de Alternância de Abas e Recolhimento -->
+            <div style='display:flex; align-items:center; justify-content:space-between; gap:6px; padding-bottom:4px; border-bottom:1px solid #f1f5f9;'>
+              <div style='display:flex; gap:6px; flex:1;'>
+                <button type='button' id='tabBtnOrders' class='map-tab-btn active'>
+                  <span>📋 Pedidos & SLA</span>
+                  <span id='mapTotalBadge' class='badge' style='background:#e2e8f0; color:#1e293b; padding:2px 6px; font-size:11px;'>0</span>
+                </button>
+                <button type='button' id='tabBtnDraft' class='map-tab-btn'>
+                  <span>🚚 Montar Carga</span>
+                  <span id='draftBadge' class='badge' style='background:#f59e0b; color:#ffffff; padding:2px 6px; font-size:11px;'>0</span>
+                </button>
+              </div>
+              <button type='button' id='btnToggleSidebar' class='btn small ghost' title='Ocultar / Expandir Painel' style='padding:6px 9px; font-size:12px; border-radius:6px;'>◀</button>
+            </div>
+
+            <!-- ================= ABA 1: PEDIDOS & SLA ================= -->
+            <div id='tabContentOrders' style='display:flex; flex-direction:column; gap:8px; flex:1; min-height:0;'>
+              <!-- Chips Compactos de SLA -->
+              <div style='display:flex; gap:4px; overflow-x:auto; padding-bottom:2px;'>
+                <div class='map-sla-pill' data-filter='all' style='flex:1; min-width:55px; background:#f8fafc; border:1px solid var(--border); border-radius:6px; padding:4px 6px; text-align:center; cursor:pointer;'>
+                  <small style='color:#64748b; font-size:10px; font-weight:700; display:block;'>TODOS</small>
+                  <strong id='cntAll' style='font-size:0.95rem; color:#0f172a;'>0</strong>
+                </div>
+                <div class='map-sla-pill' data-filter='late' style='flex:1; min-width:55px; background:#fef2f2; border:1px solid #fecaca; border-radius:6px; padding:4px 6px; text-align:center; cursor:pointer;'>
+                  <small style='color:#991b1b; font-size:10px; font-weight:700; display:block;'>🔴 VENCIDOS</small>
+                  <strong id='cntLate' style='font-size:0.95rem; color:#dc2626;'>0</strong>
+                </div>
+                <div class='map-sla-pill' data-filter='risk' style='flex:1; min-width:55px; background:#fefce8; border:1px solid #fef08a; border-radius:6px; padding:4px 6px; text-align:center; cursor:pointer;'>
+                  <small style='color:#854d0e; font-size:10px; font-weight:700; display:block;'>🟡 RISCO</small>
+                  <strong id='cntRisk' style='font-size:0.95rem; color:#d97706;'>0</strong>
+                </div>
+                <div class='map-sla-pill' data-filter='ok' style='flex:1; min-width:55px; background:#f0fdf4; border:1px solid #bbf7d0; border-radius:6px; padding:4px 6px; text-align:center; cursor:pointer;'>
+                  <small style='color:#166534; font-size:10px; font-weight:700; display:block;'>🟢 NO PRAZO</small>
+                  <strong id='cntOk' style='font-size:0.95rem; color:#16a34a;'>0</strong>
+                </div>
+                <div class='map-sla-pill' data-filter='in_route' style='flex:1; min-width:55px; background:#faf5ff; border:1px solid #e9d5ff; border-radius:6px; padding:4px 6px; text-align:center; cursor:pointer;'>
+                  <small style='color:#6b21a8; font-size:10px; font-weight:700; display:block;'>🟣 EM ROTA</small>
+                  <strong id='cntInRoute' style='font-size:0.95rem; color:#9333ea;'>0</strong>
+                </div>
+              </div>
+
+              <!-- Indicadores de GPS Rural vs Ponto Aproximado -->
+              <div style='display:flex; gap:6px; font-size:11px; margin:2px 0;'>
+                <div style='flex:1; background:#f0fdf4; border:1px solid #bbf7d0; border-radius:6px; padding:4px 6px; color:#166534; display:flex; align-items:center; justify-content:space-between; font-weight:600;' title='Pedidos com localização exata da fazenda confirmada por motorista ou mapa'>
+                  <span>🌾 Rural Confirmado:</span>
+                  <b id='cntVerifiedRural' style='font-size:12px;'>0</b>
+                </div>
+                <div style='flex:1; background:#fefce8; border:1px solid #fef08a; border-radius:6px; padding:4px 6px; color:#854d0e; display:flex; align-items:center; justify-content:space-between; font-weight:600;' title='Pedidos com ponto provisório no centro da cidade (1ª Entrega Rural)'>
+                  <span>⚠️ Centro Cidade:</span>
+                  <b id='cntCityApprox' style='font-size:12px;'>0</b>
+                </div>
+              </div>
+
+              <!-- Filtros Compactos de Busca, Rota, Cidade e Status -->
+              <div style='display:flex; flex-direction:column; gap:5px;'>
+                <input type='text' id='mapSearchInput' class='form-control' placeholder='🔍 Buscar cliente, pedido, cidade...' style='width:100%; padding:6px 10px; border:1px solid var(--border); border-radius:var(--radius-sm); font-size:0.82rem;'>
+                <div style='display:grid; grid-template-columns: 1fr 1fr; gap:5px;'>
+                  <select id='mapRouteSelect' class='form-control' style='padding:5px 6px; border:1px solid var(--border); border-radius:var(--radius-sm); font-size:0.78rem;'>
+                    <option value=''>Todas as Rotas</option>
+                    {route_options}
+                  </select>
+                  <select id='mapCitySelect' class='form-control' style='padding:5px 6px; border:1px solid var(--border); border-radius:var(--radius-sm); font-size:0.78rem;'>
+                    <option value=''>Todas as Cidades</option>
+                    {city_options}
+                  </select>
+                </div>
+                <div style='display:grid; grid-template-columns: 1fr auto; gap:5px;'>
+                  <select id='mapStatusSelect' class='form-control' style='padding:5px 6px; border:1px solid var(--border); border-radius:var(--radius-sm); font-size:0.78rem;'>
+                    <option value=''>Todos Status Ativos</option>
+                    <option value='Venda'>Venda (Aguardando Faturamento)</option>
+                    <option value='Faturado'>Faturado (Pronto p/ Carga)</option>
+                    <option value='Carga Montada'>Carga Montada (Aguardando Saída)</option>
+                    <option value='Saiu para entrega'>Saiu para entrega (Em Rota)</option>
+                    <option value='Agendado'>Agendado</option>
+                    <option value='Problema'>Com problema / Ocorrência</option>
+                  </select>
+                  <button type='button' id='btnResetFilters' class='btn small ghost' title='Limpar filtros' style='padding:5px 8px; font-size:11px;'>↺</button>
+                </div>
+                <div style='display:flex; gap:6px; margin-top:2px;'>
+                  <button type='button' id='btnGeocodeAll' class='btn small' style='flex:1; background:#0284c7; border-color:#0284c7; color:#fff; font-size:0.75rem; font-weight:700; padding:5px 8px; display:flex; align-items:center; justify-content:center; gap:4px;' title='Localizar pedidos sem GPS automaticamente usando a API do Google Maps'>
+                    ⚡ Geocodificar sem GPS (Google)
+                  </button>
+                  <button type='button' id='btnSidebarLocateMe' class='btn small ghost' style='background:#f0f9ff; border:1px solid #bae6fd; color:#0369a1; font-size:0.75rem; font-weight:700; padding:5px 8px; display:flex; align-items:center; justify-content:center; gap:4px;' title='Centralizar no meu GPS atual'>
+                    🎯 Minha Posição
+                  </button>
+                </div>
+                <div id='geocodeFeedbackBox' style='display:none; font-size:11px; padding:6px 8px; border-radius:4px; font-weight:600;'></div>
+              </div>
+
+              <!-- Banner de Ação de Ponto GPS / Fixação -->
+              <div id='selectedOrderBanner' class='alert info' style='display:none; padding:7px 9px; font-size:0.78rem; margin:0; background:#eff6ff; border-color:#bfdbfe; color:#1e40af;'>
+                <div id='selectedOrderText'>Selecione um pedido abaixo para marcar a localização.</div>
+                <div style='display:flex; gap:6px; margin-top:5px;'>
+                  <button type='button' id='btnSavePinAction' class='btn small' style='flex:1; font-weight:700; background:#0284c7; color:#ffffff; padding:4px 8px; font-size:11px;' disabled>📍 Fixar Ponto</button>
+                  <button type='button' id='btnCancelPinAction' class='btn small ghost' style='padding:4px 6px; font-size:11px;'>Cancelar</button>
+                </div>
+              </div>
+
+              <!-- Lista Rolável de Pedidos com Checkbox e Detalhes -->
+              <div id='mapOrdersList' style='flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:5px; padding-right:2px; min-height:100px;'>
+                <div class='empty' style='padding:16px 0; font-size:0.85rem;'>Carregando pedidos em andamento...</div>
+              </div>
+            </div>
+
+            <!-- ================= ABA 2: MONTAGEM DE CARGA ================= -->
+            <div id='tabContentDraft' style='display:none; flex-direction:column; gap:8px; flex:1; min-height:0;'>
+              <!-- Resumo da Carga em Montagem -->
+              <div style='background:#fffbeb; border:1px solid #fde68a; border-radius:8px; padding:8px 10px;'>
+                <div style='display:flex; justify-content:space-between; align-items:center;'>
+                  <span style='font-size:0.82rem; font-weight:700; color:#92400e;'>🚚 Resumo da Nova Carga</span>
+                  <span id='draftOrderCountLabel' class='badge ok' style='background:#f59e0b; color:#fff; font-size:11px;'>0 pedidos</span>
+                </div>
+                
+                <div style='display:flex; justify-content:space-between; align-items:baseline; margin:4px 0 2px;'>
+                  <small style='color:#78350f; font-weight:600;'>Peso Acumulado:</small>
+                  <span style='font-size:0.88rem;'><strong id='draftTotalWeightText' style='color:#b45309;'>0</strong> / <span id='draftCapacityMaxText'>{default_capacity}</span> kg</span>
+                </div>
+
+                <div class='progress' style='height:8px; margin:4px 0 3px; background:#fef3c7;'>
+                  <i id='draftCapacityBar' style='background:#f59e0b; width:0%; transition:width 0.3s ease;'></i>
+                </div>
+                <small id='draftCapacityAlert' style='font-size:11px; color:#92400e; font-weight:600;'>Selecione pedidos no mapa ou lista para preencher a carga.</small>
+              </div>
+
+              <!-- Dados e Formulário Rápido de Criação -->
+              <div style='display:flex; flex-direction:column; gap:6px;'>
+                <div style='display:grid; grid-template-columns: 1fr 1fr; gap:5px;'>
+                  <div>
+                    <label style='font-size:11px; font-weight:700; color:#475569; display:block; margin-bottom:2px;'>Nome da Carga</label>
+                    <input type='text' id='draftName' class='form-control' value='{default_load_name}' style='padding:5px 8px; font-size:0.80rem; border:1px solid var(--border); border-radius:var(--radius-sm);'>
+                  </div>
+                  <div>
+                    <label style='font-size:11px; font-weight:700; color:#475569; display:block; margin-bottom:2px;'>Data</label>
+                    <input type='date' id='draftDate' class='form-control' value='{today()}' style='padding:5px 8px; font-size:0.80rem; border:1px solid var(--border); border-radius:var(--radius-sm);'>
+                  </div>
+                </div>
+
+                <div style='display:grid; grid-template-columns: 1fr 1fr; gap:5px;'>
+                  <div>
+                    <label style='font-size:11px; font-weight:700; color:#475569; display:block; margin-bottom:2px;'>Motorista</label>
+                    <select id='draftDriverSelect' class='form-control' style='padding:5px 8px; font-size:0.80rem; border:1px solid var(--border); border-radius:var(--radius-sm);'>
+                      {driver_options}
+                    </select>
+                  </div>
+                  <div>
+                    <label style='font-size:11px; font-weight:700; color:#475569; display:block; margin-bottom:2px;'>Veículo</label>
+                    <select id='draftVehicleSelect' class='form-control' style='padding:5px 8px; font-size:0.80rem; border:1px solid var(--border); border-radius:var(--radius-sm);'>
+                      {vehicle_options}
+                    </select>
+                  </div>
+                </div>
+
+                <div style='display:grid; grid-template-columns: 1fr 1fr; gap:5px;'>
+                  <div>
+                    <label style='font-size:11px; font-weight:700; color:#475569; display:block; margin-bottom:2px;'>Rota</label>
+                    <select id='draftRouteSelect' class='form-control' style='padding:5px 8px; font-size:0.80rem; border:1px solid var(--border); border-radius:var(--radius-sm);'>
+                      {route_options}
+                    </select>
+                  </div>
+                  <div>
+                    <label style='font-size:11px; font-weight:700; color:#475569; display:block; margin-bottom:2px;'>Capacidade (kg)</label>
+                    <input type='number' id='draftCapacityInput' class='form-control' value='{default_capacity}' style='padding:5px 8px; font-size:0.80rem; border:1px solid var(--border); border-radius:var(--radius-sm);'>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Lista de Paradas Selecionadas na Carga -->
+              <div style='display:flex; justify-content:space-between; align-items:center; margin-top:2px;'>
+                <span style='font-size:11px; font-weight:700; color:#64748b;'>Paradas da Carga (<span id='draftStopCount'>0</span>):</span>
+                <button type='button' id='btnClearDraft' class='btn small ghost' style='font-size:11px; padding:2px 6px; color:#dc2626;'>🗑️ Limpar Seleção</button>
+              </div>
+
+              <div id='draftStopsList' style='flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:4px; padding-right:2px; min-height:80px;'>
+                <div class='empty' style='padding:16px 0; font-size:0.82rem;'>Nenhum pedido adicionado à carga.<br><small>Clique nos pedidos ou marcadores do mapa para incluir.</small></div>
+              </div>
+
+              <!-- Botão de Ação: Criar Carga -->
+              <button type='button' id='btnSubmitDraftLoad' class='btn primary' style='width:100%; font-weight:800; padding:10px; background:#166534; border-color:#166534; color:#fff; font-size:0.88rem; box-shadow:0 3px 8px rgba(22,101,52,0.3);' disabled>
+                🚚 Confirmar e Gerar Carga
+              </button>
+            </div>
+
+          </div>
+
+          <!-- Canvas Interativo Leaflet com Botão Flutuante de Maximizar -->
+          <div id='mapViewportPanel' class='map-viewport-panel' style='position:relative; background:#e2e8f0; border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; box-shadow:var(--shadow-sm); height:100%;'>
+            
+            <!-- Botão Flutuante de Alternar Painel Lateral -->
+            <button type='button' id='btnFloatToggleSidebar' class='btn small ghost' style='position:absolute; top:12px; left:52px; z-index:1000; background:rgba(255,255,255,0.94); backdrop-filter:blur(4px); box-shadow:0 2px 6px rgba(0,0,0,0.15); border:1px solid var(--border); font-size:12px; font-weight:700; padding:6px 10px;'>
+              ☰ Painel Lateral
+            </button>
+
+            <!-- Botão Flutuante: Onde estou agora (GPS em tempo real) -->
+            <button type='button' id='btnLocateMe' class='btn small' style='position:absolute; top:12px; left:165px; z-index:1000; background:#0284c7; color:#ffffff; border:none; box-shadow:0 2px 8px rgba(2,132,199,0.4); font-size:12px; font-weight:700; padding:6px 12px; border-radius:6px; display:flex; align-items:center; gap:6px; cursor:pointer;' title='Buscar localização GPS do seu dispositivo e centralizar o mapa'>
+              <span id='locateIcon' style='font-size:14px;'>🎯</span>
+              <span id='locateText'>Onde estou agora</span>
+            </button>
+
+            <!-- Banner Informativo para Redirecionamento HTTPS quando acessado via IP em HTTP -->
+            <div id='httpsGpsBanner' style='display:none; position:absolute; top:48px; left:52px; right:52px; z-index:1001; background:#fffbeb; border:1px solid #fde68a; border-radius:8px; padding:8px 12px; font-size:12.5px; color:#92400e; box-shadow:0 3px 10px rgba(0,0,0,0.12); align-items:center; justify-content:space-between; gap:10px;'>
+              <div style='display:flex; align-items:center; gap:8px;'>
+                <span style='font-size:18px;'>🔒</span>
+                <span><b>Conexão HTTP (Porta 3000):</b> O Chrome bloqueia a pergunta de permissão de GPS em rede local HTTP. Para solicitar permissão diretamente, use HTTPS.</span>
+              </div>
+              <button type='button' id='btnBannerGoHttps' class='btn small' style='background:#166534; color:#fff; font-weight:700; border:none; padding:6px 12px; border-radius:6px; white-space:nowrap; cursor:pointer;'>
+                Mudar para HTTPS (Porta 3443) e Ativar GPS
+              </button>
+            </div>
+
+            <!-- Canvas do Mapa -->
+            <div id='interactiveMap' style='width:100%; height:100%; z-index:1;'></div>
+            
+            <!-- Barra Flutuante de Legenda (Compacta) -->
+            <div class='map-legend-bar' style='position:absolute; bottom:12px; left:12px; z-index:1000; background:rgba(255,255,255,0.94); backdrop-filter:blur(4px); border:1px solid var(--border); border-radius:var(--radius-sm); padding:4px 10px; font-size:0.74rem; box-shadow:0 2px 8px rgba(0,0,0,0.12); display:flex; gap:8px; align-items:center; flex-wrap:wrap;'>
+              <span><b>Legenda:</b></span>
+              <span><i style='display:inline-block; width:8px; height:8px; border-radius:50%; background:#dc2626;'></i> Vencido</span>
+              <span><i style='display:inline-block; width:8px; height:8px; border-radius:50%; background:#d97706;'></i> Risco</span>
+              <span><i style='display:inline-block; width:8px; height:8px; border-radius:50%; background:#16a34a;'></i> No Prazo</span>
+              <span><i style='display:inline-block; width:8px; height:8px; border-radius:50%; background:#2563eb;'></i> Agendado</span>
+              <span><i style='display:inline-block; width:8px; height:8px; border-radius:50%; background:#9333ea;'></i> Em Rota</span>
+              <span><i style='display:inline-block; width:8px; height:8px; border-radius:50%; background:#f59e0b;'></i> Na Carga</span>
+            </div>
+          </div>
+        <style>
+        @keyframes pulseGeo {{
+          0% {{ transform: scale(0.6); opacity: 0.95; }}
+          100% {{ transform: scale(2.2); opacity: 0; }}
+        }}
+        .my-location-pulse-marker {{
+          background: transparent !important;
+          border: none !important;
+        }}
+        </style>
+
+        <script>
+        function initDeliveryMapPage() {{
+          var mapElement = document.getElementById('interactiveMap');
+          if (!mapElement) return;
+          if (!window.L) {{
+            setTimeout(initDeliveryMapPage, 100);
+            return;
+          }}
+          if (mapElement._leaflet_id) return;
+
+          // 1. Inicializar Mapa centrado na região operacional
+          var map = L.map('interactiveMap', {{
+            center: [-17.8572, -41.5055],
+            zoom: 9,
+            zoomControl: true
+          }});
+
+          // 2. Camadas Oficiais do Google Maps (Alta Resolução)
+          var googleHybrid = L.tileLayer('https://{{s}}.google.com/vt/lyrs=y&x={{x}}&y={{y}}&z={{z}}', {{
+            maxZoom: 20,
+            subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
+            attribution: '© Google Maps'
+          }});
+
+          var googleStreets = L.tileLayer('https://{{s}}.google.com/vt/lyrs=m&x={{x}}&y={{y}}&z={{z}}', {{
+            maxZoom: 20,
+            subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
+            attribution: '© Google Maps'
+          }});
+
+          var googleTerrain = L.tileLayer('https://{{s}}.google.com/vt/lyrs=p&x={{x}}&y={{y}}&z={{z}}', {{
+            maxZoom: 20,
+            subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
+            attribution: '© Google Maps'
+          }});
+
+          // Camadas Livres / Alternativas (ESRI / OpenStreetMap)
+          var streetLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+            maxZoom: 19,
+            attribution: '© Esri & OpenStreetMap'
+          }});
+
+          var esriSat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+            maxZoom: 19,
+            attribution: 'Tiles © Esri'
+          }});
+          var esriLabels = L.tileLayer('https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+            maxZoom: 19,
+            attribution: 'Labels © Esri'
+          }});
+          var satelliteLayerGroup = L.layerGroup([esriSat, esriLabels]);
+
+          var osmLayer = L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+            maxZoom: 19,
+            subdomains: ['a', 'b', 'c'],
+            attribution: '© OpenStreetMap'
+          }});
+
+          // Ativa Satélite Híbrido Google como camada padrão (ideal para o agro e entregas rurais)
+          googleHybrid.addTo(map);
+
+          L.control.layers({{
+            "🛰️ Google Satélite Híbrido (Vias e Nomes)": googleHybrid,
+            "🗺️ Google Ruas": googleStreets,
+            "⛰️ Google Terreno": googleTerrain,
+            "🗺️ Ruas & Cidades (ESRI)": streetLayer,
+            "🛰️ Satélite Alternativo (ESRI)": satelliteLayerGroup,
+            "🌍 OpenStreetMap Padrão": osmLayer
+          }}, null, {{ position: 'topright', collapsed: false }}).addTo(map);
+
+          setTimeout(function() {{ map.invalidateSize(); }}, 200);
+          setTimeout(function() {{ map.invalidateSize(); }}, 600);
+          window.addEventListener('resize', function() {{ map.invalidateSize(); }});
+
+          // Camadas de elementos interativos
+          var markersLayer = L.layerGroup().addTo(map);
+          var draftRoutePolyline = null;
+          var tempPinMarker = null;
+          
+          var allPoints = [];
+          var currentFilter = 'all';
+          var activeSelectedOrder = null;
+          var tempClickedLatLng = null;
+
+          // Estado da Carga em Montagem (Draft Load)
+          var draftOrderIds = [];
+
+          // 3. Alternância entre Abas e Recolhimento da Barra Lateral
+          var tabBtnOrders = document.getElementById('tabBtnOrders');
+          var tabBtnDraft = document.getElementById('tabBtnDraft');
+          var tabContentOrders = document.getElementById('tabContentOrders');
+          var tabContentDraft = document.getElementById('tabContentDraft');
+          var sidebar = document.getElementById('mapSidebarPanel');
+          var pageContainer = document.getElementById('mapPageContainer');
+          var btnToggleSidebar = document.getElementById('btnToggleSidebar');
+          var btnFloatToggleSidebar = document.getElementById('btnFloatToggleSidebar');
+
+          function showTab(tabName) {{
+            if (tabName === 'orders') {{
+              tabBtnOrders.classList.add('active');
+              tabBtnDraft.classList.remove('active');
+              tabContentOrders.style.display = 'flex';
+              tabContentDraft.style.display = 'none';
+            }} else {{
+              tabBtnDraft.classList.add('active');
+              tabBtnOrders.classList.remove('active');
+              tabContentDraft.style.display = 'flex';
+              tabContentOrders.style.display = 'none';
+            }}
+          }}
+
+          tabBtnOrders.addEventListener('click', function() {{ showTab('orders'); }});
+          tabBtnDraft.addEventListener('click', function() {{ showTab('draft'); }});
+
+          function toggleSidebar() {{
+            var isHidden = (sidebar.style.display === 'none');
+            if (isHidden) {{
+              sidebar.style.display = 'flex';
+              pageContainer.style.gridTemplateColumns = '360px 1fr';
+              btnToggleSidebar.textContent = '◀';
+            }} else {{
+              sidebar.style.display = 'none';
+              pageContainer.style.gridTemplateColumns = '1fr';
+              btnToggleSidebar.textContent = '▶';
+            }}
+            setTimeout(function() {{ map.invalidateSize(); }}, 250);
+          }}
+
+          btnToggleSidebar.addEventListener('click', toggleSidebar);
+          btnFloatToggleSidebar.addEventListener('click', toggleSidebar);
+
+          // 4. Ícones do Mapa
+          function getMarkerIcon(color, seqNumber, isDraft, isRuralVerified) {{
+            if (isDraft) {{
+              var ring = isRuralVerified ? 'border:2px solid #ffffff; box-shadow:0 0 0 3px rgba(22,163,74,0.7), 0 3px 6px rgba(0,0,0,0.35);' : 'border:2px dashed #b45309; box-shadow:0 0 0 3px rgba(245,158,11,0.5), 0 3px 6px rgba(0,0,0,0.35);';
+              var bg = isRuralVerified ? '#16a34a' : '#f59e0b';
+              return L.divIcon({{
+                className: 'draft-load-marker',
+                html: '<div style="background-color:' + bg + '; color:#ffffff; font-weight:800; font-size:11px; width:26px; height:26px; border-radius:50%; ' + ring + ' display:flex; align-items:center; justify-content:center;">' + (seqNumber || '🚚') + '</div>',
+                iconSize: [26, 26],
+                iconAnchor: [13, 13]
+              }});
+            }}
+
+            if (isRuralVerified) {{
+              return L.divIcon({{
+                className: 'custom-map-marker verified-rural-marker',
+                html: '<div style="background-color:' + color + '; width:20px; height:20px; border-radius:50%; border:2px solid #ffffff; box-shadow:0 0 0 2px #16a34a, 0 2px 5px rgba(0,0,0,0.35); display:flex; align-items:center; justify-content:center; color:#fff; font-size:9px; font-weight:800;" title="GPS Rural Confirmado (Fazenda)">✓</div>',
+                iconSize: [22, 22],
+                iconAnchor: [11, 11]
+              }});
+            }}
+
+            return L.divIcon({{
+              className: 'custom-map-marker approx-city-marker',
+              html: '<div style="background-color:#fef3c7; color:#b45309; width:22px; height:22px; border-radius:50%; border:2px dashed #d97706; box-shadow:0 2px 5px rgba(0,0,0,0.3); display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:900;" title="Ponto Aproximado (Centro da Cidade - 1ª Entrega Rural)">⚠️</div>',
+              iconSize: [22, 22],
+              iconAnchor: [11, 11]
+            }});
+          }}
+
+          function getTempPinIcon() {{
+            return L.divIcon({{
+              className: 'temp-pin-marker',
+              html: '<div style="font-size:28px; line-height:1; filter:drop-shadow(0 3px 6px rgba(0,0,0,0.4)); animation:bouncePin 0.8s infinite alternate ease-in-out;">📍</div>',
+              iconSize: [30, 30],
+              iconAnchor: [15, 28]
+            }});
+          }}
+
+          // 5. Carregamento dos Pontos da API
+          function loadMapPoints() {{
+            fetch('/api/map/points')
+              .then(function(res) {{ return res.json(); }})
+              .then(function(data) {{
+                if (!data.ok) return;
+                allPoints = data.points || [];
+                updateSlaCounts(data.counts || {{}});
+                renderPoints();
+                renderDraftLoad();
+              }})
+              .catch(function(err) {{
+                console.error('Erro ao carregar dados do mapa:', err);
+              }});
+          }}
+
+          function updateSlaCounts(counts) {{
+            document.getElementById('cntAll').textContent = allPoints.length;
+            document.getElementById('cntLate').textContent = counts.late || 0;
+            document.getElementById('cntRisk').textContent = counts.risk || 0;
+            document.getElementById('cntOk').textContent = counts.ok || 0;
+            document.getElementById('cntInRoute').textContent = counts.in_route || 0;
+            document.getElementById('mapTotalBadge').textContent = allPoints.length;
+            var ruralEl = document.getElementById('cntVerifiedRural');
+            if (ruralEl) ruralEl.textContent = counts.verified_rural || 0;
+            var approxEl = document.getElementById('cntCityApprox');
+            if (approxEl) approxEl.textContent = counts.approx_city || 0;
+          }}
+
+          // 6. Gerenciamento da Carga em Montagem (Draft Load)
+          window.toggleDraftOrder = function(orderId) {{
+            orderId = parseInt(orderId);
+            var idx = draftOrderIds.indexOf(orderId);
+            if (idx >= 0) {{
+              draftOrderIds.splice(idx, 1);
+            }} else {{
+              draftOrderIds.push(orderId);
+            }}
+            renderDraftLoad();
+            renderPoints();
+          }};
+
+          function renderDraftLoad() {{
+            var badge = document.getElementById('draftBadge');
+            var countLabel = document.getElementById('draftOrderCountLabel');
+            var stopCount = document.getElementById('draftStopCount');
+            var weightText = document.getElementById('draftTotalWeightText');
+            var capBar = document.getElementById('draftCapacityBar');
+            var alertText = document.getElementById('draftCapacityAlert');
+            var stopsList = document.getElementById('draftStopsList');
+            var btnSubmit = document.getElementById('btnSubmitDraftLoad');
+            var capInput = document.getElementById('draftCapacityInput');
+            var capMax = parseFloat(capInput.value || 11000) || 11000;
+
+            var draftOrders = allPoints.filter(function(p) {{ return draftOrderIds.indexOf(p.order_id) >= 0; }});
+            
+            badge.textContent = draftOrders.length;
+            countLabel.textContent = draftOrders.length + ' pedidos';
+            stopCount.textContent = draftOrders.length;
+
+            var totalWeight = draftOrders.reduce(function(acc, o) {{ return acc + (parseFloat(o.weight_kg) || 0); }}, 0);
+            weightText.textContent = totalWeight.toLocaleString('pt-BR', {{ minimumFractionDigits: 1, maximumFractionDigits: 1 }});
+
+            var pct = Math.min(100, Math.round((totalWeight / capMax) * 100));
+            capBar.style.width = pct + '%';
+
+            if (totalWeight > capMax) {{
+              capBar.style.background = '#dc2626';
+              alertText.innerHTML = '<span style="color:#dc2626;">⚠️ Excesso de peso: +' + (totalWeight - capMax).toFixed(1) + ' kg além da capacidade!</span>';
+              btnSubmit.disabled = true;
+            }} else if (draftOrders.length > 0) {{
+              capBar.style.background = '#16a34a';
+              alertText.innerHTML = '<span style="color:#166534;">✓ Capacidade ocupada: ' + pct + '% (' + (capMax - totalWeight).toFixed(1) + ' kg disponíveis)</span>';
+              btnSubmit.disabled = false;
+            }} else {{
+              capBar.style.background = '#f59e0b';
+              alertText.textContent = 'Selecione pedidos no mapa ou lista para preencher a carga.';
+              btnSubmit.disabled = true;
+            }}
+
+            // Renderizar paradas na aba 2
+            if (draftOrders.length === 0) {{
+              stopsList.innerHTML = '<div class="empty" style="padding:16px 0; font-size:0.82rem;">Nenhum pedido adicionado à carga.<br><small>Clique nos pedidos ou marcadores do mapa para incluir.</small></div>';
+            }} else {{
+              stopsList.innerHTML = '';
+              draftOrders.forEach(function(o, seq) {{
+                var item = document.createElement('div');
+                item.className = 'draft-load-item';
+                item.style.cssText = 'background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px; padding:6px 8px; display:flex; justify-content:space-between; align-items:center; gap:6px; font-size:0.80rem;';
+                item.innerHTML = '<div style="display:flex; align-items:center; gap:6px; min-width:0;">' +
+                                 '<span style="background:#f59e0b; color:#fff; font-weight:800; font-size:10px; width:18px; height:18px; border-radius:50%; display:flex; align-items:center; justify-content:center; flex:none;">' + (seq + 1) + '</span>' +
+                                 '<div style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">' +
+                                 '<b>#' + o.order_number + '</b> · ' + o.client_name + '<br><small style="color:#64748b;">' + o.city + ' · ' + (o.weight_kg || 0) + ' kg</small>' +
+                                 '</div></div>' +
+                                 '<button type="button" onclick="toggleDraftOrder(' + o.order_id + ')" class="btn small ghost" style="padding:3px 6px; color:#dc2626; font-size:12px;" title="Remover da carga">✕</button>';
+                stopsList.appendChild(item);
+              }});
+            }}
+
+            // Atualizar traçado da linha polilinha da carga em montagem no mapa
+            if (draftRoutePolyline) {{
+              map.removeLayer(draftRoutePolyline);
+              draftRoutePolyline = null;
+            }}
+
+            var draftCoords = [];
+            draftOrders.forEach(function(o) {{
+              if (o.has_gps && o.lat && o.lng) {{
+                draftCoords.push([o.lat, o.lng]);
+              }}
+            }});
+
+            if (draftCoords.length > 1) {{
+              draftRoutePolyline = L.polyline(draftCoords, {{
+                color: '#f59e0b',
+                weight: 4,
+                opacity: 0.9,
+                dashArray: '8, 6'
+              }}).addTo(map);
+            }}
+          }}
+
+          // Atualizar capacidade ao mudar veículo
+          document.getElementById('draftVehicleSelect').addEventListener('change', function(e) {{
+            var opt = e.target.selectedOptions[0];
+            if (opt && opt.dataset.capacity) {{
+              var capVal = parseFloat(opt.dataset.capacity) || 11000;
+              document.getElementById('draftCapacityInput').value = capVal;
+              document.getElementById('draftCapacityMaxText').textContent = capVal.toLocaleString('pt-BR');
+              renderDraftLoad();
+            }}
+          }});
+
+          document.getElementById('draftCapacityInput').addEventListener('input', function() {{
+            var capVal = parseFloat(this.value) || 11000;
+            document.getElementById('draftCapacityMaxText').textContent = capVal.toLocaleString('pt-BR');
+            renderDraftLoad();
+          }});
+
+          document.getElementById('btnClearDraft').addEventListener('click', function() {{
+            draftOrderIds = [];
+            renderDraftLoad();
+            renderPoints();
+          }});
+
+          // 7. Submeter Criação de Carga
+          document.getElementById('btnSubmitDraftLoad').addEventListener('click', function() {{
+            if (draftOrderIds.length === 0) return;
+            var driverId = document.getElementById('draftDriverSelect').value;
+            var vehicleId = document.getElementById('draftVehicleSelect').value;
+            var loadName = document.getElementById('draftName').value.trim();
+            var loadDate = document.getElementById('draftDate').value;
+            var routeName = document.getElementById('draftRouteSelect').value;
+            var cap = document.getElementById('draftCapacityInput').value;
+
+            if (!driverId) {{
+              alert('Por favor, selecione o motorista responsável.');
+              return;
+            }}
+            if (!vehicleId) {{
+              alert('Por favor, selecione o veículo da carga.');
+              return;
+            }}
+
+            var payload = {{
+              name: loadName,
+              date: loadDate,
+              driver_id: driverId,
+              vehicle_id: vehicleId,
+              route_name: routeName,
+              capacity: cap,
+              order_ids: draftOrderIds
+            }};
+
+            function getCookie(name) {{
+              var key = name + "=";
+              var ca = document.cookie.split(';');
+              for (var i = 0; i < ca.length; i++) {{
+                var c = ca[i].trim();
+                if (c.indexOf(key) === 0) return decodeURIComponent(c.substring(key.length, c.length));
+              }}
+              return '';
+            }}
+
+            var btn = document.getElementById('btnSubmitDraftLoad');
+            btn.disabled = true;
+            btn.textContent = '⏳ Criando Carga...';
+
+            fetch('/api/routes/create-from-map', {{
+              method: 'POST',
+              headers: {{
+                'Content-Type': 'application/json',
+                'X-CSRF-Token': getCookie('csrf_token')
+              }},
+              body: JSON.stringify(payload)
+            }})
+            .then(function(res) {{ return res.json(); }})
+            .then(function(data) {{
+              if (data.ok) {{
+                alert(data.message || 'Carga criada com sucesso!');
+                if (data.redirect_url) {{
+                  window.location.href = data.redirect_url;
+                }} else {{
+                  location.reload();
+                }}
+              }} else {{
+                alert(data.message || 'Erro ao criar carga.');
+                btn.disabled = false;
+                btn.textContent = '🚚 Confirmar e Gerar Carga';
+              }}
+            }})
+            .catch(function(err) {{
+              alert('Erro de conexão ao criar carga. Tente novamente.');
+              btn.disabled = false;
+              btn.textContent = '🚚 Confirmar e Gerar Carga';
+            }});
+          }});
+
+          // 8. Renderização dos Pontos e Pedidos
+          function renderPoints() {{
+            markersLayer.clearLayers();
+            var searchQ = (document.getElementById('mapSearchInput').value || '').toLowerCase().trim();
+            var routeQ = document.getElementById('mapRouteSelect').value;
+            var cityQ = document.getElementById('mapCitySelect').value;
+            var statusQ = document.getElementById('mapStatusSelect').value;
+            var listContainer = document.getElementById('mapOrdersList');
+            listContainer.innerHTML = '';
+
+            var filtered = allPoints.filter(function(p) {{
+              if (currentFilter !== 'all' && p.sla_category !== currentFilter) return false;
+              if (routeQ && p.route_name !== routeQ) return false;
+              if (cityQ && p.city !== cityQ) return false;
+              if (statusQ && p.status !== statusQ) return false;
+              if (searchQ) {{
+                var hay = (p.order_number + ' ' + p.client_name + ' ' + (p.farm_name || '') + ' ' + p.city + ' ' + (p.delivery_address || '')).toLowerCase();
+                if (hay.indexOf(searchQ) === -1) return false;
+              }}
+              return true;
+            }});
+
+            if (filtered.length === 0) {{
+              listContainer.innerHTML = '<div class="empty" style="padding:16px 0; font-size:0.82rem;">Nenhum pedido encontrado com os filtros aplicados.</div>';
+              return;
+            }}
+
+            var bounds = [];
+
+            filtered.forEach(function(p) {{
+              var inDraft = (draftOrderIds.indexOf(p.order_id) >= 0);
+              var draftSeq = inDraft ? (draftOrderIds.indexOf(p.order_id) + 1) : null;
+
+              // Card na Lista Lateral
+              var card = document.createElement('div');
+              card.className = 'map-order-item' + (inDraft ? ' selected-in-draft' : '');
+              card.dataset.orderId = p.order_id;
+              card.style.cssText = 'background:#ffffff; border:1px solid ' + (inDraft ? '#f59e0b' : '#e2e8f0') + '; border-radius:8px; padding:8px 10px; display:flex; flex-direction:column; gap:4px; font-size:0.80rem;';
+
+              var gpsBadge = p.is_rural_verified ? 
+                '<span style="color:#16a34a; font-weight:700; font-size:10px; background:#dcfce7; padding:2px 5px; border-radius:4px; border:1px solid #86efac;">✅ GPS Rural</span>' : 
+                (p.has_gps ? 
+                  '<span style="color:#d97706; font-weight:700; font-size:10px; background:#fef3c7; padding:2px 5px; border-radius:4px; border:1px solid #fcd34d;">⚠️ Centro Cidade</span>' : 
+                  '<span style="color:#dc2626; font-weight:700; font-size:10px; background:#fee2e2; padding:2px 5px; border-radius:4px; border:1px solid #fca5a5;">❌ Sem GPS</span>');
+
+              card.innerHTML = 
+                '<div style="display:flex; justify-content:space-between; align-items:flex-start; gap:6px;">' +
+                  '<label style="display:flex; align-items:center; gap:6px; cursor:pointer; min-width:0; flex:1;">' +
+                    '<input type="checkbox" ' + (inDraft ? 'checked' : '') + ' onchange="toggleDraftOrder(' + p.order_id + ')" style="width:16px; height:16px; cursor:pointer; accent-color:#f59e0b;">' +
+                    '<div style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">' +
+                      '<b>#' + p.order_number + '</b> · ' + p.client_name +
+                    '</div>' +
+                  '</label>' +
+                  '<span class="badge" style="background:' + p.color + '20; color:' + p.color + '; border:1px solid ' + p.color + '40; font-size:10px; padding:2px 5px; flex:none;">' + p.sla_label + '</span>' +
+                '</div>' +
+                (p.farm_name ? '<div style="font-size:11px; color:#1e293b; font-weight:600;">🌾 ' + p.farm_name + '</div>' : '') +
+                '<div style="display:flex; justify-content:space-between; color:#64748b; font-size:11px;">' +
+                  '<span>' + (p.city || 'Sem cidade') + (p.route_name ? ' (' + p.route_name + ')' : '') + '</span>' +
+                  '<span><b>' + (p.weight_kg || 0) + ' kg</b> · ' + gpsBadge + '</span>' +
+                '</div>' +
+                (p.reference_point ? '<div style="font-size:10.5px; color:#64748b; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">Ref: ' + p.reference_point + '</div>' : '') +
+                '<div style="display:flex; gap:6px; margin-top:2px;">' +
+                  '<button type="button" class="btn small ghost btn-fix-pin" style="flex:1; padding:3px 6px; font-size:11px;" title="Marcar ou mover localização exata no mapa">📍 ' + (p.is_rural_verified ? 'Ajustar GPS' : 'Posicionar Fazenda') + '</button>' +
+                  '<button type="button" class="btn small ghost btn-toggle-draft" style="flex:1; padding:3px 6px; font-size:11px; ' + (inDraft ? 'color:#dc2626;' : 'color:#166534; font-weight:700;') + '">' + (inDraft ? '➖ Remover Carga' : '🚚 + Carga') + '</button>' +
+                '</div>';
+
+              card.querySelector('.btn-fix-pin').addEventListener('click', function(e) {{
+                e.stopPropagation();
+                selectOrderForPinning(p);
+              }});
+
+              card.querySelector('.btn-toggle-draft').addEventListener('click', function(e) {{
+                e.stopPropagation();
+                toggleDraftOrder(p.order_id);
+              }});
+
+              card.addEventListener('click', function() {{
+                if (p.has_gps && p.lat && p.lng) {{
+                  map.flyTo([p.lat, p.lng], 15, {{ duration: 1.0 }});
+                }} else {{
+                  selectOrderForPinning(p);
+                }}
+              }});
+
+              listContainer.appendChild(card);
+
+              // Adicionar Marcador no Mapa (se tiver GPS)
+              if (p.has_gps && p.lat && p.lng) {{
+                var markerIcon = getMarkerIcon(p.color, draftSeq, inDraft, p.is_rural_verified);
+                var marker = L.marker([p.lat, p.lng], {{ icon: markerIcon }}).addTo(markersLayer);
+                
+                var draftBtnHtml = inDraft ?
+                  '<button onclick="toggleDraftOrder(' + p.order_id + ')" class="btn small ghost" style="width:100%; color:#dc2626; border-color:#fca5a5; font-size:11px; font-weight:700; padding:5px;">➖ Remover da Carga</button>' :
+                  '<button onclick="toggleDraftOrder(' + p.order_id + ')" class="btn small" style="width:100%; background:#f59e0b; color:#fff; border-color:#f59e0b; font-size:11px; font-weight:700; padding:5px;">🚚 + Adicionar à Carga</button>';
+
+                var ruralBadge = p.is_rural_verified ?
+                  '<div style="background:#dcfce7; color:#166534; border:1px solid #86efac; border-radius:4px; padding:3px 6px; font-size:10.5px; font-weight:700; margin-bottom:5px;">✅ GPS Fazenda Confirmado</div>' :
+                  '<div style="background:#fef3c7; color:#92400e; border:1px solid #fcd34d; border-radius:4px; padding:3px 6px; font-size:10.5px; font-weight:700; margin-bottom:5px;">⚠️ Centro da Cidade (1ª Entrega Rural)</div>';
+
+                var farmLine = p.farm_name ? '<div style="font-size:12px; color:#1e293b; font-weight:600;">🌾 ' + p.farm_name + '</div>' : '';
+                var refLine = p.reference_point ? '<div style="font-size:11px; color:#475569; background:#f8fafc; padding:3px 6px; border-radius:4px; margin:3px 0;"><b>Ponto de Referência:</b> ' + p.reference_point + '</div>' : '';
+
+                var popupContent = 
+                  '<div style="font-family:system-ui,sans-serif; min-width:220px;">' +
+                    '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:3px;">' +
+                      '<b style="font-size:13px;">Pedido #' + p.order_number + '</b>' +
+                      '<span class="badge" style="background:' + p.color + '20; color:' + p.color + '; font-size:10px; padding:1px 5px;">' + p.sla_label + '</span>' +
+                    '</div>' +
+                    ruralBadge +
+                    '<div style="font-size:12px; color:#166534; font-weight:600;">' + p.client_name + '</div>' +
+                    farmLine +
+                    '<div style="font-size:11px; color:#64748b; margin:2px 0 4px;">' + (p.city || '') + ' · ' + (p.weight_kg || 0) + ' kg</div>' +
+                    refLine +
+                    '<div style="display:flex; flex-direction:column; gap:5px; margin-top:8px;">' +
+                      draftBtnHtml +
+                      '<button onclick="triggerPinOrder(' + p.order_id + ')" class="btn small ghost" style="width:100%; font-size:11px; padding:5px; font-weight:600;">📍 ' + (p.is_rural_verified ? 'Ajustar Localização GPS' : 'Posicionar Fazenda no Mapa') + '</button>' +
+                    '</div>' +
+                  '</div>';
+
+                marker.bindPopup(popupContent);
+                bounds.push([p.lat, p.lng]);
+              }}
+            }});
+
+            if (bounds.length > 0 && !activeSelectedOrder) {{
+              map.fitBounds(bounds, {{ padding: [30, 30], maxZoom: 14 }});
+            }}
+          }}
+
+          // 9. Fluxo de Fixação de Localização no Mapa
+          window.triggerPinOrder = function(orderId) {{
+            var order = allPoints.find(function(p) {{ return p.order_id == orderId; }});
+            if (order) selectOrderForPinning(order);
+          }};
+
+          function selectOrderForPinning(order) {{
+            showTab('orders');
+            activeSelectedOrder = order;
+            tempClickedLatLng = null;
+
+            if (tempPinMarker) {{
+              map.removeLayer(tempPinMarker);
+              tempPinMarker = null;
+            }}
+
+            var banner = document.getElementById('selectedOrderBanner');
+            var bannerTxt = document.getElementById('selectedOrderText');
+            var btnSave = document.getElementById('btnSavePinAction');
+            banner.style.display = 'block';
+
+            bannerTxt.innerHTML = '👉 <b>Pedido #' + order.order_number + '</b> (' + order.client_name + ') selecionado.<br>Clique no local exato do mapa para fixar a entrega.';
+            btnSave.disabled = true;
+            btnSave.textContent = '📍 Clique no Mapa';
+            btnSave.style.background = '#0284c7';
+
+            if (order.has_gps && order.lat && order.lng) {{
+              map.flyTo([order.lat, order.lng], 15, {{ duration: 1.0 }});
+            }}
+          }}
+
+          document.getElementById('btnCancelPinAction').addEventListener('click', function() {{
+            activeSelectedOrder = null;
+            tempClickedLatLng = null;
+            if (tempPinMarker) {{
+              map.removeLayer(tempPinMarker);
+              tempPinMarker = null;
+            }}
+            document.getElementById('selectedOrderBanner').style.display = 'none';
+          }});
+
+          // Clique no mapa para posicionar marcador temporário de fixação
+          map.on('click', function(e) {{
+            if (!activeSelectedOrder) return;
+
+            var lat = e.latlng.lat;
+            var lng = e.latlng.lng;
+            tempClickedLatLng = {{ lat: lat, lng: lng }};
+
+            if (tempPinMarker) {{
+              tempPinMarker.setLatLng([lat, lng]);
+            }} else {{
+              tempPinMarker = L.marker([lat, lng], {{
+                icon: getTempPinIcon(),
+                draggable: true
+              }}).addTo(map);
+
+              tempPinMarker.on('dragend', function(ev) {{
+                var pos = ev.target.getLatLng();
+                tempClickedLatLng = {{ lat: pos.lat, lng: pos.lng }};
+              }});
+            }}
+
+            var btnSave = document.getElementById('btnSavePinAction');
+            btnSave.disabled = false;
+            btnSave.textContent = '✓ Salvar Ponto no Pedido #' + activeSelectedOrder.order_number;
+            btnSave.style.background = '#16a34a';
+          }});
+
+          document.getElementById('btnSavePinAction').addEventListener('click', function() {{
+            if (!activeSelectedOrder || !tempClickedLatLng) return;
+            saveLocation(activeSelectedOrder.order_id, activeSelectedOrder.client_id, tempClickedLatLng.lat, tempClickedLatLng.lng, activeSelectedOrder.order_number);
+          }});
+
+          function saveLocation(orderId, clientId, lat, lng, orderNumber) {{
+            function getCookie(name) {{
+              var key = name + "=";
+              var ca = document.cookie.split(';');
+              for (var i = 0; i < ca.length; i++) {{
+                var c = ca[i].trim();
+                if (c.indexOf(key) === 0) return decodeURIComponent(c.substring(key.length, c.length));
+              }}
+              return '';
+            }}
+
+            var payload = {{
+              order_id: orderId,
+              client_id: clientId,
+              lat: lat,
+              lng: lng
+            }};
+
+            fetch('/api/map/save-location', {{
+              method: 'POST',
+              headers: {{
+                'Content-Type': 'application/json',
+                'X-CSRF-Token': getCookie('csrf_token')
+              }},
+              body: JSON.stringify(payload)
+            }})
+            .then(function(res) {{ return res.json(); }})
+            .then(function(data) {{
+              if (data.ok) {{
+                if (tempPinMarker) {{
+                  map.removeLayer(tempPinMarker);
+                  tempPinMarker = null;
+                }}
+                activeSelectedOrder = null;
+                tempClickedLatLng = null;
+                document.getElementById('selectedOrderBanner').style.display = 'none';
+                loadMapPoints();
+              }} else {{
+                alert(data.message || 'Erro ao salvar localização.');
+              }}
+            }})
+            .catch(function(err) {{
+              alert('Erro ao salvar localização.');
+            }});
+          }}
+
+          // 10. Filtros de SLA e Busca
+          document.querySelectorAll('.map-sla-pill').forEach(function(pill) {{
+            pill.addEventListener('click', function() {{
+              document.querySelectorAll('.map-sla-pill').forEach(function(p) {{ p.classList.remove('active-filter'); }});
+              pill.classList.add('active-filter');
+              currentFilter = pill.dataset.filter || 'all';
+              renderPoints();
+            }});
+          }});
+
+          document.getElementById('mapSearchInput').addEventListener('input', renderPoints);
+          document.getElementById('mapRouteSelect').addEventListener('change', renderPoints);
+          document.getElementById('mapCitySelect').addEventListener('change', renderPoints);
+          document.getElementById('mapStatusSelect').addEventListener('change', renderPoints);
+          document.getElementById('btnResetFilters').addEventListener('click', function() {{
+            document.getElementById('mapSearchInput').value = '';
+            document.getElementById('mapRouteSelect').value = '';
+            document.getElementById('mapCitySelect').value = '';
+            document.getElementById('mapStatusSelect').value = '';
+            currentFilter = 'all';
+            document.querySelectorAll('.map-sla-pill').forEach(function(p) {{ p.style.outline = 'none'; }});
+            renderPoints();
+          }});
+
+          var btnGeocodeAll = document.getElementById('btnGeocodeAll');
+          var geocodeFeedback = document.getElementById('geocodeFeedbackBox');
+
+          if (btnGeocodeAll) {{
+            btnGeocodeAll.addEventListener('click', function() {{
+              btnGeocodeAll.disabled = true;
+              btnGeocodeAll.textContent = '⏳ Localizando...';
+              if (geocodeFeedback) {{
+                geocodeFeedback.style.display = 'block';
+                geocodeFeedback.style.background = '#eff6ff';
+                geocodeFeedback.style.color = '#1e40af';
+                geocodeFeedback.style.border = '1px solid #bfdbfe';
+                geocodeFeedback.textContent = 'Consultando Google Geocoding API para pedidos sem GPS...';
+              }}
+
+              fetch('/api/map/geocode-auto', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{}})
+              }})
+              .then(function(res) {{ return res.json(); }})
+              .then(function(data) {{
+                btnGeocodeAll.disabled = false;
+                btnGeocodeAll.textContent = '⚡ Geocodificar sem GPS (Google)';
+                if (data.ok) {{
+                  if (geocodeFeedback) {{
+                    geocodeFeedback.style.background = '#dcfce7';
+                    geocodeFeedback.style.color = '#166534';
+                    geocodeFeedback.style.border = '1px solid #86efac';
+                    geocodeFeedback.textContent = data.message || 'Geocodificação concluída com sucesso!';
+                  }}
+                  loadMapPoints();
+                }} else {{
+                  if (geocodeFeedback) {{
+                    geocodeFeedback.style.background = '#fee2e2';
+                    geocodeFeedback.style.color = '#991b1b';
+                    geocodeFeedback.style.border = '1px solid #fca5a5';
+                    geocodeFeedback.textContent = data.message || 'Falha ao geocodificar.';
+                  }}
+                }}
+              }})
+              .catch(function(err) {{
+                btnGeocodeAll.disabled = false;
+                btnGeocodeAll.textContent = '⚡ Geocodificar sem GPS (Google)';
+                if (geocodeFeedback) {{
+                  geocodeFeedback.style.background = '#fee2e2';
+                  geocodeFeedback.style.color = '#991b1b';
+                  geocodeFeedback.style.border = '1px solid #fca5a5';
+                  geocodeFeedback.textContent = 'Erro ao conectar: ' + err.message;
+                }}
+              }});
+            }});
+          }}
+
+          // 11. Localização Atual do Usuário (GPS ao vivo)
+          var btnLocateMe = document.getElementById('btnLocateMe');
+          var btnSidebarLocateMe = document.getElementById('btnSidebarLocateMe');
+          var locateText = document.getElementById('locateText');
+          var locateIcon = document.getElementById('locateIcon');
+          var userLocationMarker = null;
+          var userLocationCircle = null;
+
+          function locateUserNow() {{
+            // 1. Se estiver em HTTP na rede local (não localhost), navegadores modernos bloqueiam o prompt de permissão
+            if (!window.isSecureContext && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {{
+              var goHttps = confirm([
+                '🔒 Para que o navegador solicite a sua permissão de GPS diretamente, é necessário acessar via HTTPS (Porta 3443).',
+                '',
+                'No modo HTTP comum (Porta 3000), o Google Chrome e o Edge bloqueiam a pergunta de permissão por segurança.',
+                '',
+                'Deseja alternar agora para https://' + location.hostname + ':3443/map para ativar o GPS?'
+              ].join('\\n'));
+              if (goHttps) {{
+                window.location.href = 'https://' + location.hostname + ':3443' + location.pathname + (location.search ? location.search + '&locate=1' : '?locate=1');
+              }}
+              return;
+            }}
+
+            if (!navigator.geolocation) {{
+              alert('A geolocalização não é suportada ou está desativada no seu navegador.');
+              return;
+            }}
+
+            if (navigator.permissions && navigator.permissions.query) {{
+              navigator.permissions.query({{ name: 'geolocation' }}).then(function(perm) {{
+                if (perm.state === 'denied') {{
+                  alert([
+                    '⚠️ A permissão de localização foi bloqueada nas configurações do navegador.',
+                    '',
+                    'Para reativar a pergunta de permissão:',
+                    '1. Clique no ícone de opções/cadeado ao lado de ' + location.host + ' na barra de endereços;',
+                    '2. Redefina a permissão de "Localização" para "Permitir" ou "Perguntar";',
+                    '3. Recarregue a página.'
+                  ].join('\\n'));
+                }}
+              }}).catch(function() {{}});
+            }}
+
+            if (btnLocateMe) btnLocateMe.disabled = true;
+            if (btnSidebarLocateMe) btnSidebarLocateMe.disabled = true;
+            if (locateText) locateText.textContent = 'Obtendo GPS...';
+            if (locateIcon) locateIcon.textContent = '⏳';
+
+            function applyUserPosition(lat, lng, acc, sourceLabel) {{
+              map.flyTo([lat, lng], 17, {{ duration: 1.2 }});
+
+              if (userLocationMarker) {{
+                map.removeLayer(userLocationMarker);
+              }}
+              if (userLocationCircle) {{
+                map.removeLayer(userLocationCircle);
+              }}
+
+              userLocationCircle = L.circle([lat, lng], {{
+                radius: Math.min(acc || 25, 300),
+                color: '#0284c7',
+                fillColor: '#38bdf8',
+                fillOpacity: 0.18,
+                weight: 1.5
+              }}).addTo(map);
+
+              var pulseIcon = L.divIcon({{
+                className: 'my-location-pulse-marker',
+                html: '<div style="position:relative; width:22px; height:22px; background:#0284c7; border:3px solid #ffffff; border-radius:50%; box-shadow:0 0 14px rgba(2,132,199,0.9); display:flex; align-items:center; justify-content:center;"><div style="width:6px; height:6px; background:#ffffff; border-radius:50%;"></div><div style="position:absolute; width:44px; height:44px; border-radius:50%; border:2px solid #0284c7; animation:pulseGeo 1.6s infinite ease-out; opacity:0.8; pointer-events:none; top:-14px; left:-14px;"></div></div>',
+                iconSize: [22, 22],
+                iconAnchor: [11, 11]
+              }});
+
+              userLocationMarker = L.marker([lat, lng], {{ icon: pulseIcon }}).addTo(map);
+              userLocationMarker.bindPopup(
+                '<div style="min-width:190px; padding:2px;">' +
+                '<b style="color:#0284c7; font-size:13px;">🎯 Sua Posição Atual (' + (sourceLabel || 'GPS') + ')</b><br>' +
+                '<div style="font-size:12px; color:#334155; margin:4px 0;">' +
+                'Lat: <b>' + lat.toFixed(6) + '</b><br>' +
+                'Lng: <b>' + lng.toFixed(6) + '</b><br>' +
+                '<small style="color:#64748b;">Precisão do sinal: ±' + Math.round(acc) + ' metros</small>' +
+                '</div>' +
+                '<a href="https://www.google.com/maps?q=' + lat.toFixed(6) + ',' + lng.toFixed(6) + '" target="_blank" rel="noopener" style="display:inline-block; font-size:11px; font-weight:700; color:#0284c7; text-decoration:none;">🗺️ Abrir no Google Maps ↗</a>' +
+                '</div>'
+              ).openPopup();
+
+              if (locateText) locateText.textContent = 'Você está aqui!';
+              if (locateIcon) locateIcon.textContent = '🎯';
+              if (btnLocateMe) btnLocateMe.disabled = false;
+              if (btnSidebarLocateMe) btnSidebarLocateMe.disabled = false;
+
+              setTimeout(function() {{
+                if (locateText) locateText.textContent = 'Onde estou agora';
+              }}, 4500);
+            }}
+
+            function handleGeoError(err) {{
+              if (btnLocateMe) btnLocateMe.disabled = false;
+              if (btnSidebarLocateMe) btnSidebarLocateMe.disabled = false;
+              if (locateText) locateText.textContent = 'Onde estou agora';
+              if (locateIcon) locateIcon.textContent = '🎯';
+              var msg = 'Não foi possível obter a sua localização GPS.';
+              if (err && err.code === 1) {{
+                if (!window.isSecureContext) {{
+                  msg = 'O navegador bloqueou a permissão de GPS porque a conexão atual é HTTP (Porta 3000). Use HTTPS na porta 3443 para solicitar a permissão nativa.';
+                }} else {{
+                  msg = 'Permissão de localização negada pelo navegador. Permita o acesso clicando no ícone de configurações ao lado de ' + location.host + ' na barra de endereços.';
+                }}
+              }} else if (err && err.code === 2) {{
+                msg = 'Sinal de GPS/localização indisponível no dispositivo. Ative o GPS/Localização no Windows ou no aparelho.';
+              }} else if (err && err.code === 3) {{
+                msg = 'Tempo limite esgotado ao buscar localização GPS.';
+              }}
+              alert('📍 ' + msg);
+            }}
+
+            function fallbackLowAccuracy() {{
+              navigator.geolocation.getCurrentPosition(
+                function(pos) {{
+                  applyUserPosition(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy || 50, 'Rede/Wi-Fi');
+                }},
+                function(err) {{
+                  fetch('/api/v1/driver/auto-location')
+                    .then(function(r) {{ return r.json(); }})
+                    .then(function(d) {{
+                      if (d && d.ok && d.latitude && d.longitude) {{
+                        applyUserPosition(parseFloat(d.latitude), parseFloat(d.longitude), 150, 'Estimada (Rede)');
+                      }} else {{
+                        handleGeoError(err);
+                      }}
+                    }})
+                    .catch(function() {{
+                      handleGeoError(err);
+                    }});
+                }},
+                {{ enableHighAccuracy: false, timeout: 15000, maximumAge: 300000 }}
+              );
+            }}
+
+            navigator.geolocation.getCurrentPosition(
+              function(pos) {{
+                applyUserPosition(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy || 20, 'GPS');
+              }},
+              function(err) {{
+                if (err && err.code === 1) {{
+                  handleGeoError(err);
+                }} else {{
+                  fallbackLowAccuracy();
+                }}
+              }},
+              {{
+                enableHighAccuracy: true,
+                timeout: 25000,
+                maximumAge: 5000
+              }}
+            );
+          }}
+
+          if (btnLocateMe) btnLocateMe.addEventListener('click', locateUserNow);
+          if (btnSidebarLocateMe) btnSidebarLocateMe.addEventListener('click', locateUserNow);
+
+          // Verificar banner de HTTP na rede local
+          if (!window.isSecureContext && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {{
+            var b = document.getElementById('httpsGpsBanner');
+            if (b) b.style.display = 'flex';
+          }}
+          var btnBannerGoHttps = document.getElementById('btnBannerGoHttps');
+          if (btnBannerGoHttps) {{
+            btnBannerGoHttps.addEventListener('click', function() {{
+              window.location.href = 'https://' + location.hostname + ':3443' + location.pathname + (location.search ? location.search + '&locate=1' : '?locate=1');
+            }});
+          }}
+
+          // Se a URL contém ?locate=1 (ex: redirecionado para ativar GPS no HTTPS), acionar automaticamente
+          if (location.search && location.search.indexOf('locate=1') !== -1) {{
+            setTimeout(function() {{
+              locateUserNow();
+            }}, 700);
+          }}
+
+          loadMapPoints();
+        }}
+
+        if (document.readyState === 'loading') {{
+          document.addEventListener('DOMContentLoaded', initDeliveryMapPage);
+        }} else {{
+          initDeliveryMapPage();
+        }}
+        </script>
+        """
+        return self.send_html(layout(u, 'Mapa de Entregas', content, 'Controle geográfico dos pedidos em tempo real por status de SLA e roteirização', search_action='/map', search_placeholder='Buscar pedido, cliente ou cidade no mapa...'))
+
+    def get_map_points(self, u):
+        with conn() as db:
+            rows = db.execute("""
+                SELECT o.id order_id, o.order_number, o.status, o.urgency, o.sale_date, o.expected_delivery_date,
+                       o.weight_kg, o.total_value, o.delivery_address, o.city, o.route_name,
+                       o.location_link, o.latitude, o.longitude,
+                       o.delivery_location_link, o.delivery_latitude, o.delivery_longitude,
+                       o.is_rural_verified, o.gps_source,
+                       c.id client_id, c.name client_name, c.farm_name, c.phone client_phone, c.whatsapp client_whatsapp,
+                       c.location_link client_location_link, c.latitude client_latitude, c.longitude client_longitude,
+                       c.is_rural_verified client_rural_verified, c.gps_source client_gps_source, c.reference_point,
+                       (SELECT delivery_location_link FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.delivery_location_link IS NOT NULL AND dr.delivery_location_link!='' LIMIT 1) dr_loc_link,
+                       (SELECT latitude FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.latitude IS NOT NULL LIMIT 1) dr_lat,
+                       (SELECT longitude FROM delivery_receipts dr WHERE dr.order_id=o.id AND dr.longitude IS NOT NULL LIMIT 1) dr_lng
+                FROM orders o
+                LEFT JOIN clients c ON c.id=o.client_id
+                WHERE o.status NOT IN ('Cancelado', 'Acertado', 'Entregue')
+                ORDER BY CASE WHEN o.expected_delivery_date < date('now') THEN 0 ELSE 1 END, o.expected_delivery_date ASC
+            """).fetchall()
+
+        points = []
+        counts = {'late': 0, 'risk': 0, 'ok': 0, 'in_route': 0, 'scheduled': 0, 'problem': 0, 'verified_rural': 0, 'approx_city': 0, 'no_gps': 0}
+        
+        for r in rows:
+            # Determinar coordenadas
+            lat = r['dr_lat'] or r['delivery_latitude'] or r['latitude'] or r['client_latitude']
+            lng = r['dr_lng'] or r['delivery_longitude'] or r['longitude'] or r['client_longitude']
+            
+            # Tentar extrair do link se ainda for nulo
+            if lat is None or lng is None:
+                link = r['dr_loc_link'] or r['delivery_location_link'] or r['location_link'] or r['client_location_link']
+                if link:
+                    lat, lng = extract_lat_lng(link)
+
+            has_gps = (lat is not None and lng is not None and float(lat) != 0 and float(lng) != 0)
+            
+            is_rural = bool(
+                r['dr_lat'] or
+                r['is_rural_verified'] or
+                r['client_rural_verified'] or
+                (r['gps_source'] in ('driver_confirmed', 'manual_pin')) or
+                (r['client_gps_source'] in ('driver_confirmed', 'manual_pin'))
+            )
+            gps_src = 'driver_confirmed' if r['dr_lat'] else (r['gps_source'] or r['client_gps_source'] or ('driver_confirmed' if is_rural else 'city_approximate'))
+
+            if not has_gps:
+                counts['no_gps'] += 1
+            elif is_rural:
+                counts['verified_rural'] += 1
+            else:
+                counts['approx_city'] += 1
+
+            st = normalize_order_status(r['status'])
+            deadline = r['expected_delivery_date'] or ''
+            
+            # Classificação de SLA
+            if st == 'Agendado':
+                sla_cat = 'scheduled'
+                color = '#2563eb'
+                sla_label = 'Agendado'
+                counts['scheduled'] += 1
+            elif st == 'Saiu para entrega':
+                sla_cat = 'in_route'
+                color = '#9333ea'
+                sla_label = 'Em Rota'
+                counts['in_route'] += 1
+            elif st in ('Problema', 'Com problema'):
+                sla_cat = 'problem'
+                color = '#dc2626'
+                sla_label = 'Com Problema'
+                counts['problem'] += 1
+            else:
+                if deadline and deadline < today():
+                    sla_cat = 'late'
+                    color = '#dc2626'
+                    sla_label = 'Vencido'
+                    counts['late'] += 1
+                elif deadline and deadline <= date_add(SLA_RISK_DAYS):
+                    sla_cat = 'risk'
+                    color = '#d97706'
+                    sla_label = 'Em Risco'
+                    counts['risk'] += 1
+                else:
+                    sla_cat = 'ok'
+                    color = '#16a34a'
+                    sla_label = 'No Prazo'
+                    counts['ok'] += 1
+
+            points.append({
+                'order_id': r['order_id'],
+                'order_number': r['order_number'],
+                'client_id': r['client_id'],
+                'client_name': r['client_name'] or 'Cliente não informado',
+                'farm_name': r['farm_name'] or '',
+                'city': r['city'] or '',
+                'route_name': r['route_name'] or 'Sem rota',
+                'weight_kg': r['weight_kg'] or 0,
+                'total_value': r['total_value'] or 0,
+                'delivery_address': r['delivery_address'] or '',
+                'status': st,
+                'sla_category': sla_cat,
+                'sla_label': sla_label,
+                'color': color,
+                'has_gps': has_gps,
+                'is_rural_verified': is_rural,
+                'gps_source': gps_src,
+                'reference_point': r['reference_point'] or '',
+                'client_phone': r['client_phone'] or '',
+                'client_whatsapp': r['client_whatsapp'] or '',
+                'lat': float(lat) if has_gps else None,
+                'lng': float(lng) if has_gps else None
+            })
+
+        return self.send_json({
+            'ok': True,
+            'counts': counts,
+            'points': points
+        })
+
+    def post_map_save_location(self, u):
+        data = self.post_data()
+        order_id = parse_int(data.get('order_id'))
+        client_id = parse_int(data.get('client_id'))
+        lat = parse_float(data.get('lat'))
+        lng = parse_float(data.get('lng'))
+
+        if lat is None or lng is None or lat < -90 or lat > 90 or lng < -180 or lng > 180:
+            return self.send_json({'ok': False, 'message': 'Coordenadas inválidas informadas.'}, 400)
+
+        maps_link = f"https://www.google.com/maps?q={lat:.6f},{lng:.6f}"
+
+        with conn() as db:
+            if order_id:
+                db.execute("""
+                    UPDATE orders 
+                    SET latitude=?, longitude=?, location_link=?, is_rural_verified=1, gps_source='manual_pin', updated_at=?, version=COALESCE(version,1)+1 
+                    WHERE id=? OR order_number=?
+                """, (lat, lng, maps_link, now(), order_id, str(order_id)))
+                
+                if not client_id:
+                    o = db.execute("SELECT client_id FROM orders WHERE id=? OR order_number=?", (order_id, str(order_id))).fetchone()
+                    if o: client_id = o['client_id']
+
+            if client_id:
+                db.execute("""
+                    UPDATE clients 
+                    SET latitude=?, longitude=?, location_link=?, is_rural_verified=1, gps_source='manual_pin', updated_at=?, version=COALESCE(version,1)+1 
+                    WHERE id=?
+                """, (lat, lng, maps_link, now(), client_id))
+                
+                db.execute("""
+                    UPDATE orders 
+                    SET latitude=?, longitude=?, location_link=?, is_rural_verified=1, gps_source='manual_pin', updated_at=?, version=COALESCE(version,1)+1 
+                    WHERE client_id=? AND (delivery_latitude IS NULL OR delivery_latitude=0)
+                """, (lat, lng, maps_link, now(), client_id))
+
+            audit(db, u, 'Marcou localização no mapa', 'Mapa/Clientes', f"Cliente {client_id} / Pedido {order_id}", '', f"{lat:.6f}, {lng:.6f} (Ponto Manual Confirmado)")
+            db.commit()
+
+        return self.send_json({
+            'ok': True,
+            'message': 'Localização salva e sincronizada com o perfil do cliente!'
+        })
+
+    def post_map_test_key(self, u):
+        data = self.post_data()
+        key = (data.get('api_key') or '').strip() or get_google_maps_api_key()
+        if not key:
+            return self.send_json({'ok': False, 'message': 'Nenhuma chave informada ou cadastrada no sistema.'}, 400)
+
+        try:
+            import urllib.request
+            import urllib.parse
+            url = f"https://maps.googleapis.com/maps/api/geocode/json?address=Teofilo+Otoni+MG&key={urllib.parse.quote(key)}"
+            req = urllib.request.Request(url, headers={'User-Agent': 'LogisticaCasaDoCampo/1.0'})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                res_data = json.loads(resp.read().decode('utf-8'))
+                status = res_data.get('status')
+                if status == 'OK':
+                    return self.send_json({
+                        'ok': True,
+                        'message': '✅ Chave validada com sucesso no Google Cloud! Maps e Geocoding estão ativos e respondendo.'
+                    })
+                elif status == 'REQUEST_DENIED':
+                    err_msg = res_data.get('error_message', 'Chave inválida ou permissão de Geocoding API não ativada.')
+                    return self.send_json({'ok': False, 'message': f'❌ Rejeitado pelo Google: {err_msg}'}, 400)
+                else:
+                    return self.send_json({'ok': False, 'message': f'Resposta do Google: {status}'}, 400)
+        except Exception as exc:
+            return self.send_json({'ok': False, 'message': f'Erro ao conectar com Google Cloud: {str(exc)}'}, 500)
+
+    def post_map_geocode_auto(self, u):
+        api_key = get_google_maps_api_key()
+        if not api_key:
+            return self.send_json({
+                'ok': False,
+                'message': 'Chave da API do Google Maps não configurada. Configure-a em Configurações > Parâmetros ou no .env.'
+            }, 400)
+
+        data = self.post_data()
+        target_order_id = parse_int(data.get('order_id'))
+
+        import urllib.request
+        import urllib.parse
+
+        with conn() as db:
+            if target_order_id:
+                orders_to_geocode = db.execute("""
+                    SELECT o.id, o.order_number, o.delivery_address, o.city, o.uf,
+                           c.id as client_id, c.name as client_name, c.address as client_address, c.city as client_city, c.farm_name, c.neighborhood
+                    FROM orders o
+                    LEFT JOIN clients c ON c.id = o.client_id
+                    WHERE o.id = ?
+                """, (target_order_id,)).fetchall()
+            else:
+                orders_to_geocode = db.execute("""
+                    SELECT o.id, o.order_number, o.delivery_address, o.city, o.uf,
+                           c.id as client_id, c.name as client_name, c.address as client_address, c.city as client_city, c.farm_name, c.neighborhood
+                    FROM orders o
+                    LEFT JOIN clients c ON c.id = o.client_id
+                    WHERE o.status NOT IN ('Cancelado', 'Acertado', 'Entregue')
+                      AND (o.latitude IS NULL OR o.latitude = 0)
+                    LIMIT 30
+                """).fetchall()
+
+            if not orders_to_geocode:
+                return self.send_json({
+                    'ok': True,
+                    'geocoded_count': 0,
+                    'message': 'Todos os pedidos em aberto já possuem localização GPS no mapa!'
+                })
+
+            geocoded_count = 0
+            details = []
+
+            for row in orders_to_geocode:
+                order_id = row['id']
+                client_id = row['client_id']
+                city = row['city'] or row['client_city'] or 'Teófilo Otoni'
+                uf = row['uf'] or 'MG'
+                addr = row['delivery_address'] or row['client_address'] or ''
+                farm = row['farm_name'] or ''
+                bairro = row['neighborhood'] or ''
+
+                query_parts = []
+                if addr:
+                    query_parts.append(addr)
+                elif farm:
+                    query_parts.append(farm)
+                if bairro and bairro not in addr:
+                    query_parts.append(bairro)
+                query_parts.append(city)
+                query_parts.append(uf)
+                query_parts.append('Brasil')
+
+                full_query = ', '.join([p.strip() for p in query_parts if p.strip()])
+                if not full_query:
+                    continue
+
+                try:
+                    url = f"https://maps.googleapis.com/maps/api/geocode/json?address={urllib.parse.quote(full_query)}&components=country:BR&key={urllib.parse.quote(api_key)}"
+                    req = urllib.request.Request(url, headers={'User-Agent': 'LogisticaCasaDoCampo/1.0'})
+                    with urllib.request.urlopen(req, timeout=6) as resp:
+                        res_data = json.loads(resp.read().decode('utf-8'))
+                        if res_data.get('status') == 'OK' and res_data.get('results'):
+                            loc = res_data['results'][0]['geometry']['location']
+                            lat = float(loc['lat'])
+                            lng = float(loc['lng'])
+                            maps_link = f"https://www.google.com/maps?q={lat:.6f},{lng:.6f}"
+
+                            db.execute("""
+                                UPDATE orders
+                                SET latitude=?, longitude=?, location_link=?, updated_at=?, version=COALESCE(version,1)+1
+                                WHERE id=?
+                            """, (lat, lng, maps_link, now(), order_id))
+
+                            if client_id:
+                                db.execute("""
+                                    UPDATE clients
+                                    SET latitude=COALESCE(latitude, ?), longitude=COALESCE(longitude, ?), location_link=COALESCE(location_link, ?), updated_at=?, version=COALESCE(version,1)+1
+                                    WHERE id=? AND (latitude IS NULL OR latitude=0)
+                                """, (lat, lng, maps_link, now(), client_id))
+
+                            geocoded_count += 1
+                            details.append(f"Pedido {row['order_number']}")
+                except Exception as exc:
+                    log_server_error(f'GEOCODE_ORDER_{order_id}', exc)
+
+            if geocoded_count > 0:
+                audit(db, u, f'Geocodificou {geocoded_count} pedidos via Google Maps', 'Mapa', ', '.join(details[:6]))
+                db.commit()
+
+        return self.send_json({
+            'ok': True,
+            'geocoded_count': geocoded_count,
+            'message': f'Sucesso! {geocoded_count} pedido(s) localizados e fixados no mapa via Google Maps.'
+        })
+
+    def post_routes_create_from_map(self, u):
+        data = self.post_data()
+        name = (data.get('name') or '').strip()
+        if not name:
+            name = f"Carga {datetime.now().strftime('%d/%m %H:%M')}"
+        route_date = validate_date_field(data.get('date') or today(), 'a data da carga', required=True)
+        driver_id = parse_int(data.get('driver_id') or 0)
+        vehicle_id = parse_int(data.get('vehicle_id') or 0)
+        route_name = upper_text(data.get('route_name') or 'Mista')
+        notes = (data.get('notes') or '').strip()
+
+        raw_order_ids = data.get('order_ids') or []
+        if isinstance(raw_order_ids, str):
+            try:
+                raw_order_ids = json.loads(raw_order_ids)
+            except Exception:
+                raw_order_ids = [int(x.strip()) for x in raw_order_ids.split(',') if x.strip().isdigit()]
+
+        order_ids = [parse_int(x) for x in raw_order_ids if parse_int(x)]
+        if not order_ids:
+            return self.send_json({'ok': False, 'message': 'Nenhum pedido foi selecionado para montar a carga.'}, 400)
+
+        if driver_id <= 0:
+            return self.send_json({'ok': False, 'message': 'Selecione o motorista responsável pela carga.'}, 400)
+        if vehicle_id <= 0:
+            return self.send_json({'ok': False, 'message': 'Selecione o veículo da carga.'}, 400)
+
+        with conn() as db:
+            driver_ok = db.execute('SELECT id, active FROM drivers WHERE id=?', (driver_id,)).fetchone()
+            if not driver_ok or int(driver_ok['active'] or 0) != 1:
+                return self.send_json({'ok': False, 'message': 'Motorista selecionado é inválido ou inativo.'}, 400)
+
+            vehicle_ok = db.execute('SELECT id, active, capacity_kg, capacity FROM vehicles WHERE id=?', (vehicle_id,)).fetchone()
+            if not vehicle_ok or int(vehicle_ok['active'] or 0) != 1:
+                return self.send_json({'ok': False, 'message': 'Veículo selecionado é inválido ou inativo.'}, 400)
+
+            default_cap = float(vehicle_ok['capacity_kg'] if vehicle_ok['capacity_kg'] is not None else (vehicle_ok['capacity'] or 11000))
+            cap = parse_float(data.get('capacity') or default_cap)
+            if cap <= 0:
+                cap = default_cap or 11000.0
+
+            total_weight = 0.0
+            valid_orders = []
+            old_routes = set()
+
+            for oid in order_ids:
+                order = db.execute("SELECT id, order_number, weight_kg, status, route_name FROM orders WHERE id=?", (oid,)).fetchone()
+                if not order:
+                    continue
+                st = normalize_order_status(order['status'])
+                if st in ('Cancelado', 'Acertado', 'Entregue'):
+                    continue
+                valid_orders.append(order)
+                total_weight += float(order['weight_kg'] or 0)
+
+            if not valid_orders:
+                return self.send_json({'ok': False, 'message': 'Nenhum dos pedidos selecionados está elegível para carga.'}, 400)
+
+            if cap > 0 and total_weight > cap:
+                return self.send_json({
+                    'ok': False, 
+                    'message': f'Peso total ({fmt_num(total_weight)} kg) excede a capacidade do veículo ({fmt_num(cap)} kg). Reduza os pedidos ou ajuste a capacidade.'
+                }, 400)
+
+            cur = db.execute("""
+                INSERT INTO routes(name, date, driver_id, vehicle_id, status, route_name, total_weight, capacity, notes, created_at, updated_at, version)
+                VALUES(?, ?, ?, ?, 'Planejada', ?, ?, ?, ?, ?, ?, 1)
+            """, (name, route_date, driver_id, vehicle_id, route_name, total_weight, cap, notes, now(), now()))
+            rid = cur.lastrowid
+
+            for idx, ord_item in enumerate(valid_orders, 1):
+                oid = ord_item['id']
+                for rr in db.execute("""SELECT ro.route_id FROM route_orders ro JOIN routes ar ON ar.id=ro.route_id WHERE ro.order_id=? AND ar.status IN ('Planejada','Em rota')""", (oid,)).fetchall():
+                    old_routes.add(rr['route_id'])
+
+                db.execute("""DELETE FROM route_orders WHERE id IN (SELECT ro.id FROM route_orders ro JOIN routes ar ON ar.id=ro.route_id WHERE ro.order_id=? AND ar.status IN ('Planejada','Em rota'))""", (oid,))
+                db.execute('INSERT INTO route_orders(route_id, order_id, delivery_order, status) VALUES(?, ?, ?, ?)', (rid, oid, idx, 'Pendente'))
+                
+                old_st = normalize_order_status(ord_item['status'])
+                if old_st != 'Carga Montada':
+                    self.ensure_order_status(db, oid, 'Carga Montada')
+                    db.execute("UPDATE orders SET status='Carga Montada', updated_at=?, version=COALESCE(version,1)+1 WHERE id=?", (now(), oid))
+                    add_hist(db, oid, u['id'], old_st, 'Carga Montada', 'Carga montada (Aguardando saída)', f'Carga #{rid}')
+
+            for old_rid in old_routes:
+                if old_rid != rid:
+                    self.recalc_route_weight(db, old_rid)
+            self.recalc_route_weight(db, rid)
+            audit(db, u, 'Criou carga via Mapa', 'Rotas/Mapa', name, '', f"{total_weight:.2f} kg, {len(valid_orders)} pedidos")
+            db.commit()
+
+        return self.send_json({
+            'ok': True,
+            'route_id': rid,
+            'redirect_url': f'/routes/{rid}',
+            'message': f'Carga "{name}" criada com sucesso contendo {len(valid_orders)} pedidos ({total_weight:.1f} kg)!'
+        })
+
     def load_settlement_print_report(self,u,rid):
         can_view_financial = self.can_view_financial(u)
         with conn() as db:
@@ -5270,8 +9073,8 @@ document.addEventListener('DOMContentLoaded', function(){
         with conn() as db:
             r=db.execute('SELECT * FROM routes WHERE id=?',(rid,)).fetchone()
             if not r: return self.fail(u,'Não encontrado','Carga não encontrada.',404)
-            if normalize_route_status(r['status']) != 'Em rota':
-                return self.fail(u,'Operação inválida','Somente cargas em rota podem ser concluídas no acerto.',400)
+            if normalize_route_status(r['status']) not in ('Em rota', 'Aguardando Chegada'):
+                return self.fail(u,'Operação inválida','Somente cargas em rota ou aguardando chegada podem ser concluídas no acerto.',400)
             ros=db.execute('SELECT ro.*,o.status,o.order_number,o.sale_date FROM route_orders ro JOIN orders o ON o.id=ro.order_id WHERE ro.route_id=? ORDER BY ro.delivery_order,ro.id',(rid,)).fetchall()
             if not ros:
                 return self.fail(u,'Carga vazia','Esta carga não possui pedidos para acerto.',400)
@@ -5286,10 +9089,32 @@ document.addEventListener('DOMContentLoaded', function(){
                 result=(d.get(f'result_{oid}') or 'entregue').strip().lower()
                 if result not in ('entregue', 'problema'):
                     raise ValueError(f'Resultado inválido no pedido {ro["order_number"]}.')
+                o_items = db.execute("SELECT id, product_name, status, problem_notes FROM order_items WHERE order_id=? ORDER BY id", (oid,)).fetchall()
+                item_problems = []
+                for it in o_items:
+                    it_id = it['id']
+                    it_status = (d.get(f'item_status_{it_id}') or 'Entregue').strip()
+                    it_prob = (d.get(f'item_problem_{it_id}') or '').strip()
+                    if it_status == 'Problema':
+                        if not it_prob:
+                            raise ValueError(f'É obrigatório descrever o problema do produto "{it["product_name"]}" no pedido {ro["order_number"]}.')
+                        db.execute("UPDATE order_items SET status='Problema', problem_notes=? WHERE id=?", (it_prob, it_id))
+                        item_problems.append(f'{it["product_name"]}: {it_prob}')
+                    else:
+                        db.execute("UPDATE order_items SET status='Entregue', problem_notes=NULL WHERE id=?", (it_id,))
+
+                if item_problems:
+                    result = 'problema'
+                    prob_desc_items = "Problema nos itens: " + "; ".join(item_problems)
+                    if obs:
+                        obs = f"{obs} | {prob_desc_items}"
+                    else:
+                        obs = prob_desc_items
+
                 if result == 'problema':
                     if not obs:
                         raise ValueError(f'Informe observação do problema para o pedido {ro["order_number"]}.')
-                    ptype=(d.get(f'ptype_{oid}') or 'Outro motivo').strip()
+                    ptype=(d.get(f'ptype_{oid}') or ('Mercadoria avariada' if item_problems else 'Outro motivo')).strip()
                     self.ensure_order_status(db,oid,'Problema',obs)
                     db.execute("""UPDATE orders
                                   SET status='Problema',
@@ -5300,7 +9125,7 @@ document.addEventListener('DOMContentLoaded', function(){
                                       version=COALESCE(version,1)+1
                                   WHERE id=?""",(dt,pay,obs,now(),oid))
                     db.execute("UPDATE route_orders SET status='Com problema' WHERE id=?",(ro['id'],))
-                    db.execute('INSERT INTO delivery_problems(order_id,problem_type,description,created_at) VALUES(?,?,?,?)',(oid,ptype,obs,now()))
+                    db.execute('INSERT INTO delivery_problems(order_id,route_id,problem_type,description,created_at) VALUES(?,?,?,?,?)',(oid,rid,ptype,obs,now()))
                     add_hist(db,oid,u['id'],old,'Problema','Problema registrado no acerto',f'Carga {r["name"]}. {ptype}: {obs}')
                     problem_count += 1
                 else:
@@ -5350,7 +9175,7 @@ document.addEventListener('DOMContentLoaded', function(){
         total=len(rows); finished=[r for r in rows if r['status']=='Acertado']; open_rows=[r for r in rows if r['status'] not in ('Acertado','Problema','Cancelado')]
         out=[r for r in open_rows if r['status'] != 'Agendado' and r['expected_delivery_date'] and r['expected_delivery_date']<today()]
         risk=[r for r in open_rows if r['status'] != 'Agendado' and days_to(r['expected_delivery_date']) is not None and 0 <= days_to(r['expected_delivery_date']) <= SLA_RISK_DAYS]
-        faturado_waiting=sum(1 for r in open_rows if r['status']=='Faturado')
+        faturado_waiting=sum(1 for r in open_rows if r['status'] in ('Faturado', 'Carga Montada'))
         in_route_risk=sum(1 for r in open_rows if r['status']=='Saiu para entrega' and days_to(r['expected_delivery_date']) is not None and days_to(r['expected_delivery_date']) <= SLA_RISK_DAYS)
         problems_count=sum(1 for r in rows if r['status']=='Problema')
         delivered_ok=0; delivered_late=0; delivery_days=[]; open_age=[]
@@ -5491,10 +9316,10 @@ document.addEventListener('DOMContentLoaded', function(){
             is_risk = (not is_late) and r['status'] not in ('Acertado','Problema','Cancelado') and days_to(r['expected_delivery_date']) is not None and 0 <= days_to(r['expected_delivery_date']) <= SLA_RISK_DAYS
             row_type = 'sla-row-late' if is_late else ('sla-row-risk' if is_risk else 'sla-row-ontime')
             highlight_cls = 'late-row' if is_late else ('risk-row' if is_risk else '')
-            trs_list.append(f"""<tr class='{row_type} {highlight_cls}'><td><b>{esc(r['order_number'])}</b><br><small>{esc(r['client'] or '')} · Vendedor: {esc(r['seller_name'] or 'Não informado')}</small></td><td>{brdate(r['sale_date'])}</td><td>{brdate(r['expected_delivery_date'])}</td><td>{badge(r['status'])}</td><td>{deadline_pill(r['expected_delivery_date'],r['status'])}</td><td>{esc(r['city'] or r['client_city'] or '')}</td><td><a class='btn small ghost' href='/orders/{r['id']}'>Abrir</a></td></tr>""")
+            trs_list.append(f"""<tr class='{row_type} {highlight_cls}'><td><b>{esc(r['order_number'])}</b><br><small>{esc(r['client'] or '')} · Vendedor: {esc(resolve_seller_name(r['seller_name']))}</small></td><td>{brdate(r['sale_date'])}</td><td>{brdate(r['expected_delivery_date'])}</td><td>{badge(r['status'])}</td><td>{deadline_pill(r['expected_delivery_date'],r['status'])}</td><td>{esc(r['city'] or r['client_city'] or '')}</td><td><a class='btn small ghost' href='/orders/{r['id']}'>Abrir</a></td></tr>""")
         trs = ''.join(trs_list)
 
-        critical_rows=''.join(f"""<tr><td><b>{esc(r['order_number'])}</b><br><small>{esc(r['client'] or '')} · Vendedor: {esc(r['seller_name'] or 'Não informado')}</small></td><td>{badge(r['status'])}</td><td>{brdate(r['expected_delivery_date'])}</td><td>{esc(r['route_name'] or 'Sem rota')} · {esc(r['city'] or r['client_city'] or 'Sem cidade')}</td><td><a class='btn small ghost' href='/orders/{r['id']}'>Abrir</a></td></tr>""" for r in critical) or '<tr><td colspan="5">Nenhum pedido crítico no período.</td></tr>'
+        critical_rows=''.join(f"""<tr><td><b>{esc(r['order_number'])}</b><br><small>{esc(r['client'] or '')} · Vendedor: {esc(resolve_seller_name(r['seller_name']))}</small></td><td>{badge(r['status'])}</td><td>{brdate(r['expected_delivery_date'])}</td><td>{esc(r['route_name'] or 'Sem rota')} · {esc(r['city'] or r['client_city'] or 'Sem cidade')}</td><td><a class='btn small ghost' href='/orders/{r['id']}'>Abrir</a></td></tr>""" for r in critical) or '<tr><td colspan="5">Nenhum pedido crítico no período.</td></tr>'
         hrows=''.join(f"""<tr><td>{brdate(h['date'])}</td><td>{esc(h['name'] or 'Feriado/folga operacional')}</td><td>{f'<form method="post" action="/sla/holiday/{h["id"]}/delete"><button class="danger-btn small">Remover</button></form>' if can_manage else '<span class="muted">Somente GOD</span>'}</td></tr>""" for h in holidays) or '<tr><td colspan="3">Nenhum feriado cadastrado.</td></tr>'
         status_bars=''.join(f"""<div class='flow-row'><span>{badge(r['status'])}</span><b>{r['c']}</b></div>""" for r in by_status) or '<div class="empty">Sem status no período.</div>'
         route_bars=''.join(f"""<div class='sla-route-row'><div><b>{esc(r['route_name'])}</b><small>{r['c']} pedidos · {r['late'] or 0} atrasados · {r['risk'] or 0} em risco</small></div><div class='sla-meter'><span style='width:{min(100, (((r['late'] or 0)+(r['risk'] or 0))/max(r['c'],1))*100):.0f}%'></span></div></div>""" for r in by_route) or '<div class="empty">Sem rotas no período.</div>'
@@ -5632,12 +9457,13 @@ document.addEventListener('DOMContentLoaded', function(){
             form='<form method="post" action="/drivers" class="inline-form"><input name="name" placeholder="Motorista" required><input name="phone" placeholder="Telefone"><input name="document" placeholder="Documento"><input name="vehicle_default" list="vehicleDefaultSuggestions" placeholder="Veículo padrão"><button>Adicionar</button></form>'
         edit_panel=''
         if can_manage and edit_row:
-            edit_panel=f'''<section class="panel"><h2>Editar motorista</h2><form method="post" action="/drivers/{edit_row["id"]}/update" class="inline-form"><input name="name" required value="{esc(edit_row["name"])}"><input name="phone" value="{esc(edit_row["phone"] or "")}"><input name="document" value="{esc(edit_row["document"] or "")}"><input name="vehicle_default" list="vehicleDefaultSuggestions" value="{esc(edit_row["vehicle_default"] or "")}"><button>Salvar</button><a class="btn ghost" href="/drivers">Cancelar</a></form></section>'''
+            edit_panel=f'''<section class="panel"><h2>Editar motorista</h2><form method="post" action="/drivers/{edit_row["id"]}/update" class="inline-form"><input name="name" required value="{esc(edit_row["name"])}"><input name="phone" value="{esc(edit_row["phone"] or "")}"><input name="document" value="{esc(edit_row["document"] or "")}"><input name="vehicle_default" list="vehicleDefaultSuggestions" value="{esc(edit_row["vehicle_default"] or "")}"><button>Salvar</button><a class="btn ghost" href="/drivers">Cancelar</a></form><form method="post" action="/drivers/{edit_row["id"]}/reset-password" class="inline-form" style="margin-top:12px; padding-top:12px; border-top:1px solid #cbd5e1;"><input type="hidden" name="redirect_to" value="/drivers"><input name="new_password" type="password" placeholder="Nova senha manual" style="max-width:220px;" required><button class="btn small primary" style="background:#0284c7; border-color:#0284c7;">🔑 Trocar Senha Manualmente</button></form></section>'''
         def render_rows(source_rows):
             body_rows=''
             for r in source_rows:
                 if can_manage:
-                    actions=f'''<a class="btn small ghost" href="/drivers?edit={r["id"]}">Editar</a>
+                    reset_btn=f'''<form method="post" action="/drivers/{r["id"]}/reset-password" class="inline-mini needs-confirm" data-confirm-text="Confirma resetar a senha de {esc(r["name"])} para \'123\' (exigirá nova senha no próximo acesso)?"><input type="hidden" name="reset_to_default" value="1"><button class="btn small ghost" style="color:#0284c7; border-color:#0284c7;">⚡ Resetar (123)</button></form>'''
+                    actions=f'''<a class="btn small ghost" href="/drivers?edit={r["id"]}">Editar</a>{reset_btn}
                                 '''
                     if can_delete_catalog:
                         toggle_label='Inativar' if int(r['active'] or 0) == 1 else 'Reativar'
@@ -5686,6 +9512,38 @@ document.addEventListener('DOMContentLoaded', function(){
             audit(db,u,'Editou motorista','Motoristas',row['name'],row['name'],name)
             db.commit()
         self.redirect('/drivers')
+
+    def post_driver_reset_password(self, u, did):
+        d = self.post_data()
+        redirect_to = (d.get('redirect_to') or '/drivers').strip()
+        custom_password = (d.get('new_password') or '').strip()
+        reset_to_default = str(d.get('reset_to_default') or '').strip().lower() in ('1', 'on', 'true', 'sim', 'yes')
+
+        with conn() as db:
+            driver_row = db.execute('SELECT * FROM drivers WHERE id=?', (did,)).fetchone()
+            if not driver_row:
+                return self.fail(u, 'Não encontrado', 'Motorista não encontrado.', 404)
+
+            if reset_to_default or not custom_password:
+                pwd_hash = hash_driver_password(DEFAULT_DRIVER_PASSWORD)
+                must_change = 1
+                msg_audit = "Resetou senha do motorista para '123' (troca obrigatória no 1º acesso)"
+            else:
+                if len(custom_password) < 4:
+                    raise ValueError("A nova senha do motorista deve ter no mínimo 4 caracteres.")
+                pwd_hash = hash_driver_password(custom_password)
+                must_change = 0
+                msg_audit = f"Definiu nova senha manual para o motorista {driver_row['name']}"
+
+            db.execute(
+                'UPDATE drivers SET password_hash=?, must_change_password=?, updated_at=?, version=COALESCE(version,1)+1 WHERE id=?',
+                (pwd_hash, must_change, now(), did),
+            )
+            db.execute("UPDATE driver_sessions SET revoked_at=? WHERE driver_id=? AND revoked_at IS NULL", (utc_iso(), did))
+            audit(db, u, 'Resetou senha de motorista', 'Motoristas', driver_row['name'], notes=msg_audit)
+            db.commit()
+
+        self.redirect(redirect_to)
     def post_driver_toggle(self,u,did):
         if not can_manage_catalog_deletions(u):
             return self.fail(u,'Ação bloqueada','Seu perfil pode cadastrar e editar motoristas, mas não pode inativar/reativar.',403)
@@ -5987,163 +9845,2073 @@ document.addEventListener('DOMContentLoaded', function(){
             db.commit()
         self.redirect('/route-cities')
 
-    def relatorios(self,u):
-        qs=parse_qs(urlparse(self.path).query)
-        start,end,route_filter,status_filter=self.report_filter_values(qs)
+    def relatorio_viagens(self, u):
+        if not (self.has_perm(u, 'view_reports') or self.has_perm(u, 'view_routes')):
+            return self.fail(u, 'Acesso negado', 'Sem permissão para visualizar relatórios de motoristas.', 403)
+        qs = parse_qs(urlparse(self.path).query)
         can_view_financial = self.can_view_financial(u)
-        where_sql,p=self.report_where(start,end,route_filter,status_filter,alias='o')
+        from app_core.domains.driver_reports_dispatch import render_relatorio_motoristas_html
+        content = render_relatorio_motoristas_html(self, u, qs, can_view_financial)
+        rep_styles = """<style>
+.rep-shell { display: flex; flex-direction: column; gap: 16px; width: 100%; max-width: 100%; box-sizing: border-box; }
+.rep-top-bar {
+  display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;
+  background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px 18px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+}
+.rep-nav-group { display: flex; align-items: center; gap: 6px; background: #f1f5f9; padding: 4px; border-radius: 10px; }
+.rep-nav-item {
+  padding: 8px 18px; font-weight: 700; font-size: 13.5px; border-radius: 8px; color: #475569;
+  text-decoration: none; display: inline-flex; align-items: center; gap: 8px; transition: all 0.15s ease;
+}
+.rep-nav-item:hover { color: #0f172a; background: rgba(255,255,255,0.7); }
+.rep-nav-item.active { background: #ffffff; color: #15803d; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
+.rep-top-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.rep-btn-cta-pdf {
+  display: inline-flex; align-items: center; gap: 8px; background: #166534; color: #ffffff;
+  padding: 9px 16px; border-radius: 8px; font-size: 13px; font-weight: 750; border: none; cursor: pointer;
+  text-decoration: none; transition: background 0.15s ease; box-shadow: 0 1px 3px rgba(22,101,52,0.25);
+}
+.rep-btn-cta-pdf:hover { background: #15803d; }
+.rep-btn-cta-csv {
+  display: inline-flex; align-items: center; gap: 8px; background: #ffffff; color: #0f172a;
+  padding: 9px 16px; border-radius: 8px; font-size: 13px; font-weight: 750; border: 1px solid #cbd5e1;
+  cursor: pointer; text-decoration: none; transition: all 0.15s ease;
+}
+.rep-btn-cta-csv:hover { background: #f8fafc; border-color: #94a3b8; }
+.rep-card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+.rep-filter-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 14px; }
+.rep-presets { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.rep-presets-title { font-size: 12.5px; font-weight: 700; color: #475569; margin-right: 2px; }
+.rep-preset-pill { background: #f1f5f9; color: #334155; font-size: 12px; font-weight: 700; padding: 5px 12px; border-radius: 999px; border: 1px solid #e2e8f0; cursor: pointer; transition: all 0.15s; }
+.rep-preset-pill:hover { background: #e2e8f0; color: #0f172a; }
+.rep-active-badge { font-size: 12.5px; color: #166534; background: #f0fdf4; border: 1px solid #bbf7d0; padding: 4px 10px; border-radius: 8px; font-weight: 600; }
+.rep-grid-filters { display: grid; gap: 14px; margin-bottom: 14px; }
+.rep-input-group { display: flex; flex-direction: column; gap: 4px; }
+.rep-filter-actions { display: flex; justify-content: flex-end; gap: 10px; border-top: 1px solid #f1f5f9; padding-top: 12px; }
+</style>
+<script>
+function setRepDates(preset, formId) {
+  const form = document.getElementById(formId);
+  if (!form) return;
+  const today = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  const fmt = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  let start = fmt(today);
+  let end = fmt(today);
+  if (preset === 'today') {
+    start = fmt(today); end = fmt(today);
+  } else if (preset === '7days') {
+    const d = new Date(today); d.setDate(today.getDate() - 7);
+    start = fmt(d); end = fmt(today);
+  } else if (preset === 'this_month') {
+    const d = new Date(today.getFullYear(), today.getMonth(), 1);
+    start = fmt(d); end = fmt(today);
+  } else if (preset === 'last_month') {
+    const d1 = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+    const d2 = new Date(today.getFullYear(), today.getMonth(), 0);
+    start = fmt(d1); end = fmt(d2);
+  }
+  if (form.start) form.start.value = start;
+  if (form.end) form.end.value = end;
+  form.submit();
+}
+</script>"""
+        subtitle = 'Consolidação de desempenho, quilometragem, diárias, despesas e emissão de PDFs por motorista'
+        return self.send_html(layout(u, 'Relatório de Motoristas', rep_styles + content, subtitle))
+
+    def relatorios(self, u):
+        qs = parse_qs(urlparse(self.path).query)
+        tab = (qs.get('tab', ['operacional'])[0] or 'operacional').strip().lower()
+        if tab not in ('operacional', 'pedidos', 'motoristas'):
+            tab = 'operacional'
+
+        can_view_financial = self.can_view_financial(u)
+
+        rep_styles = """<style>
+/* RELATÓRIOS - DESIGN SYSTEM MODERNO, LIMPO E INTUITIVO */
+.rep-shell { display: flex; flex-direction: column; gap: 16px; width: 100%; max-width: 100%; box-sizing: border-box; }
+.rep-top-bar {
+  display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;
+  background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px 18px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+}
+.rep-nav-group { display: flex; align-items: center; gap: 6px; background: #f1f5f9; padding: 4px; border-radius: 10px; }
+.rep-nav-item {
+  padding: 8px 18px; font-weight: 700; font-size: 13.5px; border-radius: 8px; color: #475569;
+  text-decoration: none; display: inline-flex; align-items: center; gap: 8px; transition: all 0.15s ease;
+}
+.rep-nav-item:hover { color: #0f172a; background: rgba(255,255,255,0.7); }
+.rep-nav-item.active { background: #ffffff; color: #15803d; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
+
+.rep-top-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.rep-btn-cta-pdf {
+  background: linear-gradient(135deg, #15803d 0%, #166534 100%) !important;
+  color: #ffffff !important; font-size: 14px !important; font-weight: 700 !important;
+  padding: 10px 20px !important; border-radius: 8px !important; border: 1px solid #14532d !important;
+  box-shadow: 0 3px 10px rgba(22, 101, 52, 0.28) !important; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 8px; transition: all 0.15s ease;
+}
+.rep-btn-cta-pdf:hover {
+  filter: brightness(1.1); transform: translateY(-1px); box-shadow: 0 5px 14px rgba(22, 101, 52, 0.38) !important;
+}
+.rep-btn-cta-csv {
+  background: #ffffff !important; color: #1e293b !important; font-size: 13.5px !important; font-weight: 600 !important;
+  padding: 10px 18px !important; border-radius: 8px !important; border: 1px solid #cbd5e1 !important;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.05) !important; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 8px; transition: all 0.15s ease;
+}
+.rep-btn-cta-csv:hover { background: #f8fafc !important; border-color: #94a3b8 !important; }
+
+.rep-card {
+  background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px 20px;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.02); box-sizing: border-box; margin-bottom: 14px;
+}
+.rep-filter-header {
+  display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;
+  margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid #f1f5f9;
+}
+.rep-presets { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.rep-presets-title { font-size: 11.5px; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.3px; margin-right: 2px; }
+.rep-preset-pill {
+  background: #f8fafc; border: 1px solid #e2e8f0; color: #334155; font-size: 12px; font-weight: 600;
+  padding: 5px 12px; border-radius: 6px; cursor: pointer; transition: all 0.15s ease;
+}
+.rep-preset-pill:hover { background: #e2e8f0; color: #0f172a; }
+.rep-preset-pill.active { background: #dcfce7; border-color: #86efac; color: #15803d; font-weight: 700; }
+.rep-active-badge {
+  font-size: 12px; color: #475569; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px;
+  padding: 5px 12px; display: inline-flex; align-items: center; gap: 6px;
+}
+
+.rep-grid-filters {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); gap: 12px; align-items: end;
+}
+.rep-input-group { display: flex; flex-direction: column; gap: 4px; }
+.rep-input-group label {
+  font-size: 11px; font-weight: 700; color: #475569; text-transform: uppercase; letter-spacing: 0.3px;
+}
+.rep-input-group input, .rep-input-group select {
+  height: 38px; border: 1px solid #cbd5e1; border-radius: 6px; padding: 6px 10px; font-size: 13px;
+  background: #ffffff; color: #0f172a; width: 100%; box-sizing: border-box; transition: border-color 0.15s, box-shadow 0.15s;
+}
+.rep-input-group input:focus, .rep-input-group select:focus {
+  border-color: #15803d; outline: none; box-shadow: 0 0 0 3px rgba(21, 128, 61, 0.12);
+}
+
+.rep-kpis-container {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 16px;
+}
+.rep-kpi {
+  background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 14px 16px;
+  border-left: 4px solid #94a3b8; display: flex; flex-direction: column; justify-content: space-between;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.03); transition: transform 0.15s, box-shadow 0.15s;
+}
+.rep-kpi:hover { transform: translateY(-2px); box-shadow: 0 4px 10px rgba(0,0,0,0.06); }
+.rep-kpi.green { border-left-color: #16a34a; }
+.rep-kpi.amber { border-left-color: #d97706; }
+.rep-kpi.red { border-left-color: #dc2626; }
+.rep-kpi.blue { border-left-color: #2563eb; }
+.rep-kpi-lbl { font-size: 12px; font-weight: 600; color: #64748b; display: flex; align-items: center; gap: 6px; }
+.rep-kpi-val { font-size: 21px; font-weight: 800; color: #0f172a; margin-top: 4px; line-height: 1.2; }
+.rep-kpi-sub { font-size: 11px; color: #94a3b8; margin-top: 2px; }
+
+.rep-section-title {
+  display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;
+}
+.rep-section-title h3 {
+  margin: 0; font-size: 15px; font-weight: 700; color: #0f172a; display: flex; align-items: center; gap: 8px;
+}
+.rep-count-badge {
+  background: #f1f5f9; color: #475569; font-size: 11.5px; font-weight: 700; padding: 3px 10px; border-radius: 12px;
+}
+
+.rep-progress-track {
+  background: #e2e8f0; border-radius: 6px; height: 7px; overflow: hidden; width: 100%; min-width: 60px; margin-top: 4px;
+}
+.rep-progress-fill { height: 100%; border-radius: 6px; }
+.rep-fill-green { background: #16a34a; }
+.rep-fill-amber { background: #f59e0b; }
+.rep-fill-red { background: #ef4444; }
+
+.rep-schedule-details {
+  background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 10px; padding: 12px 16px; margin-top: 14px;
+}
+.rep-schedule-details summary {
+  font-size: 13px; font-weight: 700; color: #475569; cursor: pointer; outline: none;
+}
+.rep-split-bar {
+  display: flex; height: 16px; border-radius: 8px; overflow: hidden; background: #e2e8f0; width: 100%; margin: 8px 0;
+}
+.rep-split-seg-comm {
+  background: #3b82f6; transition: width 0.3s;
+}
+.rep-split-seg-log {
+  background: #10b981; transition: width 0.3s;
+}
+.rep-lead-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-bottom: 14px;
+}
+.rep-lead-card {
+  background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 14px;
+}
+.rep-lead-title {
+  font-size: 12px; font-weight: 700; color: #475569; text-transform: uppercase; letter-spacing: 0.3px; display: flex; align-items: center; gap: 6px;
+}
+.rep-lead-val {
+  font-size: 24px; font-weight: 800; color: #0f172a; margin: 6px 0 2px 0;
+}
+.rep-lead-sub {
+  font-size: 11.5px; color: #64748b;
+}
+
+/* PAINEL MODULAR DE CUSTOMIZAÇÃO DE RELATÓRIO */
+.rep-customizer-panel {
+  background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 10px; margin-top: 14px; overflow: hidden;
+  transition: all 0.2s ease;
+}
+.rep-customizer-panel[open] {
+  background: #ffffff; border-color: #94a3b8; box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+}
+.rep-customizer-summary {
+  display: flex; justify-content: space-between; align-items: center; padding: 12px 16px;
+  cursor: pointer; user-select: none; background: #f1f5f9; font-size: 13.5px; font-weight: 700; color: #1e293b;
+}
+.rep-customizer-summary:hover { background: #e2e8f0; }
+.rep-customizer-summary-left { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.rep-customizer-badge {
+  font-size: 11px; font-weight: 700; background: #dbeafe; color: #1e40af; padding: 2px 8px; border-radius: 12px;
+}
+.rep-customizer-hint { font-size: 11.5px; color: #64748b; font-weight: normal; }
+
+.rep-customizer-content { padding: 16px 18px; border-top: 1px solid #e2e8f0; }
+.rep-customizer-toolbar {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 14px;
+  padding-bottom: 12px; border-bottom: 1px solid #f1f5f9;
+}
+.rep-tool-btn {
+  background: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px; padding: 6px 12px;
+  font-size: 12px; font-weight: 600; color: #334155; cursor: pointer; transition: all 0.15s ease;
+  display: inline-flex; align-items: center; gap: 4px;
+}
+.rep-tool-btn:hover { background: #f1f5f9; border-color: #94a3b8; color: #0f172a; }
+.rep-tool-btn.save {
+  background: #f0fdf4; border-color: #86efac; color: #166534; font-weight: 700; margin-left: auto;
+}
+.rep-tool-btn.save:hover { background: #dcfce7; border-color: #4ade80; }
+
+.rep-customizer-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px;
+}
+.rep-cust-card {
+  background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px 14px;
+}
+.rep-cust-card-title {
+  font-size: 12px; font-weight: 700; text-transform: uppercase; color: #475569; letter-spacing: 0.3px;
+  margin-bottom: 10px; display: flex; align-items: center; gap: 6px; padding-bottom: 6px; border-bottom: 1px solid #e2e8f0;
+}
+.rep-cust-card-body { display: flex; flex-direction: column; gap: 8px; }
+.rep-chk-item {
+  display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: #1e293b; cursor: pointer;
+}
+.rep-chk-item input[type="checkbox"] {
+  width: 16px; height: 16px; cursor: pointer; accent-color: #15803d;
+}
+</style>
+<script>
+function setRepDates(preset, fId) {
+  var f = document.getElementById(fId);
+  if (!f) return;
+  var sInp = f.querySelector('input[name="start"]');
+  var eInp = f.querySelector('input[name="end"]');
+  var now = new Date();
+  var pad = function(n){ return n < 10 ? '0' + n : n; };
+  var fmt = function(d){ return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate()); };
+  if (preset === 'today') {
+    sInp.value = fmt(now);
+    eInp.value = fmt(now);
+  } else if (preset === '7days') {
+    var past = new Date(); past.setDate(now.getDate() - 7);
+    sInp.value = fmt(past);
+    eInp.value = fmt(now);
+  } else if (preset === 'this_month') {
+    var d1 = new Date(now.getFullYear(), now.getMonth(), 1);
+    sInp.value = fmt(d1);
+    eInp.value = fmt(now);
+  } else if (preset === 'last_month') {
+    var d1 = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    var d2 = new Date(now.getFullYear(), now.getMonth(), 0);
+    sInp.value = fmt(d1);
+    eInp.value = fmt(d2);
+  } else if (preset === 'open_orders') {
+    var d1 = new Date(now.getFullYear(), 0, 1);
+    sInp.value = fmt(d1);
+    eInp.value = fmt(now);
+    var stSel = f.querySelector('select[name="status"]');
+    if (stSel) stSel.value = 'open';
+  }
+  var pills = f.querySelectorAll('.rep-preset-pill');
+  pills.forEach(function(p){ p.classList.remove('active'); });
+  if (window.event && window.event.target) {
+    window.event.target.classList.add('active');
+  }
+}
+
+function setAllCheckboxes(formId, checked) {
+  var f = document.getElementById(formId);
+  if (!f) return;
+  var chks = f.querySelectorAll('.rep-customizer-grid input[type="checkbox"]');
+  chks.forEach(function(c) {
+    if (!c.disabled) c.checked = checked;
+  });
+}
+
+function resetDefaultCheckboxes(formId) {
+  var f = document.getElementById(formId);
+  if (!f) return;
+  var chks = f.querySelectorAll('.rep-customizer-grid input[type="checkbox"]');
+  chks.forEach(function(c) {
+    var n = c.name;
+    if (n === 'pdf_hdr_problems' || n === 'pdf_hdr_canceled' || n === 'pdf_report_st_cancelado' || n === 'sec_orders') {
+      c.checked = false;
+    } else {
+      c.checked = true;
+    }
+  });
+}
+
+function saveRepPreferences(formId, tabName) {
+  var f = document.getElementById(formId);
+  if (!f) return;
+  var postForm = document.createElement('form');
+  postForm.method = 'POST';
+  postForm.action = '/relatorios/settings';
+  
+  var tabInp = document.createElement('input');
+  tabInp.type = 'hidden';
+  tabInp.name = 'origin_tab';
+  tabInp.value = tabName;
+  postForm.appendChild(tabInp);
+
+  var chks = f.querySelectorAll('.rep-customizer-grid input[type="checkbox"]');
+  chks.forEach(function(c) {
+    var inp = document.createElement('input');
+    inp.type = 'hidden';
+    inp.name = c.name;
+    inp.value = c.checked ? '1' : '0';
+    postForm.appendChild(inp);
+  });
+
+  var csrfInp = f.querySelector('input[name="_csrf"]');
+  if (csrfInp) {
+    var ci = document.createElement('input');
+    ci.type = 'hidden';
+    ci.name = '_csrf';
+    ci.value = csrfInp.value;
+    postForm.appendChild(ci);
+  }
+
+  document.body.appendChild(postForm);
+  postForm.submit();
+}
+</script>"""
+
+        if tab == 'pedidos':
+            content = self.render_relatorio_pedidos(u, qs, can_view_financial)
+            subtitle = 'Relatório analítico e auditoria de pedidos com busca, filtros e exportação'
+        elif tab == 'motoristas':
+            from app_core.domains.driver_reports_dispatch import render_relatorio_motoristas_html
+            content = render_relatorio_motoristas_html(self, u, qs, can_view_financial)
+            subtitle = 'Consolidação de desempenho, quilometragem, diárias e despesas por motorista'
+        else:
+            tab = 'operacional'
+            content = self.render_relatorio_operacional(u, qs, can_view_financial)
+            subtitle = 'Indicadores executivos, desempenho de motoristas, caminhões, rotas e pontualidade SLA'
+
+        return self.send_html(layout(u, 'Relatórios', rep_styles + content, subtitle))
+
+    def render_relatorio_operacional(self, u, qs, can_view_financial):
         with conn() as db:
-            route_names=[r['route_name'] for r in db.execute('SELECT DISTINCT route_name FROM orders WHERE route_name IS NOT NULL AND route_name<>"" ORDER BY route_name')]
-            st=db.execute(f'SELECT o.status,COUNT(*) c,COALESCE(SUM(o.weight_kg),0) w,COALESCE(SUM(o.total_value),0) v FROM orders o {where_sql} GROUP BY o.status ORDER BY c DESC',p).fetchall()
-            rt=db.execute(f'SELECT COALESCE(o.route_name,"Sem rota") route_name,COUNT(*) c,COALESCE(SUM(o.weight_kg),0) w,COALESCE(SUM(o.total_value),0) v FROM orders o {where_sql} GROUP BY o.route_name ORDER BY c DESC',p).fetchall()
-            city=db.execute(f'SELECT COALESCE(o.city,"Sem cidade") city,COUNT(*) c,COALESCE(SUM(o.weight_kg),0) w,COALESCE(SUM(o.total_value),0) v FROM orders o {where_sql} GROUP BY o.city ORDER BY c DESC',p).fetchall()
-            dr=db.execute(f"""SELECT
-                                COALESCE(d.name, od.name, 'Sem motorista') driver,
-                                COUNT(o.id) c,
-                                COALESCE(SUM(o.weight_kg),0) w,
-                                COALESCE(SUM(o.total_value),0) v,
-                                SUM(CASE
-                                        WHEN NULLIF(substr(COALESCE(o.delivered_at,''),1,10),'') IS NOT NULL
-                                         AND NULLIF(o.sale_date,'') IS NOT NULL
-                                        THEN 1 ELSE 0
-                                    END) delivered_count,
-                                ROUND(AVG(CASE
-                                            WHEN NULLIF(substr(COALESCE(o.delivered_at,''),1,10),'') IS NOT NULL
-                                             AND NULLIF(o.sale_date,'') IS NOT NULL
-                                            THEN julianday(substr(o.delivered_at,1,10)) - julianday(o.sale_date)
-                                          END),1) avg_days,
-                                ROUND(COALESCE(SUM(CASE
-                                            WHEN NULLIF(substr(COALESCE(o.delivered_at,''),1,10),'') IS NOT NULL
-                                             AND NULLIF(o.sale_date,'') IS NOT NULL
-                                            THEN julianday(substr(o.delivered_at,1,10)) - julianday(o.sale_date)
-                                            ELSE 0
-                                          END),0),1) total_days
-                              FROM orders o
-                              LEFT JOIN route_orders ro ON ro.order_id=o.id
-                              LEFT JOIN routes r ON r.id=ro.route_id AND r.status <> 'Cancelada'
-                              LEFT JOIN drivers d ON d.id=r.driver_id
-                              LEFT JOIN drivers od ON od.id=o.driver_id
-                              {where_sql}
-                              GROUP BY COALESCE(d.name, od.name, 'Sem motorista')
-                              ORDER BY c DESC""",p).fetchall()
-            sla=db.execute(f"""SELECT
-                                SUM(CASE WHEN o.status='Acertado' AND substr(COALESCE(o.delivered_at,''),1,10)<=o.expected_delivery_date THEN 1 ELSE 0 END) within_sla,
-                                SUM(CASE WHEN o.status='Acertado' AND substr(COALESCE(o.delivered_at,''),1,10)>o.expected_delivery_date THEN 1 ELSE 0 END) outside_sla,
-                                SUM(CASE WHEN o.status NOT IN ('Acertado','Problema','Cancelado') AND o.expected_delivery_date<? THEN 1 ELSE 0 END) open_late
-                                FROM orders o {where_sql}""",[today()]+p).fetchone()
-            problems=db.execute(f"""SELECT COALESCE(dp.problem_type,'Sem motivo') problem_type, COUNT(*) c
-                                     FROM delivery_problems dp
-                                     JOIN orders o ON o.id=dp.order_id
-                                     {where_sql}
-                                     GROUP BY dp.problem_type
-                                     ORDER BY c DESC""",p).fetchall()
-            deliveries=self.report_orders_rows(db,start,end,route_filter,status_filter,limit=80)
-        srows=''.join(f'<tr><td>{badge(r["status"])}</td><td>{r["c"]}</td><td>{fmt_num(r["w"])} kg</td><td>{money_visible(can_view_financial, r["v"])}</td></tr>' for r in st) or '<tr><td colspan="4">Sem dados.</td></tr>'
-        rrows=''.join(f'<tr><td>{esc(r["route_name"])}</td><td>{r["c"]}</td><td>{fmt_num(r["w"])} kg</td><td>{money_visible(can_view_financial, r["v"])}</td></tr>' for r in rt) or '<tr><td colspan="4">Sem dados.</td></tr>'
-        city_rows=''.join(f'<tr><td>{esc(r["city"])}</td><td>{r["c"]}</td><td>{fmt_num(r["w"])} kg</td><td>{money_visible(can_view_financial, r["v"])}</td></tr>' for r in city) or '<tr><td colspan="4">Sem dados.</td></tr>'
-        drows=''.join(
-            f'<tr><td>{esc(r["driver"])}</td><td>{r["c"]}</td><td>{fmt_num(r["w"])} kg</td><td>{money_visible(can_view_financial, r["v"])}</td><td>{fmt_num(r["avg_days"],1) if r["avg_days"] is not None else "—"} dia(s)</td><td>{fmt_num(r["total_days"],1)} dia(s)</td></tr>'
-            for r in dr
-        ) or '<tr><td colspan="6">Sem dados.</td></tr>'
-        prob_rows=''.join(f'<tr><td>{esc(r["problem_type"])}</td><td>{r["c"]}</td></tr>' for r in problems) or '<tr><td colspan="2">Sem problemas no filtro.</td></tr>'
-        del_rows=''.join(
-            f'<tr><td><a class="btn small ghost" href="/orders/{r["id"]}">{esc(r["order_number"])}</a></td><td>{esc(r["seller_name"] or "Não informado")}</td><td>{badge(r["status"])}</td><td>{esc(r["route_name"] or "Sem rota")} · {esc(r["city"] or "Sem cidade")}</td><td>{esc(r["driver"] or "Sem motorista")}</td><td>{fmt_num(r["weight_kg"])} kg</td><td>{money_visible(can_view_financial, r["total_value"])}</td><td>{brdate(r["delivered_at"])}</td><td>{(str(r["days_to_deliver"]) + " dia(s)") if r["days_to_deliver"] is not None else "—"}</td><td>{deadline_pill(r["expected_delivery_date"],r["status"])}</td></tr>'
-            for r in deliveries
-        ) or '<tr><td colspan="10">Sem entregas no filtro.</td></tr>'
-        route_opts=option(route_names,route_filter,True,'Todas as rotas')
-        status_opts=option(STATUSES,status_filter,True,'Todos os status')
-        form=f'<form class="filters"><input type="date" name="start" value="{esc(start)}"><input type="date" name="end" value="{esc(end)}"><select name="route">{route_opts}</select><select name="status">{status_opts}</select><button>Filtrar</button><a class="btn ghost" href="/relatorios/export?start={esc(start)}&end={esc(end)}&route={quote(route_filter)}&status={quote(status_filter)}">Exportar CSV</a></form>'
-        sla_panel=f"""<section class="panel"><h2>Relatório de SLA</h2><div class="cards"><div class="card done"><small>Dentro do prazo</small><strong>{sla['within_sla'] or 0}</strong></div><div class="card danger"><small>Fora do prazo</small><strong>{sla['outside_sla'] or 0}</strong></div><div class="card warn"><small>Abertos atrasados</small><strong>{sla['open_late'] or 0}</strong></div></div></section>"""
-        
-        accordions = f"""
-        <details class='accordion-panel'>
-          <summary>Relatório por Status</summary>
-          <div class='accordion-content'>
-            <div class="table-wrap">
-              <table>
-                <thead><tr><th>Status</th><th>Qtd</th><th>Peso</th><th>Valor</th></tr></thead>
-                <tbody>{srows}</tbody>
-              </table>
-            </div>
-          </div>
-        </details>
+            route_names = [r['route_name'] for r in db.execute('SELECT DISTINCT route_name FROM orders WHERE route_name IS NOT NULL AND route_name<>"" ORDER BY route_name')]
+            city_names = [r['city'] for r in db.execute('SELECT DISTINCT city FROM orders WHERE city IS NOT NULL AND city<>"" ORDER BY city')]
+            driver_names = [r['name'] for r in db.execute('SELECT name FROM drivers WHERE active=1 ORDER BY name')]
+            vehicle_rows = db.execute("SELECT id, name, plate FROM vehicles WHERE active=1 ORDER BY name").fetchall()
+            vehicle_names = [f"{r['name']} - {r['plate']}" if (r['plate'] and r['plate'].strip()) else r['name'] for r in vehicle_rows]
+            seller_names = [r['seller_name'] for r in db.execute('SELECT DISTINCT seller_name FROM orders WHERE seller_name IS NOT NULL AND seller_name<>"" ORDER BY seller_name')]
+            settings = {r['key']: r['value'] for r in db.execute('SELECT * FROM settings')}
 
-        <details class='accordion-panel'>
-          <summary>Relatório por Rota e Cidade</summary>
-          <div class='accordion-content'>
-            <div class="dash-grid">
-              <section class="panel" style="margin: 0; padding: 0; border: none; box-shadow: none;">
-                <h2>Relatório por rota</h2>
-                <div class="table-wrap">
-                  <table>
-                    <thead><tr><th>Rota</th><th>Qtd</th><th>Peso</th><th>Valor</th></tr></thead>
-                    <tbody>{rrows}</tbody>
-                  </table>
+            op_data = self.get_operational_report_data(db, qs, can_view_financial)
+
+        _, sess = self.session_data()
+        csrf_val = esc((sess or {}).get('csrf') or '')
+
+        f = op_data['filters']
+        cfg = op_data.get('config', {})
+        totals = op_data['totals']
+        drivers = op_data['drivers']
+        vehicles = op_data.get('vehicles', [])
+        unassigned_vehicle = op_data.get('unassigned_vehicle')
+        routes = op_data['routes']
+        cities = op_data['cities']
+        problems = op_data['problems']
+        orders = op_data['orders']
+
+        def chk(name, def_val='1'):
+            return 'checked' if cfg.get(name, def_val) == '1' else ''
+
+        alert_msg = ''
+        if qs.get('saved'):
+            alert_msg = '<div class="alert success" style="margin-bottom:1rem;">✅ Preferências salvas com sucesso!</div>'
+        elif qs.get('report_generated'):
+            fn = esc(qs.get('filename', ['relatório'])[0])
+            alert_msg = f'<div class="alert success" style="margin-bottom:1rem;">⚡ <b>Relatório gerado com sucesso!</b><br>Arquivo salvo em <b>Desktop\\Relatório Logística Casa do Campo\\{fn}</b></div>'
+
+        route_opts = option(route_names, f['route'], True, 'Todas as rotas')
+        city_opts = option(city_names, f['city'], True, 'Todas as cidades')
+        driver_opts = option(driver_names, f['driver'], True, 'Todos os motoristas')
+        vehicle_opts = option(vehicle_names, f.get('vehicle', ''), True, 'Todos os caminhões')
+        seller_opts = option(seller_names, f['seller'], True, 'Todos os vendedores')
+
+        date_type_opts = ''.join([
+            f'<option value="operational" {"selected" if f["date_type"]=="operational" else ""}>Data Operacional (Carga / Entrega / Expedição) - Padrão</option>',
+            f'<option value="delivery" {"selected" if f["date_type"]=="delivery" else ""}>Data da Entrega / Acerto (Apenas finalizadas)</option>',
+            f'<option value="route" {"selected" if f["date_type"]=="route" else ""}>Data da Carga / Rota</option>',
+            f'<option value="sale" {"selected" if f["date_type"]=="sale" else ""}>Data da Venda (Comercial / ERP)</option>',
+            f'<option value="expected" {"selected" if f["date_type"]=="expected" else ""}>Previsão de Entrega (SLA)</option>',
+        ])
+
+        def chk_op(name, def_val='1'):
+            return 'checked' if cfg.get(name, def_val) == '1' else ''
+
+        active_op_cnt = sum(1 for k in cfg if cfg.get(k) == '1' and not k.startswith('sec_'))
+
+        val_op_kpi_chk = f'<label class="rep-chk-item"><input type="checkbox" name="kpi_total_value" value="1" {chk_op("kpi_total_value")}> <span>💰 Faturamento Total</span></label>' if can_view_financial else ''
+        val_op_col_chk = f'<label class="rep-chk-item"><input type="checkbox" name="col_financial" value="1" {chk_op("col_financial")}> <span>💰 Faturamento / Valor</span></label>' if can_view_financial else ''
+
+        customizer_op_html = f"""
+        <details class="rep-customizer-panel">
+          <summary class="rep-customizer-summary">
+            <div class="rep-customizer-summary-left">
+              <span>⚙️</span>
+              <span>Personalizar Exibição do Relatório Operacional (Cards, Seções e Colunas)</span>
+              <span class="rep-customizer-badge">{active_op_cnt} opções ativas</span>
+            </div>
+            <span class="rep-customizer-hint">Clique para expandir/recolher opções de exportação e tela</span>
+          </summary>
+          <div class="rep-customizer-content">
+            <div class="rep-customizer-toolbar">
+              <button type="button" class="rep-tool-btn" onclick="setAllCheckboxes('opReportForm', true)">☑️ Marcar Tudo</button>
+              <button type="button" class="rep-tool-btn" onclick="setAllCheckboxes('opReportForm', false)">⬜ Desmarcar Tudo</button>
+              <button type="button" class="rep-tool-btn" onclick="resetDefaultCheckboxes('opReportForm')">🔄 Padrão Recomendado</button>
+              <button type="button" class="rep-tool-btn save" onclick="saveRepPreferences('opReportForm', 'operacional')">💾 Salvar Minhas Preferências</button>
+            </div>
+            <div class="rep-customizer-grid">
+              <div class="rep-cust-card">
+                <div class="rep-cust-card-title"><span>🎯</span> Cards de Resumo (KPIs)</div>
+                <div class="rep-cust-card-body">
+                  <label class="rep-chk-item"><input type="checkbox" name="kpi_total_orders" value="1" {chk_op('kpi_total_orders')}> <span>📦 Total de Pedidos</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="kpi_total_weight" value="1" {chk_op('kpi_total_weight')}> <span>⚖️ Peso Total</span></label>
+                  {val_op_kpi_chk}
+                  <label class="rep-chk-item"><input type="checkbox" name="kpi_sla_rate" value="1" {chk_op('kpi_sla_rate')}> <span>🎯 Pontualidade SLA (%)</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="kpi_delivered_ontime" value="1" {chk_op('kpi_delivered_ontime')}> <span>🟢 Entregues no Prazo</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="kpi_delivered_late" value="1" {chk_op('kpi_delivered_late')}> <span>🔴 Entregues Fora Prazo</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="kpi_pending_late" value="1" {chk_op('kpi_pending_late')}> <span>⚠️ Abertos Atrasados</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="kpi_avg_days" value="1" {chk_op('kpi_avg_days')}> <span>⏱️ Média Dias Entrega</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="kpi_lead_times" value="1" {chk_op('kpi_lead_times')}> <span>⏳ Lead Times & Gargalos</span></label>
                 </div>
-              </section>
-              <section class="panel" style="margin: 0; padding: 0; border: none; box-shadow: none;">
-                <h2>Relatório por cidade</h2>
-                <div class="table-wrap">
-                  <table>
-                    <thead><tr><th>Cidade</th><th>Qtd</th><th>Peso</th><th>Valor</th></tr></thead>
-                    <tbody>{city_rows}</tbody>
-                  </table>
+              </div>
+              <div class="rep-cust-card">
+                <div class="rep-cust-card-title"><span>📑</span> Seções do Relatório</div>
+                <div class="rep-cust-card-body">
+                  <label class="rep-chk-item"><input type="checkbox" name="sec_bottlenecks" value="1" {chk_op('sec_bottlenecks')}> <span>🎯 Diagnóstico de Gargalos (Comercial vs Logística)</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="sec_drivers" value="1" {chk_op('sec_drivers')}> <span>👤 1. Desempenho por Motorista</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="sec_vehicles" value="1" {chk_op('sec_vehicles')}> <span>🚚 2. Desempenho por Caminhão</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="sec_routes" value="1" {chk_op('sec_routes')}> <span>🗺️ 3. Desempenho por Rota</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="sec_cities" value="1" {chk_op('sec_cities')}> <span>🏙️ 4. Desempenho por Cidade</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="sec_problems" value="1" {chk_op('sec_problems')}> <span>⚠️ 5. Ocorrências & Problemas</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="sec_orders" value="1" {chk_op('sec_orders', '0')}> <span>📋 6. Listagem Operacional</span></label>
                 </div>
-              </section>
-            </div>
-          </div>
-        </details>
-
-        <details class='accordion-panel'>
-          <summary>Relatório por motorista</summary>
-          <div class='accordion-content'>
-            <div class="table-wrap">
-              <table>
-                <thead><tr><th>Motorista</th><th>Pedidos</th><th>Peso</th><th>Valor</th><th>Média venda-entrega</th><th>Total dias</th></tr></thead>
-                <tbody>{drows}</tbody>
-              </table>
-            </div>
-          </div>
-        </details>
-
-        <details class='accordion-panel'>
-          <summary>Relatório de Problemas e Ocorrências</summary>
-          <div class='accordion-content'>
-            <div class="table-wrap">
-              <table>
-                <thead><tr><th>Problema</th><th>Qtd</th></tr></thead>
-                <tbody>{prob_rows}</tbody>
-              </table>
-            </div>
-          </div>
-        </details>
-
-        <details class='accordion-panel'>
-          <summary>Relatório de entregas (Últimos 80 Pedidos)</summary>
-          <div class='accordion-content'>
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr><th>Pedido</th><th>Vendedor</th><th>Status</th><th>Rota/Cidade</th><th>Motorista</th><th>Peso</th><th>Valor</th><th>Entrega</th><th>Dias entrega</th><th>SLA</th></tr>
-                </thead>
-                <tbody>{del_rows}</tbody>
-              </table>
+              </div>
+              <div class="rep-cust-card">
+                <div class="rep-cust-card-title"><span>📋</span> Colunas Analíticas</div>
+                <div class="rep-cust-card-body">
+                  {val_op_col_chk}
+                  <label class="rep-chk-item"><input type="checkbox" name="col_weight" value="1" {chk_op('col_weight')}> <span>⚖️ Peso (kg)</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="col_avg_days" value="1" {chk_op('col_avg_days')}> <span>⏱️ Média Dias</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="col_lead_times" value="1" {chk_op('col_lead_times')}> <span>⏳ Tempos por Etapa (Lead Times)</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="col_sla" value="1" {chk_op('col_sla')}> <span>🎯 Pontualidade SLA</span></label>
+                </div>
+              </div>
             </div>
           </div>
         </details>
         """
-        return self.send_html(layout(u,'Relatórios',form+sla_panel+accordions,'Relatórios operacionais com filtros e exportação CSV'))
-    def export_csv(self,u):
-        qs=parse_qs(urlparse(self.path).query)
-        start,end,route_filter,status_filter=self.report_filter_values(qs)
+
+        filter_form = f"""
+        <div class="rep-top-bar">
+          <div class="rep-nav-group">
+            <a href="/relatorios?tab=operacional" class="rep-nav-item active"><span>📊</span> Desempenho Operacional & SLA</a>
+            <a href="/relatorios?tab=pedidos" class="rep-nav-item"><span>📦</span> Relatório de Pedidos</a>
+            <a href="/relatorios?tab=motoristas" class="rep-nav-item"><span>🚚</span> Relatório de Motoristas</a>
+          </div>
+          <div class="rep-top-actions">
+            <button type="submit" form="opReportForm" formaction="/relatorios/operacional/export-pdf" class="rep-btn-cta-pdf" title="Baixar relatório formatado para impressão em PDF">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line></svg>
+              <span>📄 Emitir Relatório PDF</span>
+            </button>
+            <button type="submit" form="opReportForm" formaction="/relatorios/operacional/export-csv" class="rep-btn-cta-csv" title="Exportar dados consolidados em planilha CSV">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+              <span>📊 Exportar Planilha (CSV)</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="rep-card">
+          <form id="opReportForm" method="get" action="/relatorios">
+            <input type="hidden" name="tab" value="operacional">
+            <input type="hidden" name="filtered" value="1">
+            <input type="hidden" name="customizer_present" value="1">
+            <input type="hidden" name="_csrf" value="{csrf_val}">
+            
+            <div class="rep-filter-header">
+              <div class="rep-presets">
+                <span class="rep-presets-title">Atalhos Rápidos:</span>
+                <button type="button" class="rep-preset-pill" onclick="setRepDates('today', 'opReportForm')">Hoje</button>
+                <button type="button" class="rep-preset-pill" onclick="setRepDates('7days', 'opReportForm')">Últimos 7 dias</button>
+                <button type="button" class="rep-preset-pill active" onclick="setRepDates('this_month', 'opReportForm')">Este Mês</button>
+                <button type="button" class="rep-preset-pill" onclick="setRepDates('last_month', 'opReportForm')">Mês Anterior</button>
+                <button type="button" class="rep-preset-pill" onclick="setRepDates('open_orders', 'opReportForm')">📦 Todos em Aberto (Ativos)</button>
+              </div>
+              <div class="rep-active-badge">
+                <span>Filtro ativo: <b>{esc(op_data['filter_desc'])}</b></span>
+              </div>
+            </div>
+
+            <div class="rep-grid-filters">
+              <div class="rep-input-group">
+                <label>Data Inicial</label>
+                <input type="date" name="start" value="{esc(f['start'])}" required>
+              </div>
+              <div class="rep-input-group">
+                <label>Data Final</label>
+                <input type="date" name="end" value="{esc(f['end'])}" required>
+              </div>
+              <div class="rep-input-group">
+                <label>Filtrar período por</label>
+                <select name="date_type">{date_type_opts}</select>
+              </div>
+              <div class="rep-input-group">
+                <label>Motorista</label>
+                <select name="driver">{driver_opts}</select>
+              </div>
+              <div class="rep-input-group">
+                <label>Caminhão / Veículo</label>
+                <select name="vehicle">{vehicle_opts}</select>
+              </div>
+              <div class="rep-input-group">
+                <label>Rota</label>
+                <select name="route">{route_opts}</select>
+              </div>
+              <div class="rep-input-group">
+                <label>Status Operacional</label>
+                <select name="status">
+                  <option value="" {"selected" if not f.get('status') else ""}>Todas as cargas ativas</option>
+                  <option value="finalized" {"selected" if f.get('status')=='finalized' else ""}>Apenas Finalizadas (Entregues)</option>
+                  <option value="open" {"selected" if f.get('status')=='open' else ""}>Em Aberto / Em Rota</option>
+                  <option value="all_with_canceled" {"selected" if f.get('status')=='all_with_canceled' else ""}>Incluir Canceladas</option>
+                </select>
+              </div>
+            </div>
+
+            {customizer_op_html}
+
+            <div style="display:flex;gap:10px;align-items:center;margin-top:14px;flex-wrap:wrap;">
+              <button type="submit" class="btn primary" style="font-weight:700;padding:8px 22px;font-size:13.5px;display:inline-flex;align-items:center;gap:6px;">
+                🔍 Aplicar Filtros
+              </button>
+              <a href="/relatorios?tab=operacional" class="btn ghost" style="padding:8px 16px;font-size:13px;display:inline-flex;align-items:center;">
+                ↺ Limpar Filtros
+              </a>
+            </div>
+          </form>
+        </div>
+        """
+
+        # Opção expansiva de Agendamento Automático
+        r_enabled = settings.get('pdf_report_enabled', '1')
+        r_days = settings.get('pdf_report_days', 'Mon,Wed,Fri')
+        r_time = settings.get('pdf_report_time', '09:00')
+
+        agendador_accordion = f"""
+        <details class='rep-schedule-details'>
+          <summary>⚙️ Agendamento Automático deste Relatório na Área de Trabalho (Opcional)</summary>
+          <div style="padding-top:12px;">
+            <form method="post" action="/relatorios/settings" class="form" style="margin:0;">
+              <input type="hidden" name="_csrf" value="{csrf_val}">
+              <input type="hidden" name="origin_tab" value="operacional">
+              <div class="grid3">
+                <label>Status do Agendador
+                  <select name="pdf_report_enabled">
+                    <option value="1" {'selected' if r_enabled=='1' else ''}>Ativo (Gerar nos horários programados)</option>
+                    <option value="0" {'selected' if r_enabled=='0' else ''}>Inativo</option>
+                  </select>
+                </label>
+                <label>Dias de Execução
+                  <select name="pdf_report_days">
+                    <option value="Mon,Wed,Fri" {'selected' if r_days=='Mon,Wed,Fri' else ''}>Segunda, Quarta e Sexta</option>
+                    <option value="ALL" {'selected' if r_days=='ALL' else ''}>Todos os dias (Diário)</option>
+                    <option value="Mon" {'selected' if r_days=='Mon' else ''}>Apenas Segunda-feira</option>
+                    <option value="Fri" {'selected' if r_days=='Fri' else ''}>Apenas Sexta-feira</option>
+                  </select>
+                </label>
+                <label>Horário de Emissão (24h)
+                  <input type="time" name="pdf_report_time" value="{esc(r_time)}" required>
+                </label>
+              </div>
+              <p class="muted" style="margin:8px 0;">Os relatórios gerados automaticamente serão salvos na pasta <b>Desktop\\Relatório Logística Casa do Campo</b> neste computador.</p>
+              <div style="margin-top:10px;">
+                <button type="submit" class="btn primary" style="padding:6px 16px;font-size:13px;">💾 Salvar Agendamento</button>
+              </div>
+            </form>
+          </div>
+        </details>
+        """
+
+        sla_rate = totals.get('sla_rate') if totals.get('sla_rate') is not None else 100.0
+        tot_weight_kg = totals.get('total_weight') or 0.0
+        tot_value = totals.get('total_value') or 0.0
+        weight_display = f"{fmt_num(tot_weight_kg)} kg" + (f" ({tot_weight_kg/1000:.2f} t)" if tot_weight_kg >= 1000 else "")
+        sla_kpi_cls = 'green' if sla_rate >= 90 else ('amber' if sla_rate >= 75 else 'red')
+
+        # Montagem dinâmica dos Cards KPI conforme preferências do usuário
+        op_kpi_cards = []
+        if cfg.get('kpi_total_orders', '1') == '1':
+            op_kpi_cards.append(f"""
+              <div class="rep-kpi blue">
+                <div class="rep-kpi-lbl"><span>📦</span> Total de Pedidos</div>
+                <div class="rep-kpi-val">{totals.get("total_orders", 0) or 0}</div>
+                <div class="rep-kpi-sub">pedidos no período</div>
+              </div>
+            """)
+        if cfg.get('kpi_total_weight', '1') == '1':
+            op_kpi_cards.append(f"""
+              <div class="rep-kpi blue">
+                <div class="rep-kpi-lbl"><span>⚖️</span> Peso Transportado</div>
+                <div class="rep-kpi-val">{weight_display}</div>
+                <div class="rep-kpi-sub">volume total movimentado</div>
+              </div>
+            """)
+        if can_view_financial and cfg.get('kpi_total_value', '1') == '1':
+            op_kpi_cards.append(f"""
+              <div class="rep-kpi blue">
+                <div class="rep-kpi-lbl"><span>💰</span> Faturamento Total</div>
+                <div class="rep-kpi-val">{money_visible(can_view_financial, totals.get("total_value", 0) or 0)}</div>
+                <div class="rep-kpi-sub">valor financeiro global</div>
+              </div>
+            """)
+        if cfg.get('kpi_sla_rate', '1') == '1':
+            op_kpi_cards.append(f"""
+              <div class="rep-kpi {sla_kpi_cls}">
+                <div class="rep-kpi-lbl"><span>🎯</span> Pontualidade SLA</div>
+                <div class="rep-kpi-val" style="color:{'#15803d' if sla_rate>=90 else ('#b45309' if sla_rate>=75 else '#b91c1c')};">{sla_rate:.1f}%</div>
+                <div class="rep-kpi-sub">{totals.get("delivered_ontime", 0) or 0} no prazo / {totals.get("delivered_late", 0) or 0} atraso</div>
+              </div>
+            """)
+        if cfg.get('kpi_delivered_ontime', '1') == '1':
+            op_kpi_cards.append(f"""
+              <div class="rep-kpi green">
+                <div class="rep-kpi-lbl"><span>🟢</span> Entregues no Prazo</div>
+                <div class="rep-kpi-val">{totals.get("delivered_ontime", 0) or 0}</div>
+                <div class="rep-kpi-sub">entregas pontuais</div>
+              </div>
+            """)
+        if cfg.get('kpi_delivered_late', '1') == '1':
+            op_kpi_cards.append(f"""
+              <div class="rep-kpi {'red' if (totals.get('delivered_late') or 0)>0 else 'green'}">
+                <div class="rep-kpi-lbl"><span>🔴</span> Entregues Fora do Prazo</div>
+                <div class="rep-kpi-val">{totals.get("delivered_late", 0) or 0}</div>
+                <div class="rep-kpi-sub">entregas atrasadas</div>
+              </div>
+            """)
+        if cfg.get('kpi_pending_late', '1') == '1':
+            op_kpi_cards.append(f"""
+              <div class="rep-kpi {'red' if (totals.get('pending_late') or 0)>0 else 'amber'}">
+                <div class="rep-kpi-lbl"><span>⚠️</span> Abertos Atrasados</div>
+                <div class="rep-kpi-val">{totals.get("pending_late", 0) or 0}</div>
+                <div class="rep-kpi-sub">em rota / armazém atrasados</div>
+              </div>
+            """)
+        if cfg.get('kpi_avg_days', '1') == '1':
+            op_kpi_cards.append(f"""
+              <div class="rep-kpi blue">
+                <div class="rep-kpi-lbl"><span>⏱️</span> Média Venda-Entrega</div>
+                <div class="rep-kpi-val">{fmt_num(totals.get("avg_days_delivery", 0), 1) if totals.get("avg_days_delivery") is not None else "—"} dia(s)</div>
+                <div class="rep-kpi-sub">tempo médio de ciclo</div>
+              </div>
+            """)
+        if cfg.get('kpi_lead_times', '1') == '1':
+            s2i_val = f"{totals.get('avg_days_sale_to_inv', 0):.1f} dia(s)" if totals.get('avg_days_sale_to_inv') is not None else "—"
+            i2d_val = f"{totals.get('avg_days_inv_to_del', 0):.1f} dia(s)" if totals.get('avg_days_inv_to_del') is not None else "—"
+            bot_lbl = totals.get('bottleneck_label', 'Equilibrado')
+            bot_col = '#dc2626' if bot_lbl == 'Logística / Expedição' else ('#d97706' if bot_lbl == 'Comercial / Faturamento' else '#16a34a')
+            op_kpi_cards.append(f"""
+              <div class="rep-kpi blue">
+                <div class="rep-kpi-lbl"><span>📝➔🧾</span> Venda ➔ Faturamento</div>
+                <div class="rep-kpi-val">{s2i_val}</div>
+                <div class="rep-kpi-sub">lead time comercial ({totals.get('pct_time_commercial', 50):.0f}% do ciclo)</div>
+              </div>
+            """)
+            op_kpi_cards.append(f"""
+              <div class="rep-kpi green">
+                <div class="rep-kpi-lbl"><span>🧾➔🚚</span> Faturamento ➔ Entrega</div>
+                <div class="rep-kpi-val">{i2d_val}</div>
+                <div class="rep-kpi-sub">lead time logística ({totals.get('pct_time_logistics', 50):.0f}% do ciclo)</div>
+              </div>
+            """)
+            op_kpi_cards.append(f"""
+              <div class="rep-kpi {'red' if bot_lbl != 'Equilibrado' else 'green'}">
+                <div class="rep-kpi-lbl"><span>🔍</span> Gargalo Predominante</div>
+                <div class="rep-kpi-val" style="font-size:16px;color:{bot_col};">{esc(bot_lbl)}</div>
+                <div class="rep-kpi-sub">maior tempo de retenção</div>
+              </div>
+            """)
+
+        kpi_section = ""
+        if op_kpi_cards:
+            kpi_section = f'<div class="rep-kpis-container">{"".join(op_kpi_cards)}</div>'
+        if (totals.get('total_orders') or 0) == 0:
+            kpi_section += f"""
+            <div class="alert info" style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:12px 16px;margin:12px 0;display:flex;align-items:center;gap:12px;color:#1e40af;">
+              <span style="font-size:1.3rem;">ℹ️</span>
+              <span><b>Nenhum pedido encontrado para o período selecionado ({esc(op_data.get('filter_desc', ''))}).</b><br>
+              <small style="color:#2563eb;">💡 Dica: No início do mês ou para auditar períodos anteriores, utilize os botões rápidos no topo: <b>"Últimos 7 dias"</b>, <b>"Mês Anterior"</b> ou <b>"📦 Todos em Aberto"</b>.</small></span>
+            </div>
+            """
+
+        dr_rows = []
+        tot_dr_orders = sum((d.get('total_orders') or 0) for d in drivers)
+        tot_dr_del = sum((d.get('delivered_orders') or 0) for d in drivers)
+        tot_dr_w = sum((d.get('total_weight') or 0) for d in drivers)
+        tot_dr_v = sum((d.get('total_value') or 0) for d in drivers)
+        tot_dr_on = sum((d.get('ontime_count') or 0) for d in drivers)
+        tot_dr_prob = sum((d.get('problems_count') or 0) for d in drivers)
+        overall_dr_sla = (tot_dr_on / (tot_dr_del or 1) * 100) if tot_dr_del > 0 else 100.0
+
+        for d in drivers:
+            dr_rate = d.get('sla_rate', 100)
+            dr_badge_cls = 'st-entregue' if dr_rate >= 90 else ('st-rota' if dr_rate >= 75 else 'st-problema')
+            dr_sla_badge = f'<span class="badge {dr_badge_cls}" style="font-weight:700;">{dr_rate:.1f}%</span>'
+            dr_rows.append(
+                f'<tr><td><b>{esc(d["driver_name"])}</b></td>'
+                f'<td>{d["total_orders"]}</td>'
+                f'<td>{d["delivered_orders"]}</td>'
+                f'<td>{fmt_num(d["total_weight"])} kg</td>'
+                f'<td>{money_visible(can_view_financial, d["total_value"])}</td>'
+                f'<td>{(str(d["avg_days"]) + " dia(s)") if d["avg_days"] is not None else "—"}</td>'
+                f'<td>{dr_sla_badge} <small class="muted" style="margin-left:4px;">({d["ontime_count"]} ok / {d["late_count"]} atraso)</small></td>'
+                f'<td>{d["problems_count"]}</td></tr>'
+            )
+
+        unassigned_driver = op_data.get('unassigned_driver')
+        unassigned_note = ""
+        if unassigned_driver and (unassigned_driver.get('total_orders') or 0) > 0:
+            unassigned_note = f"""
+            <div style="background:#fffbeb;border:1px solid #fef3c7;border-radius:8px;padding:10px 14px;margin-top:10px;font-size:0.88rem;color:#92400e;display:flex;align-items:center;gap:8px;">
+              <span>📦</span>
+              <span><b>Pedidos aguardando montagem de carga / motorista:</b> {unassigned_driver['total_orders']} pedido(s) · {fmt_num(unassigned_driver['total_weight'])} kg · {money_visible(can_view_financial, unassigned_driver['total_value'])}</span>
+            </div>
+            """
+
+        dr_tbody = ''.join(dr_rows) or '<tr><td colspan="8" class="empty">Sem dados de motorista no período.</td></tr>'
+
+        vh_rows = []
+        tot_vh_loads = sum((v.get('loads_count') or 0) for v in vehicles)
+        tot_vh_orders = sum((v.get('total_orders') or 0) for v in vehicles)
+        tot_vh_del = sum((v.get('delivered_orders') or 0) for v in vehicles)
+        tot_vh_w = sum((v.get('total_weight') or 0) for v in vehicles)
+        tot_vh_v = sum((v.get('total_value') or 0) for v in vehicles)
+        tot_vh_on = sum((v.get('ontime_count') or 0) for v in vehicles)
+        overall_vh_sla = (tot_vh_on / (tot_vh_del or 1) * 100) if tot_vh_del > 0 else 100.0
+
+        tot_vh_cap = sum(((v.get('loads_count') or 0) * (v.get('capacity_kg') or 0.0)) for v in vehicles)
+        overall_vh_occ = (tot_vh_w / tot_vh_cap * 100) if tot_vh_cap > 0 else 0.0
+
+        for v in vehicles:
+            v_rate = v.get('sla_rate', 100)
+            v_badge_cls = 'st-entregue' if v_rate >= 90 else ('st-rota' if v_rate >= 75 else 'st-problema')
+            v_sla_badge = f'<span class="badge {v_badge_cls}" style="font-weight:700;">{v_rate:.1f}%</span>'
+            v_occ = v.get('occupation_rate', 0.0)
+            v_occ_fill = 'rep-fill-green' if v_occ >= 70 else ('rep-fill-amber' if v_occ >= 40 else 'rep-fill-red')
+            v_occ_color = '#15803d' if v_occ >= 70 else ('#b45309' if v_occ >= 40 else '#64748b')
+            vh_rows.append(
+                f'<tr><td><b>{esc(v.get("model", v["vehicle_name"]))}</b></td>'
+                f'<td><span class="badge neutral" style="font-weight:700;">{esc(v.get("plate", "—"))}</span></td>'
+                f'<td>{fmt_num(v.get("capacity_kg", 0))} kg</td>'
+                f'<td>{v.get("loads_count", 0)}</td>'
+                f'<td>{v["total_orders"]}</td>'
+                f'<td>{v["delivered_orders"]}</td>'
+                f'<td>{fmt_num(v["total_weight"])} kg</td>'
+                f'<td><div style="min-width:90px;"><b style="color:{v_occ_color}">{v_occ:.1f}%</b><div class="rep-progress-track"><div class="rep-progress-fill {v_occ_fill}" style="width:{min(v_occ, 100.0):.1f}%;"></div></div></div></td>'
+                f'<td>{money_visible(can_view_financial, v["total_value"])}</td>'
+                f'<td>{v_sla_badge} <small class="muted">({v["ontime_count"]} ok / {v["late_count"]} atraso)</small></td></tr>'
+            )
+
+        unassigned_vh_note = ""
+        if unassigned_vehicle and (unassigned_vehicle.get('total_orders') or 0) > 0:
+            unassigned_vh_note = f"""
+            <div style="background:#fffbeb;border:1px solid #fef3c7;border-radius:8px;padding:10px 14px;margin-top:10px;font-size:0.88rem;color:#92400e;display:flex;align-items:center;gap:8px;">
+              <span>📦</span>
+              <span><b>Pedidos aguardando alocação de caminhão / carga:</b> {unassigned_vehicle['total_orders']} pedido(s) · {fmt_num(unassigned_vehicle['total_weight'])} kg · {money_visible(can_view_financial, unassigned_vehicle['total_value'])}</span>
+            </div>
+            """
+
+        vh_tbody = ''.join(vh_rows) or '<tr><td colspan="10" class="empty">Sem dados de caminhão no período.</td></tr>'
+
+        rt_rows = []
+        tot_rt_orders = sum((r.get('total_orders') or 0) for r in routes)
+        tot_rt_del = sum((r.get('delivered_orders') or 0) for r in routes)
+        tot_rt_w = sum((r.get('total_weight') or 0) for r in routes) or 1
+        tot_rt_v = sum((r.get('total_value') or 0) for r in routes)
+        for r in routes:
+            pct_w = ((r.get('total_weight') or 0) / tot_rt_w * 100)
+            r_rate = r.get('sla_rate', 100)
+            rt_badge_cls = 'st-entregue' if r_rate >= 90 else ('st-rota' if r_rate >= 75 else 'st-problema')
+            rt_sla_badge = f'<span class="badge {rt_badge_cls}" style="font-weight:700;">{r_rate:.1f}%</span>'
+            s2i_r_str = f"{r['avg_days_sale_to_inv']:.1f}d" if r.get('avg_days_sale_to_inv') is not None else "—"
+            i2d_r_str = f"{r['avg_days_inv_to_del']:.1f}d" if r.get('avg_days_inv_to_del') is not None else "—"
+            bot_r = r.get('bottleneck', '—')
+            bot_r_badge = f'<span class="badge {"warning" if bot_r=="Comercial" else ("danger" if bot_r=="Logística" else "neutral")}">{esc(bot_r)}</span>' if bot_r != '—' else '<span class="muted">—</span>'
+            rt_rows.append(
+                f'<tr><td><b>{esc(r["route_name"])}</b></td><td>{r["total_orders"]}</td><td>{r["delivered_orders"]}</td><td>{fmt_num(r["total_weight"])} kg</td><td>{s2i_r_str}</td><td>{i2d_r_str}</td><td>{bot_r_badge}</td><td>{rt_sla_badge}</td></tr>'
+            )
+        rt_tbody = ''.join(rt_rows) or '<tr><td colspan="8" class="empty">Sem dados de rotas no período.</td></tr>'
+
+        ct_rows = []
+        tot_ct_orders = sum((c.get('total_orders') or 0) for c in cities)
+        tot_ct_del = sum((c.get('delivered_orders') or 0) for c in cities)
+        tot_ct_w = sum((c.get('total_weight') or 0) for c in cities)
+        tot_ct_v = sum((c.get('total_value') or 0) for c in cities)
+        for c in cities:
+            ct_rows.append(
+                f'<tr><td><b>{esc(c["city_name"])}</b></td><td>{esc(c.get("route_name","—"))}</td><td>{c["total_orders"]}</td><td>{c["delivered_orders"]}</td><td>{fmt_num(c["total_weight"])} kg</td><td>{money_visible(can_view_financial, c["total_value"])}</td></tr>'
+            )
+        ct_tbody = ''.join(ct_rows) or '<tr><td colspan="6" class="empty">Sem dados de cidades no período.</td></tr>'
+
+        tot_problems = sum((p.get('c') or 0) for p in problems)
+        pb_rows = []
+        for p in problems:
+            pct_pb = ((p.get('c') or 0) / (tot_problems or 1) * 100)
+            pb_rows.append(
+                f'<tr><td><b>{esc(p["problem_type"])}</b></td><td>{p["c"]}</td><td>{pct_pb:.1f}%</td></tr>'
+            )
+        
+        problems_html = ""
+        if problems:
+            problems_html = f"""
+            <div class="rep-card">
+              <div class="rep-section-title">
+                <h3><span>⚠️</span> Ocorrências e Motivos de Problema na Entrega</h3>
+                <span class="rep-count-badge" style="background:#fee2e2;color:#b91c1c;">{tot_problems} ocorrência(s)</span>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>Motivo da Ocorrência</th><th>Quantidade</th><th>% do Total</th></tr></thead>
+                  <tbody>{''.join(pb_rows)}</tbody>
+                </table>
+              </div>
+            </div>
+            """
+        else:
+            problems_html = f"""
+            <div class="rep-card" style="background:#f0fdf4;border-color:#bbf7d0;">
+              <div style="display:flex;align-items:center;gap:10px;color:#15803d;font-weight:600;">
+                <span style="font-size:1.2rem;">✅</span>
+                <span><b>Nenhuma ocorrência ou devolução registrada no período selecionado!</b> Operação fluindo perfeitamente.</span>
+              </div>
+            </div>
+            """
+
+        del_rows = []
+        for o in orders:
+            s2i_str = f"{o['days_sale_to_inv']} d" if o.get('days_sale_to_inv') is not None else "—"
+            i2d_str = f"{o['days_inv_to_del']} d" if o.get('days_inv_to_del') is not None else "—"
+            tot_d_str = f"{o['days_to_deliver']} d" if o.get('days_to_deliver') is not None else "—"
+            bot = o.get('bottleneck_stage', '—')
+            if bot == 'Comercial':
+                bot_badge = '<span class="badge" style="background:#fef3c7;color:#92400e;border:1px solid #fde68a;">Comercial</span>'
+            elif bot == 'Logística':
+                bot_badge = '<span class="badge" style="background:#fee2e2;color:#991b1b;border:1px solid #fecaca;">Logística</span>'
+            elif bot == 'Equilibrado':
+                bot_badge = '<span class="badge" style="background:#dcfce7;color:#166534;border:1px solid #bbf7d0;">Equilibrado</span>'
+            elif 'Aguard' in bot:
+                bot_badge = f'<span class="badge" style="background:#f1f5f9;color:#475569;border:1px solid #cbd5e1;">{esc(bot)}</span>'
+            else:
+                bot_badge = '<span class="muted">—</span>'
+
+            del_rows.append(
+                f'<tr><td><a class="btn small ghost" href="/orders/{o["id"]}"><b>{esc(o["order_number"])}</b></a></td>'
+                f'<td>{esc(o["seller_name"] or "Não informado")}</td>'
+                f'<td>{badge(o["status"])}</td>'
+                f'<td>{esc(o["route_name"] or "Sem rota")} · {esc(o["city"] or "Sem cidade")}</td>'
+                f'<td>{esc(o["driver_name"] or "Sem motorista")}</td>'
+                f'<td>{fmt_num(o["weight_kg"])} kg</td>'
+                f'<td>{money_visible(can_view_financial, o["total_value"])}</td>'
+                f'<td><small>Venda: {brdate(o["sale_date"])}<br>Fat: {brdate(o.get("invoiced_at"))}<br>Entr: {brdate(o["delivered_at"])}</small></td>'
+                f'<td><div style="font-size:12px;line-height:1.4;">'
+                f'<span>📝➔🧾: <b>{s2i_str}</b></span><br>'
+                f'<span>🧾➔🚚: <b>{i2d_str}</b></span><br>'
+                f'<span>🏁 Total: <b>{tot_d_str}</b></span></div></td>'
+                f'<td>{bot_badge}</td>'
+                f'<td>{deadline_pill(o["expected_delivery_date"], o["status"])}</td></tr>'
+            )
+        del_tbody = ''.join(del_rows) or '<tr><td colspan="11" class="empty">Nenhum pedido no período selecionado.</td></tr>'
+
+        sections_list = []
+
+        # SEÇÃO: DIAGNÓSTICO DE GARGALOS & LEAD TIMES
+        if cfg.get('sec_bottlenecks', '1') == '1':
+            s2i = totals.get('avg_days_sale_to_inv')
+            i2d = totals.get('avg_days_inv_to_del')
+            tot_cycle = totals.get('avg_days_delivery')
+            pct_comm = totals.get('pct_time_commercial', 50.0)
+            pct_log = totals.get('pct_time_logistics', 50.0)
+            bot_lbl = totals.get('bottleneck_label', 'Equilibrado')
+            bot_desc = totals.get('bottleneck_desc', '')
+
+            p_inv = totals.get('pending_wait_invoice', 0)
+            p_inv_days = totals.get('avg_days_waiting_invoice', 0)
+            p_del = totals.get('pending_wait_delivery', 0)
+            p_del_days = totals.get('avg_days_waiting_delivery', 0)
+
+            pend_alerts = []
+            if p_inv > 0:
+                pend_alerts.append(f"""
+                <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:10px 14px;display:flex;align-items:center;gap:10px;color:#92400e;font-size:12.5px;">
+                  <span style="font-size:18px;">⚠️</span>
+                  <div><b>Comercial / Faturamento:</b> <b>{p_inv} pedido(s)</b> aguardando emissão de nota (média de <b>{fmt_num(p_inv_days, 1)} dia(s)</b> desde a venda).</div>
+                </div>
+                """)
+            if p_del > 0:
+                pend_alerts.append(f"""
+                <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px 14px;display:flex;align-items:center;gap:10px;color:#1e40af;font-size:12.5px;">
+                  <span style="font-size:18px;">🚚</span>
+                  <div><b>Logística / Expedição:</b> <b>{p_del} pedido(s)</b> faturados aguardando carga/entrega (média de <b>{fmt_num(p_del_days, 1)} dia(s)</b> desde o faturamento).</div>
+                </div>
+                """)
+            pend_alerts_html = f'<div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(280px, 1fr));gap:10px;margin-top:12px;">{"".join(pend_alerts)}</div>' if pend_alerts else ''
+
+            sections_list.append(f"""
+            <div class="rep-card" style="border-left:4px solid #3b82f6;">
+              <div class="rep-section-title">
+                <h3><span>🎯</span> Diagnóstico de Gargalos & Lead Times (Comercial vs Logística)</h3>
+                <span class="badge {'danger' if bot_lbl != 'Equilibrado' else 'success'}" style="font-size:12px;font-weight:700;">Gargalo: {esc(bot_lbl)}</span>
+              </div>
+              <p style="font-size:13px;color:#475569;margin-top:-6px;margin-bottom:14px;">
+                Identificação precisa de onde os pedidos passam mais tempo retidos: na <b>etapa comercial/faturamento</b> ou na <b>etapa logística/expedição/transporte</b>.
+              </p>
+              
+              <div class="rep-lead-grid">
+                <div class="rep-lead-card" style="border-left:3px solid #3b82f6;">
+                  <div class="rep-lead-title"><span style="color:#3b82f6;">📝➔🧾</span> Etapa 1: Venda ➔ Faturamento</div>
+                  <div class="rep-lead-val" style="color:#1d4ed8;">{f"{s2i:.1f} dia(s)" if s2i is not None else "—"}</div>
+                  <div class="rep-lead-sub">Representa <b>{pct_comm:.1f}%</b> do ciclo total do pedido</div>
+                  <small class="muted" style="display:block;margin-top:4px;">Emissão de nota fiscal e liberação comercial/financeira.</small>
+                </div>
+                <div class="rep-lead-card" style="border-left:3px solid #10b981;">
+                  <div class="rep-lead-title"><span style="color:#10b981;">🧾➔🚚</span> Etapa 2: Faturamento ➔ Entrega</div>
+                  <div class="rep-lead-val" style="color:#047857;">{f"{i2d:.1f} dia(s)" if i2d is not None else "—"}</div>
+                  <div class="rep-lead-sub">Representa <b>{pct_log:.1f}%</b> do ciclo total do pedido</div>
+                  <small class="muted" style="display:block;margin-top:4px;">Montagem de carga, expedição no armazém e transporte até a fazenda.</small>
+                </div>
+                <div class="rep-lead-card" style="border-left:3px solid #6366f1;">
+                  <div class="rep-lead-title"><span style="color:#6366f1;">⏳</span> Ciclo Total: Venda ➔ Entrega</div>
+                  <div class="rep-lead-val" style="color:#4338ca;">{f"{tot_cycle:.1f} dia(s)" if tot_cycle is not None else "—"}</div>
+                  <div class="rep-lead-sub">Tempo médio total da experiência do cliente</div>
+                  <small class="muted" style="display:block;margin-top:4px;">Prazo total transcorrido desde o fechamento da venda.</small>
+                </div>
+              </div>
+
+              <div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:10px;padding:14px;margin-top:8px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px;font-weight:700;color:#334155;margin-bottom:4px;">
+                  <span>Proporção do Tempo Gasto por Etapa:</span>
+                  <span>Comercial: {pct_comm:.1f}% | Logística: {pct_log:.1f}%</span>
+                </div>
+                <div class="rep-split-bar">
+                  <div class="rep-split-seg-comm" style="width:{pct_comm}%;" title="Comercial / Faturamento: {pct_comm:.1f}%"></div>
+                  <div class="rep-split-seg-log" style="width:{pct_log}%;" title="Logística / Expedição: {pct_log:.1f}%"></div>
+                </div>
+                <div style="display:flex;justify-content:space-between;font-size:11px;color:#64748b;margin-top:2px;">
+                  <span>🟦 1. Comercial / Faturamento ({f"{s2i:.1f}d" if s2i is not None else "—"})</span>
+                  <span>🟩 2. Logística / Transporte ({f"{i2d:.1f}d" if i2d is not None else "—"})</span>
+                </div>
+                <div style="margin-top:10px;padding:10px 14px;border-radius:6px;font-size:12.5px;background:#f8fafc;border-left:3px solid {'#dc2626' if bot_lbl != 'Equilibrado' else '#16a34a'};">
+                  <b>Conclusão do Diagnóstico:</b> {esc(bot_desc)}
+                </div>
+              </div>
+              {pend_alerts_html}
+            </div>
+            """)
+
+        # SEÇÃO 1: MOTORISTAS
+        if cfg.get('sec_drivers', '1') == '1':
+            sections_list.append(f"""
+            <div class="rep-card">
+              <div class="rep-section-title">
+                <h3><span>🚛</span> Desempenho por Motorista</h3>
+                <span class="rep-count-badge">{len(drivers)} motoristas</span>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>Motorista</th><th>Pedidos</th><th>Entregues</th><th>Peso Transportado</th><th>Faturamento</th><th>Média Venda-Entrega</th><th>Pontualidade SLA</th><th>Ocorrências</th></tr></thead>
+                  <tbody>{dr_tbody}</tbody>
+                  <tfoot>
+                    <tr style="font-weight:bold;background:#f8fafc;">
+                      <td>Total ({len(drivers)} motoristas)</td>
+                      <td>{tot_dr_orders}</td>
+                      <td>{tot_dr_del}</td>
+                      <td>{fmt_num(tot_dr_w)} kg</td>
+                      <td>{money_visible(can_view_financial, tot_dr_v)}</td>
+                      <td>—</td>
+                      <td>{overall_dr_sla:.1f}%</td>
+                      <td>{tot_dr_prob}</td>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+              {unassigned_note}
+            </div>
+            """)
+
+        # SEÇÃO 2: CAMINHÕES
+        if cfg.get('sec_vehicles', '1') == '1':
+            sections_list.append(f"""
+            <div class="rep-card">
+              <div class="rep-section-title">
+                <h3><span>🚚</span> Desempenho por Caminhão / Veículo</h3>
+                <span class="rep-count-badge">{len(vehicles)} veículos</span>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>Caminhão / Modelo</th><th>Placa</th><th>Capacidade</th><th>Cargas</th><th>Pedidos</th><th>Entregues</th><th>Peso Transportado</th><th>% Ocupação Nominal</th><th>Faturamento</th><th>Pontualidade SLA</th></tr></thead>
+                  <tbody>{vh_tbody}</tbody>
+                  <tfoot>
+                    <tr style="font-weight:bold;background:#f8fafc;">
+                      <td colspan="2">Total ({len(vehicles)} veículos)</td>
+                      <td>—</td>
+                      <td>{tot_vh_loads}</td>
+                      <td>{tot_vh_orders}</td>
+                      <td>{tot_vh_del}</td>
+                      <td>{fmt_num(tot_vh_w)} kg</td>
+                      <td>{overall_vh_occ:.1f}%</td>
+                      <td>{money_visible(can_view_financial, tot_vh_v)}</td>
+                      <td>{overall_vh_sla:.1f}%</td>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+              {unassigned_vh_note}
+            </div>
+            """)
+
+        # SEÇÃO 3: ROTAS E CIDADES
+        show_rt = cfg.get('sec_routes', '1') == '1'
+        show_ct = cfg.get('sec_cities', '1') == '1'
+        if show_rt or show_ct:
+            rt_sec_html = f"""
+            <section class="panel" style="margin: 0; padding: 0; border: none; box-shadow: none;">
+              <h4 style="margin: 0 0 10px; color:#334155;">Rotas Atendidas ({len(routes)})</h4>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>Rota</th><th>Pedidos</th><th>Entregues</th><th>Peso</th><th>Venda➔Fat</th><th>Fat➔Entr</th><th>Gargalo</th><th>SLA</th></tr></thead>
+                  <tbody>{rt_tbody}</tbody>
+                  <tfoot>
+                    <tr style="font-weight:bold;background:#f8fafc;">
+                      <td>Total Rotas</td>
+                      <td>{tot_rt_orders}</td>
+                      <td>{tot_rt_del}</td>
+                      <td>{fmt_num(tot_rt_w)} kg</td>
+                      <td>—</td>
+                      <td>—</td>
+                      <td>—</td>
+                      <td>—</td>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+            </section>
+            """ if show_rt else ""
+
+            ct_sec_html = f"""
+            <section class="panel" style="margin: 0; padding: 0; border: none; box-shadow: none;">
+              <h4 style="margin: 0 0 10px; color:#334155;">Cidades Atendidas ({len(cities)})</h4>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>Cidade</th><th>Rota Base</th><th>Pedidos</th><th>Entregues</th><th>Peso</th><th>Valor</th></tr></thead>
+                  <tbody>{ct_tbody}</tbody>
+                  <tfoot>
+                    <tr style="font-weight:bold;background:#f8fafc;">
+                      <td>Total Cidades</td>
+                      <td>—</td>
+                      <td>{tot_ct_orders}</td>
+                      <td>{tot_ct_del}</td>
+                      <td>{fmt_num(tot_ct_w)} kg</td>
+                      <td>{money_visible(can_view_financial, tot_ct_v)}</td>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+            </section>
+            """ if show_ct else ""
+
+            dash_style = "display:grid;grid-template-columns:repeat(auto-fit, minmax(340px, 1fr));gap:14px;" if (show_rt and show_ct) else ""
+
+            sections_list.append(f"""
+            <div class="rep-card">
+              <div class="rep-section-title">
+                <h3><span>🗺️</span> Desempenho por Rota e Cidade</h3>
+              </div>
+              <div style="{dash_style}">
+                {rt_sec_html}
+                {ct_sec_html}
+              </div>
+            </div>
+            """)
+
+        # SEÇÃO 4: OCORRÊNCIAS
+        if cfg.get('sec_problems', '1') == '1':
+            sections_list.append(problems_html)
+
+        # SEÇÃO 5: PEDIDOS DO PERÍODO
+        if cfg.get('sec_orders', '0') == '1':
+            sections_list.append(f"""
+            <div class="rep-card">
+              <div class="rep-section-title">
+                <h3><span>📋</span> Listagem Operacional de Pedidos ({len(orders)} exibidos)</h3>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr><th>Pedido</th><th>Vendedor</th><th>Status</th><th>Rota/Cidade</th><th>Motorista</th><th>Peso</th><th>Valor</th><th>Datas (Venda/Fat/Entr)</th><th>Lead Time por Etapa</th><th>Gargalo</th><th>SLA</th></tr>
+                  </thead>
+                  <tbody>{del_tbody}</tbody>
+                </table>
+              </div>
+            </div>
+            """)
+
+        sections_html = "".join(sections_list)
+
+        return f'<div class="rep-shell">{alert_msg}{filter_form}{kpi_section}{sections_html}{agendador_accordion}</div>'
+
+    def render_relatorio_pedidos(self, u, qs, can_view_financial):
+        start, end, route_filter, status_filter, date_type, vehicle_filter, driver_filter, q_filter, sla_filter = self.report_filter_values(qs)
+        is_customizer_submitted = ('customizer_present' in qs)
+
+        with conn() as db:
+            settings = {r['key']: r['value'] for r in db.execute('SELECT * FROM settings')}
+            route_names = [r['route_name'] for r in db.execute('SELECT DISTINCT route_name FROM orders WHERE route_name IS NOT NULL AND route_name<>"" ORDER BY route_name')]
+            city_names = [r['city'] for r in db.execute('SELECT DISTINCT city FROM orders WHERE city IS NOT NULL AND city<>"" ORDER BY city')]
+            seller_names = [r['seller_name'] for r in db.execute('SELECT DISTINCT seller_name FROM orders WHERE seller_name IS NOT NULL AND seller_name<>"" ORDER BY seller_name')]
+            driver_names = [r['name'] for r in db.execute('SELECT name FROM drivers WHERE active=1 ORDER BY name')]
+            vehicle_rows = db.execute("SELECT id, name, plate FROM vehicles WHERE active=1 ORDER BY name").fetchall()
+            vehicle_names = [f"{r['name']} - {r['plate']}" if (r['plate'] and r['plate'].strip()) else r['name'] for r in vehicle_rows]
+
+            ped_report_keys = [
+                ('pdf_hdr_total_orders', '1'),
+                ('pdf_hdr_total_weight', '1'),
+                ('pdf_hdr_total_value', '1' if can_view_financial else '0'),
+                ('pdf_hdr_ontime', '1'),
+                ('pdf_hdr_late', '1'),
+                ('pdf_hdr_risk', '1'),
+                ('pdf_hdr_scheduled', '1'),
+                ('pdf_hdr_delivered', '1'),
+                ('pdf_hdr_problems', '0'),
+                ('pdf_hdr_canceled', '0'),
+                ('pdf_report_st_venda', '1'),
+                ('pdf_report_st_faturado', '1'),
+                ('pdf_report_st_rota', '1'),
+                ('pdf_report_st_agendado', '1'),
+                ('pdf_report_st_acertado', '1'),
+                ('pdf_report_st_problema', '1'),
+                ('pdf_report_st_cancelado', '0'),
+                ('pdf_report_col_financial', '1' if can_view_financial else '0'),
+                ('pdf_report_col_weight', '1'),
+                ('pdf_report_col_dates', '1'),
+                ('pdf_report_col_seller', '1'),
+                ('pdf_report_col_receiver', '1'),
+                ('sec_ped_kpis', '1'),
+                ('sec_ped_breakdown', '1'),
+                ('sec_ped_orders', '1'),
+            ]
+            cfg = {}
+            for k, def_v in ped_report_keys:
+                if is_customizer_submitted:
+                    cfg[k] = '1' if k in qs else '0'
+                else:
+                    v = settings.get(k)
+                    if v is None or v == '':
+                        cfg[k] = def_v
+                    else:
+                        cfg[k] = '1' if str(v).strip().lower() in ('1', 'true', 'on') else '0'
+
+            if not can_view_financial:
+                cfg['pdf_report_col_financial'] = '0'
+                cfg['pdf_hdr_total_value'] = '0'
+
+            included_statuses = []
+            if cfg.get('pdf_report_st_venda') == '1': included_statuses.append('Venda')
+            if cfg.get('pdf_report_st_faturado') == '1': included_statuses.append('Faturado')
+            if cfg.get('pdf_report_st_carga_montada', '1') == '1': included_statuses.append('Carga Montada')
+            if cfg.get('pdf_report_st_rota') == '1': included_statuses.append('Saiu para entrega')
+            if cfg.get('pdf_report_st_agendado') == '1': included_statuses.append('Agendado')
+            if cfg.get('pdf_report_st_acertado') == '1': included_statuses.extend(['Acertado', 'Entregue'])
+            if cfg.get('pdf_report_st_problema') == '1': included_statuses.append('Problema')
+            if cfg.get('pdf_report_st_cancelado') == '1': included_statuses.append('Cancelado')
+
+            where_sql, p = self.report_where(start, end, route_filter=route_filter, status_filter=status_filter, alias='o', statuses_in=included_statuses, date_type=date_type, vehicle_filter=vehicle_filter, driver_filter=driver_filter, q=q_filter, sla_filter=sla_filter)
+
+            sla = db.execute(f"""SELECT
+                                SUM(CASE WHEN o.status IN ('Acertado','Entregue') AND substr(COALESCE(o.delivered_at,''),1,10)<=o.expected_delivery_date THEN 1 ELSE 0 END) within_sla,
+                                SUM(CASE WHEN o.status IN ('Acertado','Entregue') AND substr(COALESCE(o.delivered_at,''),1,10)>o.expected_delivery_date THEN 1 ELSE 0 END) outside_sla,
+                                SUM(CASE WHEN o.status NOT IN ('Acertado','Entregue','Problema','Cancelado') AND o.expected_delivery_date<? THEN 1 ELSE 0 END) open_late,
+                                SUM(CASE WHEN o.status NOT IN ('Acertado','Entregue','Problema','Cancelado') AND o.expected_delivery_date>=? AND julianday(o.expected_delivery_date)-julianday(?)<=2 THEN 1 ELSE 0 END) at_risk,
+                                COUNT(*) total_orders,
+                                COALESCE(SUM(o.weight_kg),0) total_weight,
+                                COALESCE(SUM(o.total_value),0) total_value,
+                                SUM(CASE WHEN o.status='Agendado' THEN 1 ELSE 0 END) sched_count,
+                                SUM(CASE WHEN o.status IN ('Acertado','Entregue') THEN 1 ELSE 0 END) deliv_count,
+                                SUM(CASE WHEN o.status='Problema' THEN 1 ELSE 0 END) prob_count,
+                                SUM(CASE WHEN o.status='Cancelado' THEN 1 ELSE 0 END) canc_count
+                                FROM orders o {where_sql}""", [today(), today(), today()] + p).fetchone()
+
+            st = db.execute(f'SELECT o.status, COUNT(*) c, COALESCE(SUM(o.weight_kg),0) w, COALESCE(SUM(o.total_value),0) v FROM orders o {where_sql} GROUP BY o.status ORDER BY c DESC', p).fetchall()
+            rt = db.execute(f'SELECT COALESCE(o.route_name,"Sem rota") route_name, COUNT(*) c, COALESCE(SUM(o.weight_kg),0) w, COALESCE(SUM(o.total_value),0) v FROM orders o {where_sql} GROUP BY o.route_name ORDER BY c DESC LIMIT 10', p).fetchall()
+            orders = self.report_orders_rows(db, start, end, route_filter=route_filter, status_filter=status_filter, limit=150, statuses_in=included_statuses, date_type=date_type, vehicle_filter=vehicle_filter, driver_filter=driver_filter, q=q_filter, sla_filter=sla_filter)
+
+        _, sess = self.session_data()
+        csrf_val = esc((sess or {}).get('csrf') or '')
+
+        alert_msg = ''
+        if qs.get('saved'):
+            alert_msg = '<div class="alert success" style="margin-bottom:1rem;">✅ Preferências salvas com sucesso!</div>'
+        elif qs.get('report_generated'):
+            gen_file = esc(qs.get('filename', ['relatório'])[0])
+            alert_msg = f'<div class="alert success" style="margin-bottom:1rem;">⚡ <b>Relatório PDF gerado com sucesso!</b><br>Arquivo salvo em <b>Desktop\\Relatório Logística Casa do Campo\\{gen_file}</b></div>'
+
+        route_opts = option(route_names, route_filter, True, 'Todas as rotas')
+        vehicle_opts = option(vehicle_names, vehicle_filter, True, 'Todos os caminhões')
+        driver_opts = option(driver_names, driver_filter, True, 'Todos os motoristas')
+
+        status_opts_list = ['<option value="" ' + ('selected' if not status_filter else '') + '>Todos os status</option>']
+        for st_val in STATUSES:
+            status_opts_list.append(f'<option value="{st_val}" {"selected" if status_filter==st_val else ""}>{st_val}</option>')
+        status_opts = ''.join(status_opts_list)
+
+        sla_status_opts = ''.join([
+            f'<option value="" {"selected" if not sla_filter else ""}>Todas as situações de prazo</option>',
+            f'<option value="ontime" {"selected" if sla_filter=="ontime" else ""}>🟢 No Prazo / Concluído</option>',
+            f'<option value="late" {"selected" if sla_filter=="late" else ""}>🔴 Atrasados (SLA Violado)</option>',
+            f'<option value="risk" {"selected" if sla_filter=="risk" else ""}>🟡 Em Risco (≤ 2 dias)</option>',
+        ])
+
+        ped_date_type_opts = ''.join([
+            f'<option value="operational" {"selected" if date_type=="operational" else ""}>Data Operacional (Carga / Entrega) - Padrão</option>',
+            f'<option value="delivery" {"selected" if date_type=="delivery" else ""}>Data da Entrega / Acerto (Apenas finalizadas)</option>',
+            f'<option value="route" {"selected" if date_type=="route" else ""}>Data da Carga / Rota</option>',
+            f'<option value="sale" {"selected" if date_type=="sale" else ""}>Data da Venda (Comercial / ERP)</option>',
+            f'<option value="expected" {"selected" if date_type=="expected" else ""}>Previsão de Entrega (SLA)</option>',
+        ])
+
+        filter_desc_parts = [f"{brdate(start)} até {brdate(end)}"]
+        if q_filter: filter_desc_parts.append(f'Busca: "{q_filter}"')
+        if status_filter: filter_desc_parts.append(f'Status: {status_filter}')
+        if sla_filter:
+            sla_labels = {'ontime': 'No Prazo', 'late': 'Atrasados', 'risk': 'Em Risco'}
+            filter_desc_parts.append(f'SLA: {sla_labels.get(sla_filter, sla_filter)}')
+        if driver_filter: filter_desc_parts.append(f'Motorista: {driver_filter}')
+        if vehicle_filter: filter_desc_parts.append(f'Caminhão: {vehicle_filter}')
+        if route_filter: filter_desc_parts.append(f'Rota: {route_filter}')
+        active_filter_text = ' · '.join(filter_desc_parts)
+
+        def chk_ped(name):
+            return 'checked' if cfg.get(name) == '1' else ''
+
+        active_ped_cnt = sum(1 for k, _ in ped_report_keys if cfg.get(k) == '1' and not k.startswith('sec_'))
+
+        val_ped_kpi_chk = f'<label class="rep-chk-item"><input type="checkbox" name="pdf_hdr_total_value" value="1" {chk_ped("pdf_hdr_total_value")}> <span>💰 Faturamento Total</span></label>' if can_view_financial else ''
+        val_ped_col_chk = f'<label class="rep-chk-item"><input type="checkbox" name="pdf_report_col_financial" value="1" {chk_ped("pdf_report_col_financial")}> <span>💰 Faturamento / Valor</span></label>' if can_view_financial else ''
+
+        customizer_ped_html = f"""
+        <details class="rep-customizer-panel">
+          <summary class="rep-customizer-summary">
+            <div class="rep-customizer-summary-left">
+              <span>⚙️</span>
+              <span>Personalizar Opções do Relatório de Pedidos (Cards, Status, Colunas e Seções)</span>
+              <span class="rep-customizer-badge">{active_ped_cnt} opções ativas</span>
+            </div>
+            <span class="rep-customizer-hint">Clique para expandir/recolher opções de exportação e tela</span>
+          </summary>
+          <div class="rep-customizer-content">
+            <div class="rep-customizer-toolbar">
+              <button type="button" class="rep-tool-btn" onclick="setAllCheckboxes('pedReportForm', true)">☑️ Marcar Tudo</button>
+              <button type="button" class="rep-tool-btn" onclick="setAllCheckboxes('pedReportForm', false)">⬜ Desmarcar Tudo</button>
+              <button type="button" class="rep-tool-btn" onclick="resetDefaultCheckboxes('pedReportForm')">🔄 Padrão Recomendado</button>
+              <button type="button" class="rep-tool-btn save" onclick="saveRepPreferences('pedReportForm', 'pedidos')">💾 Salvar Minhas Preferências</button>
+            </div>
+            <div class="rep-customizer-grid">
+              <div class="rep-cust-card">
+                <div class="rep-cust-card-title"><span>🎯</span> Cards de Resumo (KPIs)</div>
+                <div class="rep-cust-card-body">
+                  <label class="rep-chk-item"><input type="checkbox" name="pdf_hdr_total_orders" value="1" {chk_ped('pdf_hdr_total_orders')}> <span>📦 Total de Pedidos</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="pdf_hdr_total_weight" value="1" {chk_ped('pdf_hdr_total_weight')}> <span>⚖️ Peso Total</span></label>
+                  {val_ped_kpi_chk}
+                  <label class="rep-chk-item"><input type="checkbox" name="pdf_hdr_ontime" value="1" {chk_ped('pdf_hdr_ontime')}> <span>🟢 Entregues no Prazo</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="pdf_hdr_late" value="1" {chk_ped('pdf_hdr_late')}> <span>🔴 Fora Prazo / Atrasados</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="pdf_hdr_risk" value="1" {chk_ped('pdf_hdr_risk')}> <span>🟡 Em Risco (≤ 2 dias)</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="pdf_hdr_scheduled" value="1" {chk_ped('pdf_hdr_scheduled')}> <span>🔵 Agendados</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="pdf_hdr_delivered" value="1" {chk_ped('pdf_hdr_delivered')}> <span>✅ Finalizados</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="pdf_hdr_problems" value="1" {chk_ped('pdf_hdr_problems')}> <span>⚠️ Ocorrências / Problemas</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="pdf_hdr_canceled" value="1" {chk_ped('pdf_hdr_canceled')}> <span>❌ Cancelados</span></label>
+                </div>
+              </div>
+              <div class="rep-cust-card">
+                <div class="rep-cust-card-title"><span>🚦</span> Status dos Pedidos a Exibir</div>
+                <div class="rep-cust-card-body">
+                  <label class="rep-chk-item"><input type="checkbox" name="pdf_report_st_venda" value="1" {chk_ped('pdf_report_st_venda')}> <span>Venda (Comercial)</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="pdf_report_st_faturado" value="1" {chk_ped('pdf_report_st_faturado')}> <span>Faturado (Pátio / Expedição)</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="pdf_report_st_rota" value="1" {chk_ped('pdf_report_st_rota')}> <span>Saiu para Entrega (Em Rota)</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="pdf_report_st_agendado" value="1" {chk_ped('pdf_report_st_agendado')}> <span>Agendado</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="pdf_report_st_acertado" value="1" {chk_ped('pdf_report_st_acertado')}> <span>Entregue / Acertado</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="pdf_report_st_problema" value="1" {chk_ped('pdf_report_st_problema')}> <span>Com Problema</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="pdf_report_st_cancelado" value="1" {chk_ped('pdf_report_st_cancelado')}> <span>Cancelados</span></label>
+                </div>
+              </div>
+              <div class="rep-cust-card">
+                <div class="rep-cust-card-title"><span>📋</span> Colunas da Tabela & PDF</div>
+                <div class="rep-cust-card-body">
+                  {val_ped_col_chk}
+                  <label class="rep-chk-item"><input type="checkbox" name="pdf_report_col_weight" value="1" {chk_ped('pdf_report_col_weight')}> <span>⚖️ Peso (kg)</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="pdf_report_col_dates" value="1" {chk_ped('pdf_report_col_dates')}> <span>📅 Datas (Venda/Prev/Entrega)</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="pdf_report_col_seller" value="1" {chk_ped('pdf_report_col_seller')}> <span>👤 Vendedor</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="pdf_report_col_receiver" value="1" {chk_ped('pdf_report_col_receiver')}> <span>🏢 Cliente / Fazenda</span></label>
+                </div>
+              </div>
+              <div class="rep-cust-card">
+                <div class="rep-cust-card-title"><span>📑</span> Seções do Relatório</div>
+                <div class="rep-cust-card-body">
+                  <label class="rep-chk-item"><input type="checkbox" name="sec_ped_kpis" value="1" {chk_ped('sec_ped_kpis')}> <span>🎯 1. Cards de Resumo (KPIs)</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="sec_ped_breakdown" value="1" {chk_ped('sec_ped_breakdown')}> <span>📊 2. Resumos por Status e Rota</span></label>
+                  <label class="rep-chk-item"><input type="checkbox" name="sec_ped_orders" value="1" {chk_ped('sec_ped_orders')}> <span>📑 3. Listagem Detalhada</span></label>
+                </div>
+              </div>
+            </div>
+          </div>
+        </details>
+        """
+
+        top_bar = f"""
+        <div class="rep-top-bar">
+          <div class="rep-nav-group">
+            <a href="/relatorios?tab=operacional" class="rep-nav-item"><span>📊</span> Desempenho Operacional & SLA</a>
+            <a href="/relatorios?tab=pedidos" class="rep-nav-item active"><span>📦</span> Relatório de Pedidos</a>
+            <a href="/relatorios?tab=motoristas" class="rep-nav-item"><span>🚚</span> Relatório de Motoristas</a>
+          </div>
+          <div class="rep-top-actions">
+            <button type="submit" form="pedReportForm" formaction="/relatorios/pedidos/export-pdf" class="rep-btn-cta-pdf" title="Baixar relatório de pedidos formatado para impressão em PDF">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line></svg>
+              <span>📄 Emitir Relatório de Pedidos (PDF)</span>
+            </button>
+            <button type="submit" form="pedReportForm" formaction="/relatorios/export" class="rep-btn-cta-csv" title="Exportar dados analíticos de pedidos em planilha CSV">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+              <span>📊 Exportar Planilha (CSV)</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="rep-card">
+          <form id="pedReportForm" method="get" action="/relatorios">
+            <input type="hidden" name="tab" value="pedidos">
+            <input type="hidden" name="filtered" value="1">
+            <input type="hidden" name="customizer_present" value="1">
+            <input type="hidden" name="_csrf" value="{csrf_val}">
+
+            <div class="rep-filter-header">
+              <div class="rep-presets">
+                <span class="rep-presets-title">Atalhos Rápidos:</span>
+                <button type="button" class="rep-preset-pill" onclick="setRepDates('today', 'pedReportForm')">Hoje</button>
+                <button type="button" class="rep-preset-pill" onclick="setRepDates('7days', 'pedReportForm')">Últimos 7 dias</button>
+                <button type="button" class="rep-preset-pill active" onclick="setRepDates('this_month', 'pedReportForm')">Este Mês</button>
+                <button type="button" class="rep-preset-pill" onclick="setRepDates('last_month', 'pedReportForm')">Mês Anterior</button>
+                <button type="button" class="rep-preset-pill" onclick="setRepDates('open_orders', 'pedReportForm')">📦 Todos em Aberto (Ativos)</button>
+              </div>
+              <div class="rep-active-badge">
+                <span>Filtro ativo: <b>{esc(active_filter_text)}</b></span>
+              </div>
+            </div>
+
+            <div style="margin-bottom:14px;">
+              <div class="rep-input-group">
+                <label style="font-weight:700;color:#1e293b;">🔍 Busca Rápida de Pedidos</label>
+                <input type="text" name="q" value="{esc(q_filter)}" placeholder="Buscar por Nº do Pedido, Nota Fiscal (NF), Cliente ou Vendedor..." style="width:100%;height:40px;font-size:14px;padding:8px 12px;border:1px solid #cbd5e1;border-radius:8px;box-sizing:border-box;">
+              </div>
+            </div>
+
+            <div class="rep-grid-filters">
+              <div class="rep-input-group">
+                <label>Data Inicial</label>
+                <input type="date" name="start" value="{esc(start)}" required>
+              </div>
+              <div class="rep-input-group">
+                <label>Data Final</label>
+                <input type="date" name="end" value="{esc(end)}" required>
+              </div>
+              <div class="rep-input-group">
+                <label>Filtrar período por</label>
+                <select name="date_type">{ped_date_type_opts}</select>
+              </div>
+              <div class="rep-input-group">
+                <label>Status do Pedido</label>
+                <select name="status">{status_opts}</select>
+              </div>
+              <div class="rep-input-group">
+                <label>Situação SLA / Prazo</label>
+                <select name="sla_status">{sla_status_opts}</select>
+              </div>
+              <div class="rep-input-group">
+                <label>Motorista</label>
+                <select name="driver">{driver_opts}</select>
+              </div>
+              <div class="rep-input-group">
+                <label>Caminhão / Veículo</label>
+                <select name="vehicle">{vehicle_opts}</select>
+              </div>
+              <div class="rep-input-group">
+                <label>Rota</label>
+                <select name="route">{route_opts}</select>
+              </div>
+            </div>
+
+            {customizer_ped_html}
+
+            <div style="display:flex;gap:10px;align-items:center;margin-top:14px;flex-wrap:wrap;">
+              <button type="submit" class="btn primary" style="font-weight:700;padding:8px 22px;font-size:13.5px;display:inline-flex;align-items:center;gap:6px;">
+                🔍 Aplicar Filtros
+              </button>
+              <a href="/relatorios?tab=pedidos" class="btn ghost" style="padding:8px 16px;font-size:13px;display:inline-flex;align-items:center;">
+                ↺ Limpar Filtros
+              </a>
+            </div>
+          </form>
+        </div>
+        """
+
+        total_orders = (sla['total_orders'] or 0) if sla else 0
+        total_weight = (sla['total_weight'] or 0) if sla else 0
+        weight_display = f"{fmt_num(total_weight)} kg" + (f" ({total_weight/1000:.2f} t)" if total_weight >= 1000 else "")
+        total_value = (sla['total_value'] or 0) if sla else 0
+        ontime_ok = (sla['within_sla'] or 0) if sla else 0
+        late_total = ((sla['outside_sla'] or 0) + (sla['open_late'] or 0)) if sla else 0
+        at_risk = (sla['at_risk'] or 0) if sla else 0
+        deliv_count = (sla['deliv_count'] or 0) if sla else 0
+        sched_count = (sla['sched_count'] or 0) if sla else 0
+        prob_count = (sla['prob_count'] or 0) if sla else 0
+        canc_count = (sla['canc_count'] or 0) if sla else 0
+
+        kpi_cards = []
+        if cfg.get('pdf_hdr_total_orders') == '1':
+            kpi_cards.append(f"""
+            <div class="rep-kpi blue">
+              <div class="rep-kpi-lbl"><span>📦</span> Total de Pedidos</div>
+              <div class="rep-kpi-val">{total_orders}</div>
+              <div class="rep-kpi-sub">pedidos localizados</div>
+            </div>
+            """)
+        if cfg.get('pdf_hdr_total_weight') == '1':
+            kpi_cards.append(f"""
+            <div class="rep-kpi blue">
+              <div class="rep-kpi-lbl"><span>⚖️</span> Peso Total</div>
+              <div class="rep-kpi-val">{weight_display}</div>
+              <div class="rep-kpi-sub">volume filtrado</div>
+            </div>
+            """)
+        if can_view_financial and cfg.get('pdf_hdr_total_value') == '1':
+            kpi_cards.append(f"""
+            <div class="rep-kpi blue">
+              <div class="rep-kpi-lbl"><span>💰</span> Valor Total</div>
+              <div class="rep-kpi-val">{money_visible(can_view_financial, total_value)}</div>
+              <div class="rep-kpi-sub">faturamento no filtro</div>
+            </div>
+            """)
+        if cfg.get('pdf_hdr_ontime') == '1':
+            kpi_cards.append(f"""
+            <div class="rep-kpi green">
+              <div class="rep-kpi-lbl"><span>🟢</span> Entregues no Prazo</div>
+              <div class="rep-kpi-val">{ontime_ok}</div>
+              <div class="rep-kpi-sub">SLA cumprido</div>
+            </div>
+            """)
+        if cfg.get('pdf_hdr_late') == '1':
+            kpi_cards.append(f"""
+            <div class="rep-kpi {'red' if late_total > 0 else 'green'}">
+              <div class="rep-kpi-lbl"><span>🔴</span> Fora Prazo / Atrasados</div>
+              <div class="rep-kpi-val">{late_total}</div>
+              <div class="rep-kpi-sub">entregues tarde ou abertos</div>
+            </div>
+            """)
+        if cfg.get('pdf_hdr_risk') == '1':
+            kpi_cards.append(f"""
+            <div class="rep-kpi {'amber' if at_risk > 0 else 'blue'}">
+              <div class="rep-kpi-lbl"><span>🟡</span> Em Risco (≤ 2 dias)</div>
+              <div class="rep-kpi-val">{at_risk}</div>
+              <div class="rep-kpi-sub">próximos do vencimento</div>
+            </div>
+            """)
+        if cfg.get('pdf_hdr_scheduled') == '1':
+            kpi_cards.append(f"""
+            <div class="rep-kpi blue">
+              <div class="rep-kpi-lbl"><span>🔵</span> Agendados</div>
+              <div class="rep-kpi-val">{sched_count}</div>
+              <div class="rep-kpi-sub">com agendamento fixado</div>
+            </div>
+            """)
+        if cfg.get('pdf_hdr_delivered') == '1':
+            kpi_cards.append(f"""
+            <div class="rep-kpi green">
+              <div class="rep-kpi-lbl"><span>✅</span> Finalizados</div>
+              <div class="rep-kpi-val">{deliv_count}</div>
+              <div class="rep-kpi-sub">entregues / acertados</div>
+            </div>
+            """)
+        if cfg.get('pdf_hdr_problems') == '1':
+            kpi_cards.append(f"""
+            <div class="rep-kpi {'red' if prob_count > 0 else 'blue'}">
+              <div class="rep-kpi-lbl"><span>⚠️</span> Ocorrências / Problemas</div>
+              <div class="rep-kpi-val">{prob_count}</div>
+              <div class="rep-kpi-sub">com ocorrência registrada</div>
+            </div>
+            """)
+        if cfg.get('pdf_hdr_canceled') == '1':
+            kpi_cards.append(f"""
+            <div class="rep-kpi {'red' if canc_count > 0 else 'blue'}">
+              <div class="rep-kpi-lbl"><span>❌</span> Cancelados</div>
+              <div class="rep-kpi-val">{canc_count}</div>
+              <div class="rep-kpi-sub">pedidos cancelados</div>
+            </div>
+            """)
+
+        kpi_section = f'<div class="rep-kpis-container">{"".join(kpi_cards)}</div>' if (cfg.get('sec_ped_kpis', '1') == '1' and kpi_cards) else ""
+
+        show_breakdown_w = (cfg.get('pdf_report_col_weight') == '1')
+        show_breakdown_v = (can_view_financial and cfg.get('pdf_report_col_financial') == '1')
+
+        status_rows_list = []
+        for r in st:
+            row_tds = [f"<td>{badge(r['status'])}</td>", f"<td><b>{r['c']}</b></td>"]
+            if show_breakdown_w:
+                row_tds.append(f"<td>{fmt_num(r['w'])} kg</td>")
+            if show_breakdown_v:
+                row_tds.append(f"<td>{money_visible(can_view_financial, r['v'])}</td>")
+            status_rows_list.append(f"<tr>{''.join(row_tds)}</tr>")
+        bd_cols_count = 2 + (1 if show_breakdown_w else 0) + (1 if show_breakdown_v else 0)
+        status_rows_html = ''.join(status_rows_list) or f'<tr><td colspan="{bd_cols_count}" class="empty">Sem dados para os filtros.</td></tr>'
+
+        route_rows_list = []
+        for r in rt:
+            row_tds = [f"<td><b>{esc(r['route_name'])}</b></td>", f"<td><b>{r['c']}</b></td>"]
+            if show_breakdown_w:
+                row_tds.append(f"<td>{fmt_num(r['w'])} kg</td>")
+            if show_breakdown_v:
+                row_tds.append(f"<td>{money_visible(can_view_financial, r['v'])}</td>")
+            route_rows_list.append(f"<tr>{''.join(row_tds)}</tr>")
+        route_rows_html = ''.join(route_rows_list) or f'<tr><td colspan="{bd_cols_count}" class="empty">Sem dados para os filtros.</td></tr>'
+
+        breakdown_section = f"""
+        <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(340px, 1fr));gap:14px;margin-bottom:14px;">
+          <div class="rep-card" style="margin-bottom:0;">
+            <div class="rep-section-title">
+              <h3><span>📊</span> Resumo por Status</h3>
+              <span class="rep-count-badge">{len(st)} status</span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Status</th><th>Pedidos</th>{f'<th>Peso (kg)</th>' if show_breakdown_w else ''}{f'<th>Valor</th>' if show_breakdown_v else ''}</tr></thead>
+                <tbody>{status_rows_html}</tbody>
+              </table>
+            </div>
+          </div>
+          <div class="rep-card" style="margin-bottom:0;">
+            <div class="rep-section-title">
+              <h3><span>🗺️</span> Resumo por Rota (Top 10)</h3>
+              <span class="rep-count-badge">{len(rt)} rotas</span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Rota</th><th>Pedidos</th>{f'<th>Peso (kg)</th>' if show_breakdown_w else ''}{f'<th>Valor</th>' if show_breakdown_v else ''}</tr></thead>
+                <tbody>{route_rows_html}</tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+        """ if cfg.get('sec_ped_breakdown', '1') == '1' else ""
+
+        show_rec = (cfg.get('pdf_report_col_receiver') == '1')
+        show_sel = (cfg.get('pdf_report_col_seller') == '1')
+        show_wt = (cfg.get('pdf_report_col_weight') == '1')
+        show_val = (can_view_financial and cfg.get('pdf_report_col_financial') == '1')
+        show_dt = (cfg.get('pdf_report_col_dates') == '1')
+
+        del_rows_list = []
+        for r in orders:
+            is_finished = r['status'] in ('Acertado', 'Entregue')
+            deliv_date = (r['delivered_at'] or '')[:10]
+            exp_date = r['expected_delivery_date'] or ''
+            if is_finished:
+                if exp_date and deliv_date:
+                    if deliv_date <= exp_date:
+                        sla_pill = '<span class="deadline ok">🟢 No Prazo</span>'
+                    else:
+                        sla_pill = f'<span class="deadline late">🔴 Fora ({brdate(deliv_date)})</span>'
+                else:
+                    sla_pill = '<span class="deadline ok">Finalizado</span>'
+            else:
+                sla_pill = deadline_pill(exp_date, r['status'])
+
+            date_col = f"<b>{brdate(r['delivered_at'])}</b>" if is_finished else (f"Prev: {brdate(r['expected_delivery_date'])}" if r['expected_delivery_date'] else "—")
+            seller_str = esc(r['seller_name'] or '—')
+            client_str = esc(r['client'] or '—')
+            nf_str = esc(r['invoice_number'] or '—')
+            route_city_str = f"<b>{esc(r['route_name'] or 'Sem rota')}</b><br><small class='muted'>{esc(r['city'] or 'Sem cidade')}</small>"
+            driver_veh_str = f"<b>{esc(r['driver'] or 'Sem motorista')}</b><br><small class='muted'>{esc(r['vehicle'] or 'Sem caminhão')}</small>"
+
+            tds = [
+                f"<td><a class='btn small ghost' href='/orders/{r['id']}' style='font-weight:700;color:#1e3a8a;'>{esc(r['order_number'])}</a></td>",
+                f"<td>{nf_str}</td>"
+            ]
+            if show_rec:
+                tds.append(f"<td><b>{client_str}</b></td>")
+            if show_sel:
+                tds.append(f"<td>{seller_str}</td>")
+            tds.append(f"<td>{route_city_str}</td>")
+            tds.append(f"<td>{driver_veh_str}</td>")
+            tds.append(f"<td>{badge(r['status'])}</td>")
+            if show_wt:
+                tds.append(f"<td><b>{fmt_num(r['weight_kg'])} kg</b></td>")
+            if show_val:
+                tds.append(f"<td>{money_visible(can_view_financial, r['total_value'])}</td>")
+            if show_dt:
+                tds.append(f"<td>{date_col}</td>")
+            tds.append(f"<td>{sla_pill}</td>")
+
+            del_rows_list.append(f"<tr>{''.join(tds)}</tr>")
+
+        th_cols = ["<th>Pedido</th>", "<th>NF</th>"]
+        if show_rec: th_cols.append("<th>Cliente</th>")
+        if show_sel: th_cols.append("<th>Vendedor</th>")
+        th_cols.append("<th>Rota / Cidade</th>")
+        th_cols.append("<th>Motorista / Caminhão</th>")
+        th_cols.append("<th>Status</th>")
+        if show_wt: th_cols.append("<th>Peso</th>")
+        if show_val: th_cols.append("<th>Valor</th>")
+        if show_dt: th_cols.append("<th>Data Ref.</th>")
+        th_cols.append("<th>Situação SLA</th>")
+        table_head_html = "".join(th_cols)
+
+        del_rows = ''.join(del_rows_list) or f'<tr><td colspan="{len(th_cols)}" class="empty">Nenhum pedido encontrado para os filtros selecionados.</td></tr>'
+
+        orders_card = f"""
+        <div class="rep-card">
+          <div class="rep-section-title">
+            <h3><span>📑</span> Listagem Detalhada de Pedidos</h3>
+            <span class="rep-count-badge">Mostrando {len(orders)} de {total_orders} pedidos</span>
+          </div>
+          {f'<p class="muted" style="margin: -6px 0 12px 0; font-size: 12.5px;">Mostrando os primeiros {len(orders)} pedidos na tela. Para a relação completa de todos os {total_orders} pedidos, clique em <b>Emitir Relatório de Pedidos (PDF)</b> ou <b>Exportar Planilha (CSV)</b> no topo.</p>' if total_orders > len(orders) else ''}
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>{table_head_html}</tr>
+              </thead>
+              <tbody>
+                {del_rows}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        """ if cfg.get('sec_ped_orders', '1') == '1' else ""
+
+        r_enabled = settings.get('pdf_report_enabled', '1')
+        r_days = settings.get('pdf_report_days', 'Mon,Wed,Fri')
+        r_time = settings.get('pdf_report_time', '09:00')
+
+        agendador_accordion = f"""
+        <details class='rep-schedule-details'>
+          <summary>⚙️ Agendamento Automático deste Relatório na Área de Trabalho (Opcional)</summary>
+          <div style="padding-top:12px;">
+            <form method="post" action="/relatorios/settings" class="form" style="margin:0;">
+              <input type="hidden" name="_csrf" value="{csrf_val}">
+              <input type="hidden" name="origin_tab" value="pedidos">
+              <div class="grid3">
+                <label>Status do Agendador
+                  <select name="pdf_report_enabled">
+                    <option value="1" {'selected' if r_enabled=='1' else ''}>Ativo (Gerar nos horários programados)</option>
+                    <option value="0" {'selected' if r_enabled=='0' else ''}>Inativo</option>
+                  </select>
+                </label>
+                <label>Dias de Execução
+                  <select name="pdf_report_days">
+                    <option value="Mon,Wed,Fri" {'selected' if r_days=='Mon,Wed,Fri' else ''}>Segunda, Quarta e Sexta</option>
+                    <option value="ALL" {'selected' if r_days=='ALL' else ''}>Todos os dias (Diário)</option>
+                    <option value="Mon" {'selected' if r_days=='Mon' else ''}>Apenas Segunda-feira</option>
+                    <option value="Fri" {'selected' if r_days=='Fri' else ''}>Apenas Sexta-feira</option>
+                  </select>
+                </label>
+                <label>Horário de Emissão (24h)
+                  <input type="time" name="pdf_report_time" value="{esc(r_time)}" required>
+                </label>
+              </div>
+              <p class="muted" style="margin:8px 0;">Os relatórios gerados automaticamente serão salvos na pasta <b>Desktop\\Relatório Logística Casa do Campo</b> neste computador.</p>
+              <div style="margin-top:10px;">
+                <button type="submit" class="btn primary" style="padding:6px 16px;font-size:13px;">💾 Salvar Agendamento</button>
+              </div>
+            </form>
+          </div>
+        </details>
+        """
+        return f'<div class="rep-shell">{alert_msg}{top_bar}{kpi_section}{breakdown_section}{orders_card}{agendador_accordion}</div>'
+
+    def render_relatorio_agendador(self, u, qs):
+        return self.redirect('/relatorios?tab=operacional')
+
+    def export_csv(self, u):
+        qs = parse_qs(urlparse(self.path).query)
+        start, end, route_filter, status_filter, date_type, vehicle_filter, driver_filter, q_filter, sla_filter = self.report_filter_values(qs)
         can_view_financial = self.can_view_financial(u)
-        path=os.path.join(DATA_DIR,'relatorio_pedidos.csv')
-        with conn() as db, open(path,'w',newline='',encoding='utf-8-sig') as f:
-            w=csv.writer(f,delimiter=';'); w.writerow(['Pedido','Documento','Vendedor','Cliente','Cidade','Rota','Status','Peso_kg','Valor','Método_pagamento','Venda','Prazo_limite','Entrega','Dias_venda_entrega'])
-            for r in self.report_orders_rows(db,start,end,route_filter,status_filter,limit=0):
+
+        path = os.path.join(DATA_DIR, 'relatorio_pedidos.csv')
+        with conn() as db, open(path, 'w', newline='', encoding='utf-8-sig') as f:
+            w = csv.writer(f, delimiter=';')
+            w.writerow(['Pedido', 'Documento', 'Vendedor', 'Cliente', 'Cidade', 'Rota', 'Motorista', 'Caminhão', 'Status', 'Peso_kg', 'Valor', 'Método_pagamento', 'Venda', 'Prazo_limite', 'Entrega', 'Dias_venda_entrega'])
+            for r in self.report_orders_rows(db, start, end, route_filter, status_filter, limit=0, date_type=date_type, vehicle_filter=vehicle_filter, driver_filter=driver_filter, q=q_filter, sla_filter=sla_filter):
+                veh_val = r['vehicle'] or 'Sem caminhão'
                 exported_value = r['total_value'] if can_view_financial else 'Oculto'
-                w.writerow([r['order_number'],r['invoice_number'],r['seller_name'],r['client'],r['city'],r['route_name'],r['status'],r['weight_kg'],exported_value,r['payment_method'],r['sale_date'],r['expected_delivery_date'],r['delivered_at'],r['days_to_deliver'] if r['days_to_deliver'] is not None else ''])
-        return self.send_file(path,'text/csv')
+                w.writerow([r['order_number'], r['invoice_number'], r['seller_name'], r['client'], r['city'], r['route_name'], r['driver'], veh_val, r['status'], r['weight_kg'], exported_value, r['payment_method'], r['sale_date'], r['expected_delivery_date'], r['delivered_at'], r['days_to_deliver'] if r['days_to_deliver'] is not None else ''])
+        return self.send_file(path, 'text/csv')
+
+    def export_operacional_csv(self, u):
+        qs = parse_qs(urlparse(self.path).query)
+        can_view_financial = self.can_view_financial(u)
+        with conn() as db:
+            op_data = self.get_operational_report_data(db, qs, can_view_financial)
+
+        totals = op_data['totals']
+        drivers = op_data['drivers']
+        vehicles = op_data.get('vehicles', [])
+        routes = op_data['routes']
+        cities = op_data['cities']
+        problems = op_data['problems']
+        orders = op_data['orders']
+
+        path = os.path.join(DATA_DIR, 'relatorio_operacional_sla.csv')
+        with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+            w = csv.writer(f, delimiter=';')
+            w.writerow(['RELATÓRIO OPERACIONAL & DESEMPENHO SLA - CASA DO CAMPO'])
+            w.writerow([f"Filtros: {op_data['filter_desc']}"])
+            w.writerow([f"Emissão: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"])
+            w.writerow([])
+
+            w.writerow(['--- 1. RESUMO GERAL & SLA ---'])
+            w.writerow(['Total de Pedidos', totals.get('total_orders', 0)])
+            w.writerow(['Peso Total (kg)', totals.get('total_weight', 0)])
+            w.writerow(['Faturamento Total (R$)', totals.get('total_value', 0) if can_view_financial else 'Oculto'])
+            w.writerow(['Pontualidade SLA (%)', f"{totals.get('sla_rate', 100):.1f}%"])
+            w.writerow(['Entregues no Prazo', totals.get('delivered_ontime', 0)])
+            w.writerow(['Entregues Fora do Prazo', totals.get('delivered_late', 0)])
+            w.writerow(['Abertos Atrasados', totals.get('pending_late', 0)])
+            w.writerow(['Média Venda ➔ Faturamento (dias)', totals.get('avg_days_sale_to_inv', '')])
+            w.writerow(['Média Faturamento ➔ Entrega (dias)', totals.get('avg_days_inv_to_del', '')])
+            w.writerow(['Média Venda ➔ Entrega (dias)', totals.get('avg_days_delivery', 0)])
+            w.writerow(['Gargalo Predominante', totals.get('bottleneck_label', 'Equilibrado')])
+            w.writerow(['Diagnóstico do Gargalo', totals.get('bottleneck_desc', '')])
+            w.writerow([])
+
+            w.writerow(['--- 2. DESEMPENHO POR MOTORISTA ---'])
+            w.writerow(['Motorista', 'Total_Pedidos', 'Entregues', 'Peso_kg', 'Valor_Total', 'Media_Dias_Entrega', 'Pontualidade_SLA_Pct', 'No_Prazo', 'Fora_Prazo', 'Problemas'])
+            for d in drivers:
+                w.writerow([
+                    d['driver_name'],
+                    d['total_orders'],
+                    d['delivered_orders'],
+                    d['total_weight'],
+                    d['total_value'] if can_view_financial else 'Oculto',
+                    d['avg_days'] if d['avg_days'] is not None else '',
+                    f"{d.get('sla_rate', 100):.1f}%",
+                    d['ontime_count'],
+                    d['late_count'],
+                    d['problems_count']
+                ])
+            unassigned_driver = op_data.get('unassigned_driver')
+            if unassigned_driver and unassigned_driver.get('total_orders', 0) > 0:
+                w.writerow([
+                    'Aguardando Carga / Pátio',
+                    unassigned_driver['total_orders'],
+                    unassigned_driver['delivered_orders'],
+                    unassigned_driver['total_weight'],
+                    unassigned_driver['total_value'] if can_view_financial else 'Oculto',
+                    '',
+                    '—',
+                    0,
+                    0,
+                    0
+                ])
+            w.writerow([])
+
+            w.writerow(['--- 2.1. DESEMPENHO POR CAMINHÃO / VEÍCULO ---'])
+            w.writerow(['Caminhao_Modelo', 'Placa', 'Capacidade_kg', 'Cargas_Realizadas', 'Total_Pedidos', 'Entregues', 'Peso_Transportado_kg', 'Ocupacao_Capacidade_Pct', 'Valor_Total', 'Pontualidade_SLA_Pct', 'No_Prazo', 'Fora_Prazo'])
+            for v in vehicles:
+                w.writerow([
+                    v.get('model', v.get('vehicle_name', '')),
+                    v.get('plate', ''),
+                    v.get('capacity_kg', 0),
+                    v.get('loads_count', 0),
+                    v.get('total_orders', 0),
+                    v.get('delivered_orders', 0),
+                    v.get('total_weight', 0),
+                    f"{v.get('occupation_rate', 0):.1f}%",
+                    v.get('total_value', 0) if can_view_financial else 'Oculto',
+                    f"{v.get('sla_rate', 100):.1f}%",
+                    v.get('ontime_count', 0),
+                    v.get('late_count', 0),
+                ])
+            unassigned_vh = op_data.get('unassigned_vehicle')
+            if unassigned_vh and unassigned_vh.get('total_orders', 0) > 0:
+                w.writerow([
+                    'Aguardando Caminhão / Pátio',
+                    '',
+                    0,
+                    0,
+                    unassigned_vh.get('total_orders', 0),
+                    unassigned_vh.get('delivered_orders', 0),
+                    unassigned_vh.get('total_weight', 0),
+                    '—',
+                    unassigned_vh.get('total_value', 0) if can_view_financial else 'Oculto',
+                    '—',
+                    0,
+                    0
+                ])
+            w.writerow([])
+
+            w.writerow(['--- 3. DESEMPENHO POR ROTA ---'])
+            w.writerow(['Rota', 'Total_Pedidos', 'Entregues', 'Peso_kg', 'Pct_Peso', 'Valor_Total', 'Media_Dias_Venda_Fat', 'Media_Dias_Fat_Entr', 'Gargalo_Rota', 'Pontualidade_SLA_Pct'])
+            tot_w = totals.get('total_weight', 0) or 1
+            for r in routes:
+                pct_w = (r.get('total_weight', 0) / tot_w * 100)
+                w.writerow([
+                    r['route_name'],
+                    r['total_orders'],
+                    r['delivered_orders'],
+                    r['total_weight'],
+                    f"{pct_w:.1f}%",
+                    r['total_value'] if can_view_financial else 'Oculto',
+                    r.get('avg_days_sale_to_inv', ''),
+                    r.get('avg_days_inv_to_del', ''),
+                    r.get('bottleneck', '—'),
+                    f"{r.get('sla_rate', 100):.1f}%"
+                ])
+            w.writerow([])
+
+            w.writerow(['--- 4. DESEMPENHO POR CIDADE ---'])
+            w.writerow(['Cidade', 'Rota_Base', 'Total_Pedidos', 'Entregues', 'Peso_kg', 'Valor_Total'])
+            for c in cities:
+                w.writerow([
+                    c['city_name'],
+                    c.get('route_name', ''),
+                    c['total_orders'],
+                    c['delivered_orders'],
+                    c['total_weight'],
+                    c['total_value'] if can_view_financial else 'Oculto'
+                ])
+            w.writerow([])
+
+            if problems:
+                w.writerow(['--- 5. OCORRÊNCIAS & PROBLEMAS ---'])
+                w.writerow(['Motivo', 'Quantidade'])
+                for p in problems:
+                    w.writerow([p['problem_type'], p['c']])
+                w.writerow([])
+
+            w.writerow(['--- 6. LISTAGEM ANALÍTICA DOS PEDIDOS (AMOSTRA FILTRADA) ---'])
+            w.writerow(['Pedido', 'Documento', 'Vendedor', 'Cliente', 'Cidade', 'Rota', 'Motorista', 'Status', 'Peso_kg', 'Valor', 'Metodo_Pagamento', 'Venda', 'Faturamento', 'Prazo_SLA', 'Entrega', 'Dias_Venda_Fat', 'Dias_Fat_Entr', 'Dias_Venda_Entrega_Total', 'Gargalo_Pedido'])
+            for o in orders:
+                w.writerow([
+                    o['order_number'],
+                    o['invoice_number'],
+                    o['seller_name'],
+                    o['client_name'] if 'client_name' in o.keys() else (o['client'] if 'client' in o.keys() else ''),
+                    o['city'],
+                    o['route_name'],
+                    o['driver_name'],
+                    o['status'],
+                    o['weight_kg'],
+                    o['total_value'] if can_view_financial else 'Oculto',
+                    o['payment_method'],
+                    o['sale_date'],
+                    o.get('invoiced_at', ''),
+                    o['expected_delivery_date'],
+                    o['delivered_at'],
+                    o.get('days_sale_to_inv', ''),
+                    o.get('days_inv_to_del', ''),
+                    o['days_to_deliver'] if o['days_to_deliver'] is not None else '',
+                    o.get('bottleneck_stage', '—')
+                ])
+
+        return self.send_file(path, 'text/csv')
+
+    def export_operacional_pdf(self, u):
+        qs = parse_qs(urlparse(self.path).query)
+        can_view_financial = self.can_view_financial(u)
+        with conn() as db:
+            op_data = self.get_operational_report_data(db, qs, can_view_financial)
+            filepath = pdf_report_service.generate_operational_sla_pdf_report(op_data)
+            filename = os.path.basename(filepath)
+            audit(db, u, 'Exportou relatório operacional PDF', 'Relatórios', filename, '', f'Salvo em {filepath}')
+            db.commit()
+
+        try:
+            with open(filepath, 'rb') as f:
+                pdf_bytes = f.read()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/pdf')
+            self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+            self.send_header('Content-Length', str(len(pdf_bytes)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(pdf_bytes)
+            self.mark_request_timing()
+        except Exception as exc:
+            log_server_error('PDF_OPERATIONAL_DOWNLOAD', exc)
+            self.redirect(f'/relatorios?tab=operacional&report_generated=1&filename={quote(filename)}')
+
+    def export_pedidos_pdf(self, u):
+        if not self.require_perm(u, 'export_reports', 'Sem permissão para exportar relatórios.'):
+            return
+        qs = parse_qs(urlparse(self.path).query)
+        can_view_financial = self.can_view_financial(u)
+        is_customizer_submitted = ('customizer_present' in qs)
+        with conn() as db:
+            settings = {r['key']: r['value'] for r in db.execute('SELECT * FROM settings')}
+            cfg = {}
+            cfg['start'] = (qs.get('start', [''])[0] or '').strip()
+            cfg['end'] = (qs.get('end', [''])[0] or '').strip()
+            cfg['route'] = (qs.get('route', [''])[0] or '').strip()
+            cfg['status'] = (qs.get('status', [''])[0] or '').strip()
+            cfg['date_type'] = (qs.get('date_type', ['operational'])[0] or 'operational').strip()
+            cfg['driver'] = (qs.get('driver', [''])[0] or '').strip()
+            cfg['vehicle'] = (qs.get('vehicle', [''])[0] or '').strip()
+            cfg['q'] = (qs.get('q', [''])[0] or qs.get('search', [''])[0] or '').strip()
+            cfg['sla_status'] = (qs.get('sla_status', [''])[0] or '').strip()
+
+            ped_keys = [
+                ('pdf_hdr_total_orders', '1'),
+                ('pdf_hdr_total_weight', '1'),
+                ('pdf_hdr_total_value', '1' if can_view_financial else '0'),
+                ('pdf_hdr_ontime', '1'),
+                ('pdf_hdr_late', '1'),
+                ('pdf_hdr_risk', '1'),
+                ('pdf_hdr_scheduled', '1'),
+                ('pdf_hdr_delivered', '1'),
+                ('pdf_hdr_problems', '0'),
+                ('pdf_hdr_canceled', '0'),
+                ('pdf_report_st_venda', '1'),
+                ('pdf_report_st_faturado', '1'),
+                ('pdf_report_st_rota', '1'),
+                ('pdf_report_st_agendado', '1'),
+                ('pdf_report_st_acertado', '1'),
+                ('pdf_report_st_problema', '1'),
+                ('pdf_report_st_cancelado', '0'),
+                ('pdf_report_col_financial', '1' if can_view_financial else '0'),
+                ('pdf_report_col_weight', '1'),
+                ('pdf_report_col_dates', '1'),
+                ('pdf_report_col_seller', '1'),
+                ('pdf_report_col_receiver', '1'),
+            ]
+            for k, def_v in ped_keys:
+                if is_customizer_submitted:
+                    cfg[k] = '1' if k in qs else '0'
+                else:
+                    v = settings.get(k)
+                    if v is None or v == '':
+                        cfg[k] = def_v
+                    else:
+                        cfg[k] = '1' if str(v).strip().lower() in ('1', 'true', 'on') else '0'
+
+            if not can_view_financial:
+                cfg['pdf_report_col_financial'] = '0'
+                cfg['pdf_hdr_total_value'] = '0'
+
+            filepath = pdf_report_service.generate_orders_pdf_report(db, config=cfg)
+            filename = os.path.basename(filepath)
+            audit(db, u, 'Exportou relatório de pedidos PDF', 'Relatórios', filename, '', f'Salvo em {filepath}')
+            db.commit()
+
+        try:
+            with open(filepath, 'rb') as f:
+                pdf_bytes = f.read()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/pdf')
+            self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+            self.send_header('Content-Length', str(len(pdf_bytes)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(pdf_bytes)
+            self.mark_request_timing()
+        except Exception as exc:
+            log_server_error('PDF_PEDIDOS_DOWNLOAD', exc)
+            self.redirect(f'/relatorios?tab=pedidos&report_generated=1&filename={quote(filename)}')
+
+    def post_report_settings(self, u):
+        if not (self.has_perm(u, 'manage_settings') or is_admin(u)):
+            return self.send_html(layout(u, 'Acesso negado', '<div class="alert danger">Somente perfis autorizados alteram preferências de relatórios.</div>'), 403)
+        d = self.post_data()
+        origin_tab = (d.get('origin_tab', 'operacional') or 'operacional').strip().lower()
+        if origin_tab not in ('operacional', 'pedidos'):
+            origin_tab = 'operacional'
+
+        with conn() as db:
+            if origin_tab == 'pedidos':
+                ped_bool_keys = [
+                    'pdf_hdr_total_orders', 'pdf_hdr_total_weight', 'pdf_hdr_total_value',
+                    'pdf_hdr_ontime', 'pdf_hdr_late', 'pdf_hdr_risk', 'pdf_hdr_scheduled',
+                    'pdf_hdr_delivered', 'pdf_hdr_problems', 'pdf_hdr_canceled',
+                    'pdf_report_st_venda', 'pdf_report_st_faturado', 'pdf_report_st_rota',
+                    'pdf_report_st_agendado', 'pdf_report_st_acertado', 'pdf_report_st_problema', 'pdf_report_st_cancelado',
+                    'pdf_report_col_financial', 'pdf_report_col_weight', 'pdf_report_col_dates',
+                    'pdf_report_col_seller', 'pdf_report_col_receiver',
+                    'sec_ped_kpis', 'sec_ped_breakdown', 'sec_ped_orders'
+                ]
+                for k in ped_bool_keys:
+                    val = '1' if d.get(k) in ('1', 'on', 'true') else '0'
+                    db.execute('INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES(?,?,?)', (k, val, now()))
+            else:
+                op_bool_keys = [
+                    'kpi_total_orders', 'kpi_total_weight', 'kpi_total_value', 'kpi_sla_rate',
+                    'kpi_delivered_ontime', 'kpi_delivered_late', 'kpi_pending_late', 'kpi_avg_days',
+                    'sec_drivers', 'sec_vehicles', 'sec_routes', 'sec_cities', 'sec_problems', 'sec_orders',
+                    'col_financial', 'col_weight', 'col_avg_days', 'col_sla'
+                ]
+                for k in op_bool_keys:
+                    val = '1' if d.get(k) in ('1', 'on', 'true') else '0'
+                    db.execute('INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES(?,?,?)', (k, val, now()))
+
+            if 'pdf_report_enabled' in d:
+                db.execute('INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES(?,?,?)', ('pdf_report_enabled', '1' if d.get('pdf_report_enabled') == '1' else '0', now()))
+            if 'pdf_report_days' in d:
+                db.execute('INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES(?,?,?)', ('pdf_report_days', d.get('pdf_report_days', 'Mon,Wed,Fri'), now()))
+            if 'pdf_report_time' in d:
+                db.execute('INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES(?,?,?)', ('pdf_report_time', d.get('pdf_report_time', '09:00'), now()))
+
+            audit(db, u, f'Alterou configurações de relatórios ({origin_tab})', 'Relatórios')
+            db.commit()
+        return self.redirect(f'/relatorios?tab={quote(origin_tab)}&saved=1')
+
     def backup(self,u):
         if not self.has_perm(u,'view_backup'):
             return self.fail(u,'Acesso negado','Sem permissão para acessar backup.',403)
@@ -6257,11 +12025,12 @@ document.addEventListener('DOMContentLoaded', function(){
         can_manage_reports = self.has_perm(u,'manage_settings') or is_admin(u)
         can_manage_app_config = is_god(u)
 
+        if section == 'reports':
+            return self.redirect('/relatorios?tab=agendador')
+
         allowed_sections = {'profile'}
         if can_manage_config:
             allowed_sections.add('system')
-        if can_manage_reports:
-            allowed_sections.add('reports')
         if can_manage_app_config:
             allowed_sections.add('app_config')
         if can_manage_users:
@@ -6277,8 +12046,6 @@ document.addEventListener('DOMContentLoaded', function(){
         tabs = [("profile", "Minha conta", "#settings-profile")]
         if can_manage_config:
             tabs.append(("system", "Parâmetros", "#settings-system"))
-        if can_manage_reports:
-            tabs.append(("reports", "Relatórios PDF", "#settings-reports"))
         if can_manage_app_config:
             tabs.append(("app_config", "App Mobile (GOD)", "#settings-app_config"))
         if can_manage_users:
@@ -6312,13 +12079,108 @@ document.addEventListener('DOMContentLoaded', function(){
                 content += f'''<section class="panel settings-panel" id="settings-profile"><h2>Minha conta</h2>{saved_msg}<form method="post" action="/settings/profile" class="inline-form"><input type="hidden" name="redirect_section" value="profile"><input name="name" value="{esc(u['name'])}" placeholder="Nome" required><input name="username" value="{esc(u['username'])}" placeholder="Usuário" required><input name="password" type="password" placeholder="Nova senha opcional"><button>Atualizar minha conta</button></form><p class="muted">Último acesso: {brdate(u["last_login_at"])} {esc(str(u["last_login_at"] or "")[11:16]) if u["last_login_at"] else "—"}</p></section>'''
 
         elif section == 'system' and can_manage_config:
-            content += f'''<section class="panel settings-panel" id="settings-system"><h2>Parâmetros do sistema</h2><form method="post" action="/settings" class="form"><input type="hidden" name="redirect_section" value="system"><fieldset><legend>Identidade e operação</legend><div class="grid3"><label>Nome do sistema<input name="system_name" value="{esc(settings.get('system_name'))}"></label><label>Nome da empresa<input name="company_name" value="{esc(settings.get('company_name'))}"></label><label>Subtítulo<input name="company_subtitle" value="{esc(settings.get('company_subtitle'))}"></label><label>Cor principal<input type="color" name="primary_color" value="{esc(settings.get('primary_color'))}"></label><label>Cor secundária<input type="color" name="secondary_color" value="{esc(settings.get('secondary_color'))}"></label><label>Cor de apoio<input type="color" name="accent_color" value="{esc(settings.get('accent_color'))}"></label><label>Cor fundo<input type="color" name="background_color" value="{esc(settings.get('background_color','#f6f7f2'))}"></label><label>Prazo SLA oficial<input name="sla_limit_days" value="15" readonly><small>Travado em 15 dias corridos conforme regra operacional.</small></label><label>Capacidade padrão kg<input name="load_capacity_kg" value="{esc(settings.get('load_capacity_kg'))}"></label><label>Modo manutenção<select name="maintenance_mode"><option value="off" {'selected' if settings.get('maintenance_mode','off')!='on' else ''}>Desligado</option><option value="on" {'selected' if settings.get('maintenance_mode')=='on' else ''}>Ligado</option></select></label><label class="full">Observação interna<input name="god_note" value="{esc(settings.get('god_note',''))}" placeholder="Ex: revisão feita em..."></label></div></fieldset><button class="btn primary" style="margin-top:1rem;">💾 Salvar configurações globais</button></form></section>'''
+            active_gmap_key = get_google_maps_api_key()
+            is_env_key = bool(os.environ.get('GOOGLE_MAPS_API_KEY'))
+            gmap_status_text = '🟢 Chave Configurada via .env' if is_env_key else ('🟢 Chave Configurada no Banco' if active_gmap_key else '⚪ Nenhuma Chave Configurada (Usando ESRI/OpenStreetMap)')
+            gmap_status_color = '#16a34a' if active_gmap_key else '#64748b'
+            gmap_status_bg = '#dcfce7' if active_gmap_key else '#f1f5f9'
 
-        elif section == 'reports' and can_manage_reports:
-            r_enabled = settings.get('pdf_report_enabled', '1')
-            r_days = settings.get('pdf_report_days', 'Mon,Wed,Fri')
-            r_time = settings.get('pdf_report_time', '09:00')
-            content += f'''<section class="panel settings-panel" id="settings-reports"><h2>📊 Agendamento e Preferências de Relatórios em PDF</h2>{saved_msg}<form method="post" action="/settings" class="form"><input type="hidden" name="redirect_section" value="reports"><fieldset><legend>Agendamento Automático (Salvo no Desktop)</legend><div class="grid3"><label>Status do Agendador<select name="pdf_report_enabled"><option value="1" {"selected" if r_enabled=="1" else ""}>Ativo (Gerar nos horários programados)</option><option value="0" {"selected" if r_enabled=="0" else ""}>Inativo</option></select></label><label>Dias de Execução<select name="pdf_report_days"><option value="Mon,Wed,Fri" {"selected" if r_days=="Mon,Wed,Fri" else ""}>Segunda, Quarta e Sexta</option><option value="ALL" {"selected" if r_days=="ALL" else ""}>Todos os dias (Diário)</option><option value="Mon" {"selected" if r_days=="Mon" else ""}>Apenas Segunda-feira</option><option value="Fri" {"selected" if r_days=="Fri" else ""}>Apenas Sexta-feira</option></select></label><label>Horário de Emissão (24h)<input type="time" name="pdf_report_time" value="{esc(r_time)}" required></label></div><p class="muted">Os relatórios gerados automaticamente serão salvos na pasta <b>Desktop\\Relatório Logística Casa do Campo</b> no computador.</p></fieldset><fieldset style="margin-top:1rem;"><legend>Cards e Métricas do Cabeçalho do PDF</legend><div class="checkbox-grid"><label class="checkbox-card"><input type="checkbox" name="pdf_hdr_total_orders" value="1" {"checked" if settings.get('pdf_hdr_total_orders','1')=='1' else ""}> Total de Pedidos</label><label class="checkbox-card"><input type="checkbox" name="pdf_hdr_total_weight" value="1" {"checked" if settings.get('pdf_hdr_total_weight','1')=='1' else ""}> Peso Total (kg)</label><label class="checkbox-card"><input type="checkbox" name="pdf_hdr_total_value" value="1" {"checked" if settings.get('pdf_hdr_total_value','1')=='1' else ""}> Valor Total (R$)</label><label class="checkbox-card"><input type="checkbox" name="pdf_hdr_late" value="1" {"checked" if settings.get('pdf_hdr_late','1')=='1' else ""}> 🔴 Qtd. Atrasados</label><label class="checkbox-card"><input type="checkbox" name="pdf_hdr_risk" value="1" {"checked" if settings.get('pdf_hdr_risk','1')=='1' else ""}> 🟡 Qtd. Em Risco</label><label class="checkbox-card"><input type="checkbox" name="pdf_hdr_ontime" value="1" {"checked" if settings.get('pdf_hdr_ontime','1')=='1' else ""}> 🟢 Qtd. No Prazo (OK)</label><label class="checkbox-card"><input type="checkbox" name="pdf_hdr_scheduled" value="1" {"checked" if settings.get('pdf_hdr_scheduled','1')=='1' else ""}> 🔵 Qtd. Agendados</label><label class="checkbox-card"><input type="checkbox" name="pdf_hdr_delivered" value="1" {"checked" if settings.get('pdf_hdr_delivered','1')=='1' else ""}> Qtd. Entregues</label><label class="checkbox-card"><input type="checkbox" name="pdf_hdr_problems" value="1" {"checked" if settings.get('pdf_hdr_problems','0')=='1' else ""}> Qtd. Com Problema</label><label class="checkbox-card"><input type="checkbox" name="pdf_hdr_canceled" value="1" {"checked" if settings.get('pdf_hdr_canceled','0')=='1' else ""}> Qtd. Cancelados</label></div></fieldset><fieldset style="margin-top:1rem;"><legend>Status a Incluir no Relatório</legend><div class="checkbox-grid"><label class="checkbox-card"><input type="checkbox" name="pdf_report_st_venda" value="1" {"checked" if settings.get('pdf_report_st_venda','1')=='1' else ""}> Venda</label><label class="checkbox-card"><input type="checkbox" name="pdf_report_st_faturado" value="1" {"checked" if settings.get('pdf_report_st_faturado','1')=='1' else ""}> Faturado</label><label class="checkbox-card"><input type="checkbox" name="pdf_report_st_rota" value="1" {"checked" if settings.get('pdf_report_st_rota','1')=='1' else ""}> Saiu para Entrega</label><label class="checkbox-card"><input type="checkbox" name="pdf_report_st_agendado" value="1" {"checked" if settings.get('pdf_report_st_agendado','1')=='1' else ""}> Agendado</label><label class="checkbox-card"><input type="checkbox" name="pdf_report_st_acertado" value="1" {"checked" if settings.get('pdf_report_st_acertado','1')=='1' else ""}> Entregue / Acertado</label><label class="checkbox-card"><input type="checkbox" name="pdf_report_st_problema" value="1" {"checked" if settings.get('pdf_report_st_problema','1')=='1' else ""}> Com Problema</label><label class="checkbox-card"><input type="checkbox" name="pdf_report_st_cancelado" value="1" {"checked" if settings.get('pdf_report_st_cancelado','0')=='1' else ""}> Cancelado</label></div></fieldset><fieldset style="margin-top:1rem;"><legend>Colunas e Informações Visíveis no PDF</legend><div class="checkbox-grid"><label class="checkbox-card"><input type="checkbox" name="pdf_report_col_financial" value="1" {"checked" if settings.get('pdf_report_col_financial','1')=='1' else ""}> Valores R$</label><label class="checkbox-card"><input type="checkbox" name="pdf_report_col_weight" value="1" {"checked" if settings.get('pdf_report_col_weight','1')=='1' else ""}> Pesos kg</label><label class="checkbox-card"><input type="checkbox" name="pdf_report_col_dates" value="1" {"checked" if settings.get('pdf_report_col_dates','1')=='1' else ""}> Previsão & Dias SLA</label><label class="checkbox-card"><input type="checkbox" name="pdf_report_col_seller" value="1" {"checked" if settings.get('pdf_report_col_seller','1')=='1' else ""}> Vendedor</label><label class="checkbox-card"><input type="checkbox" name="pdf_report_col_receiver" value="1" {"checked" if settings.get('pdf_report_col_receiver','1')=='1' else ""}> Recebedor / Obs</label></div></fieldset><div style="display:flex;gap:12px;align-items:center;margin-top:1.2rem;flex-wrap:wrap;"><button class="btn primary">💾 Salvar preferências de relatório</button><a class="btn ghost" href="/settings/reports/generate-now" style="color:#15803d;border-color:#22c55e;font-weight:700;">⚡ Gerar Relatório Agora em PDF (Download e Salvar no Desktop)</a></div></form></section>'''
+            content += f'''<section class="panel settings-panel" id="settings-system"><h2>Parâmetros do sistema</h2><p class="muted" style="margin-bottom:1rem;">📋 O agendamento e personalização de relatórios PDF foram movidos para a aba <a href="/relatorios?tab=agendador" style="color:var(--primary);font-weight:700;">Relatórios → Agendamento PDF</a>.</p><form method="post" action="/settings" class="form"><input type="hidden" name="redirect_section" value="system"><fieldset><legend>Identidade e operação</legend><div class="grid3"><label>Nome do sistema<input name="system_name" value="{esc(settings.get('system_name'))}"></label><label>Nome da empresa<input name="company_name" value="{esc(settings.get('company_name'))}"></label><label>Subtítulo<input name="company_subtitle" value="{esc(settings.get('company_subtitle'))}"></label><label>Cor principal<input type="color" name="primary_color" value="{esc(settings.get('primary_color'))}"></label><label>Cor secundária<input type="color" name="secondary_color" value="{esc(settings.get('secondary_color'))}"></label><label>Cor de apoio<input type="color" name="accent_color" value="{esc(settings.get('accent_color'))}"></label><label>Cor fundo<input type="color" name="background_color" value="{esc(settings.get('background_color','#f6f7f2'))}"></label><label>Prazo SLA oficial<input name="sla_limit_days" value="15" readonly><small>Travado em 15 dias corridos conforme regra operacional.</small></label><label>Capacidade padrão kg<input name="load_capacity_kg" value="{esc(settings.get('load_capacity_kg'))}"></label><label>Modo manutenção<select name="maintenance_mode"><option value="off" {'selected' if settings.get('maintenance_mode','off')!='on' else ''}>Desligado</option><option value="on" {'selected' if settings.get('maintenance_mode')=='on' else ''}>Ligado</option></select></label><label class="full">Observação interna<input name="god_note" value="{esc(settings.get('god_note',''))}" placeholder="Ex: revisão feita em..."></label></div></fieldset>
+
+<fieldset style="margin-top:1.5rem; border:1px solid #93c5fd; background:#f0f9ff; padding:16px; border-radius:8px;">
+<legend style="color:#0369a1; font-weight:800; font-size:14px; padding:0 8px;">🗺️ Integração Google Maps (Google Cloud Platform)</legend>
+<div style="display:flex; flex-direction:column; gap:12px;">
+  <p style="margin:0; font-size:13px; color:#334155;">
+    Habilita mapas em alta resolução (Satélite Híbrido com nomes de vias/cidades, Ruas e Terreno) e <b>Geocodificação Automática</b> de endereços rurais/urbanos para fixar pinos GPS no mapa interativo e facilitar a navegação do motorista.
+  </p>
+  <div>
+    <label style="font-weight:700; font-size:13px; display:block; margin-bottom:4px; color:#1e293b;">Chave de API do Google Maps (Google Cloud API Key)</label>
+    <div style="display:flex; gap:8px;">
+      <input type="password" id="inputGoogleMapsKey" name="google_maps_api_key" value="{esc(settings.get('google_maps_api_key', ''))}" placeholder="AIzaSy..." style="flex:1; font-family:monospace; padding:8px 10px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px;">
+      <button type="button" id="btnToggleKeyVis" class="btn ghost small" style="padding:6px 12px; font-size:12px;">👁️ Ver</button>
+    </div>
+    <small style="color:#64748b; margin-top:3px; display:block;">
+      {f'🔒 Chave ativa detectada no arquivo <code>.env</code> (GOOGLE_MAPS_API_KEY).' if is_env_key else 'Pode ser preenchida aqui ou no arquivo <code>.env</code>. Requer as APIs Maps JavaScript API e Geocoding API ativadas no Google Cloud.'}
+    </small>
+  </div>
+  <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; padding-top:10px; border-top:1px solid #bae6fd;">
+    <div style="display:flex; align-items:center; gap:8px;">
+      <span id="badgeGMapStatus" style="font-size:12px; font-weight:700; padding:4px 10px; border-radius:12px; background:{gmap_status_bg}; color:{gmap_status_color};">
+        {gmap_status_text}
+      </span>
+    </div>
+    <button type="button" id="btnTestGoogleMaps" class="btn small" style="background:#0284c7; border-color:#0284c7; color:#fff; font-weight:700; font-size:12px; padding:6px 12px;">
+      🔍 Testar Chave no Google Cloud
+    </button>
+  </div>
+  <div id="boxGoogleMapsTestResult" style="display:none; font-size:13px; font-weight:600; padding:10px 14px; border-radius:6px; margin-top:4px;"></div>
+</div>
+</fieldset>
+
+<script>
+(function() {{
+  var btnToggle = document.getElementById('btnToggleKeyVis');
+  var inputKey = document.getElementById('inputGoogleMapsKey');
+  var btnTest = document.getElementById('btnTestGoogleMaps');
+  var resBox = document.getElementById('boxGoogleMapsTestResult');
+
+  if (btnToggle && inputKey) {{
+    btnToggle.addEventListener('click', function() {{
+      if (inputKey.type === 'password') {{
+        inputKey.type = 'text';
+        btnToggle.textContent = '🔒 Ocultar';
+      }} else {{
+        inputKey.type = 'password';
+        btnToggle.textContent = '👁️ Ver';
+      }}
+    }});
+  }}
+
+  if (btnTest && resBox) {{
+    btnTest.addEventListener('click', function() {{
+      var keyVal = inputKey ? inputKey.value.trim() : '';
+      btnTest.disabled = true;
+      btnTest.textContent = '⏳ Testando conexão...';
+      resBox.style.display = 'block';
+      resBox.style.background = '#f8fafc';
+      resBox.style.color = '#334155';
+      resBox.style.border = '1px solid #cbd5e1';
+      resBox.textContent = 'Conectando à Google Geocoding API...';
+
+      fetch('/api/map/test-key', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ api_key: keyVal }})
+      }})
+      .then(function(res) {{ return res.json(); }})
+      .then(function(data) {{
+        btnTest.disabled = false;
+        btnTest.textContent = '🔍 Testar Chave no Google Cloud';
+        if (data.ok) {{
+          resBox.style.background = '#dcfce7';
+          resBox.style.color = '#166534';
+          resBox.style.border = '1px solid #86efac';
+          resBox.textContent = data.message || 'Chave testada e funcionando com sucesso!';
+        }} else {{
+          resBox.style.background = '#fee2e2';
+          resBox.style.color = '#991b1b';
+          resBox.style.border = '1px solid #fca5a5';
+          resBox.textContent = data.message || 'Falha ao validar chave no Google Cloud.';
+        }}
+      }})
+      .catch(function(err) {{
+        btnTest.disabled = false;
+        btnTest.textContent = '🔍 Testar Chave no Google Cloud';
+        resBox.style.background = '#fee2e2';
+        resBox.style.color = '#991b1b';
+        resBox.style.border = '1px solid #fca5a5';
+        resBox.textContent = 'Erro ao se comunicar com o servidor: ' + err.message;
+      }});
+    }});
+  }}
+}})();
+</script>
+<button class="btn primary" style="margin-top:1rem;">💾 Salvar configurações globais</button></form></section>'''
 
         elif section == 'app_config' and can_manage_app_config:
             app_title = settings.get('driver_app_title', 'Entregas Casa do Campo')
@@ -6407,7 +12269,7 @@ document.addEventListener('DOMContentLoaded', function(){
             self.mark_request_timing()
         except Exception as exc:
             log_server_error('PDF_DOWNLOAD', exc)
-            self.redirect(f'/settings?section=reports&report_generated=1&filename={quote(filename)}')
+            self.redirect(f'/relatorios?tab=agendador&report_generated=1&filename={quote(filename)}')
 
     def post_settings(self,u):
         d=self.post_data()
@@ -6436,11 +12298,11 @@ document.addEventListener('DOMContentLoaded', function(){
                 for k in report_keys:
                     db.execute('INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES(?,?,?)',(k,d.get(k,''),now()))
                 audit(db,u,'Alterou configurações de relatórios PDF','Configurações'); db.commit()
-            return self.redirect('/settings?section=reports#settings-reports')
+            return self.redirect('/relatorios?tab=agendador&saved=1')
 
         if not self.has_perm(u,'manage_settings') or not is_admin(u):
             return self.send_html(layout(u,'Acesso negado','<div class="alert danger">Somente perfis autorizados alteram configurações globais.</div>'),403)
-        keys=['system_name','company_name','company_subtitle','primary_color','secondary_color','accent_color','background_color','load_capacity_kg','maintenance_mode','god_note']
+        keys=['system_name','company_name','company_subtitle','primary_color','secondary_color','accent_color','background_color','load_capacity_kg','maintenance_mode','god_note','google_maps_api_key']
         load_capacity=parse_float(d.get('load_capacity_kg') or 0)
         if load_capacity <= 0:
             raise ValueError('Capacidade padrão deve ser maior que zero.')
@@ -6452,6 +12314,12 @@ document.addEventListener('DOMContentLoaded', function(){
                 db.execute('INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES(?,?,?)',(k,val,now()))
             db.execute('INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES(?,?,?)',('sla_limit_days','15',now()))
             audit(db,u,'Alterou configurações','Configurações'); db.commit()
+            if d.get('maintenance_mode') == 'on':
+                with SESSIONS_LOCK:
+                    for s_id, s_data in list(SESSIONS.items()):
+                        uid = s_data.get('uid')
+                        if uid != u['id']:
+                            SESSIONS.pop(s_id, None)
         self.redirect(f'/settings?section={quote(redirect_section)}#settings-{quote(redirect_section)}')
     def post_profile(self,u):
         d=self.post_data()
@@ -7591,15 +13459,15 @@ def sync_pending_invoiced_orders_to_logistica():
                 mapped_ped = _erp_mapper.map_erp_to_logistica(fat_raw)
                 if mapped_ped and (mapped_ped.get('is_invoiced') or mapped_ped.get('invoice_number')):
                     invoice_data = {
-                        'invoice_number': mapped_ped.get('invoice_number') or '1',
+                        'invoice_number': mapped_ped.get('invoice_number') or order_number,
                         'invoiced_at': mapped_ped.get('invoiced_at') or mapped_ped.get('sale_date') or now()[:10],
                     }
 
             if not invoice_data or not invoice_data.get('invoice_number'):
                 continue
 
-            nf = str(invoice_data['invoice_number']).strip()
-            if not nf or nf in ('0', '0.0', 'None', 'null'):
+            nf = str(invoice_data.get('invoice_number') or '').strip()
+            if not nf or nf in ('0', '0.0', 'None', 'null', 'NULL'):
                 continue
 
             nf_date = invoice_data.get('invoiced_at') or now()[:10]
@@ -7611,22 +13479,512 @@ def sync_pending_invoiced_orders_to_logistica():
                 ).fetchone()
                 if not current:
                     continue
+
+                # Evita falha por duplicidade na constraint UNIQUE de invoice_number
+                dup = db.execute(
+                    "SELECT id, order_number FROM orders WHERE invoice_number=? AND id<>?",
+                    (nf, row['id'])
+                ).fetchone()
+                if dup:
+                    nf = f"{nf}-{order_number}"
+
                 db.execute(
                     "UPDATE orders SET invoice_number=?, invoiced_at=?, status='Faturado', updated_at=?, version=COALESCE(version,1)+1 WHERE id=? AND status='Venda'",
                     (nf, nf_date, now(), row['id'])
                 )
                 db.execute(
                     "INSERT INTO order_history(order_id,old_status,new_status,action,notes,created_at) VALUES(?,?,?,?,?,?)",
-                    (row['id'], 'Venda', 'Faturado', 'ERP_SYNC', f'Faturamento detectado automaticamente via ERP. NF: {nf}', now())
+                    (row['id'], 'Venda', 'Faturado', 'ERP_SYNC', f'Faturamento detectado automaticamente via ERP. NF/Doc: {nf}', now())
                 )
                 db.commit()
                 updated_count += 1
-                _log.info('Pedido %s (ID %s) faturado automaticamente via ERP. NF: %s', order_number, row['id'], nf)
+                _log.info('Pedido %s (ID %s) faturado automaticamente via ERP. NF/Doc: %s', order_number, row['id'], nf)
                 GLOBAL_BROKER.publish('orders_updated')
         except Exception as item_exc:
             _log.error('Sync ERP: erro no pedido %s: %s', order_number, item_exc)
 
     return updated_count
+
+
+def _resolve_route_name_for_city(db, city):
+    if not city:
+        return ''
+    c_key = normalized_text_key(city)
+    rc_rows = db.execute("SELECT route_name, city FROM route_cities WHERE active=1 AND route_name IS NOT NULL AND TRIM(route_name)<>'' ORDER BY COALESCE(delivery_order,9999), route_name, id").fetchall()
+    for r in rc_rows:
+        if normalized_text_key(r['city']) == c_key:
+            return str(r['route_name']).strip()
+    for r in rc_rows:
+        rck = normalized_text_key(r['city'])
+        if rck and (rck in c_key or c_key in rck):
+            return str(r['route_name']).strip()
+    return ''
+
+
+def _get_or_create_client_from_erp(db, client_code, client_name, doc, phone, city, address, neighborhood, uf):
+    c = None
+    doc_clean = str(doc or '').strip()
+    if doc_clean and doc_clean not in ('00000000000', '00000000000000', '0'):
+        c = db.execute("SELECT id FROM clients WHERE document = ? LIMIT 1", (doc_clean,)).fetchone()
+    if not c and client_code:
+        c = db.execute("SELECT id FROM clients WHERE customer_code = ? LIMIT 1", (str(client_code).strip(),)).fetchone()
+    if not c and client_name:
+        c = db.execute("SELECT id FROM clients WHERE UPPER(TRIM(name)) = UPPER(TRIM(?)) LIMIT 1", (str(client_name).strip(),)).fetchone()
+
+    city_val = str(city or 'Teófilo Otoni').strip()
+    addr_val = str(address or '').strip()
+    neigh_val = str(neighborhood or '').strip()
+    phone_val = str(phone or '').strip()
+    now_ts = now()
+
+    if c:
+        cid = c['id']
+        db.execute("""
+            UPDATE clients 
+            SET phone = COALESCE(NULLIF(phone,''), ?),
+                city = COALESCE(NULLIF(city,''), ?),
+                address = COALESCE(NULLIF(address,''), ?),
+                neighborhood = COALESCE(NULLIF(neighborhood,''), ?),
+                updated_at = ?
+            WHERE id = ?
+        """, (phone_val, city_val, addr_val, neigh_val, now_ts, cid))
+        return cid
+
+    cur = db.execute("""
+        INSERT INTO clients (customer_code, name, document, phone, city, address, neighborhood, active, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+    """, (str(client_code or '').strip(), str(client_name or 'Cliente ERP').strip(), doc_clean, phone_val, city_val, addr_val, neigh_val, now_ts, now_ts))
+    return cur.lastrowid
+
+
+def enrich_order_items_from_erp(db, order_id, order_number):
+    """
+    Busca os itens reais do pedido na tabela don_pedido_venda_item do Oracle
+    e substitui itens genéricos ('Carga/volume...') pelos produtos detalhados.
+    """
+    if not _ERP_AVAILABLE:
+        return False
+    import logging as _logging
+    _log = _logging.getLogger('logistica.items_enrich')
+    cfg = _erp_connector.get_erp_config()
+    if not cfg.enabled:
+        return False
+    try:
+        with _erp_connector._erp_connection(cfg) as ora_conn:
+            cur = ora_conn.cursor()
+            cur.execute("""
+                SELECT 
+                    pvi.item,
+                    pvi.codigo_produto,
+                    COALESCE(pvi.descricao_produto, pro.descricao, 'Produto') as descricao,
+                    COALESCE(pro.unidade, 'UN') as unidade,
+                    NVL(pvi.embalagem_venda, '') as embalagem,
+                    pvi.quantidade,
+                    pvi.preco_venda,
+                    (pvi.quantidade * pvi.preco_venda) as total_valor,
+                    NVL(pro.peso_bruto, 0) as peso_unit,
+                    (pvi.quantidade * NVL(pro.peso_bruto, 0)) as peso_total
+                FROM don_pedido_venda_item pvi
+                LEFT JOIN don_produto pro ON pro.codigo = pvi.codigo_produto
+                WHERE pvi.numero_pedido_venda = :ped
+                ORDER BY pvi.item
+            """, ped=str(order_number).strip())
+            items = cur.fetchall()
+            if not items:
+                return False
+
+            existing = db.execute("SELECT id, status FROM order_items WHERE order_id = ?", (order_id,)).fetchall()
+            has_settled = any(it['status'] in ('Entregue', 'Problema') for it in existing)
+            if has_settled:
+                return False
+
+            db.execute("DELETE FROM order_items WHERE order_id = ?", (order_id,))
+            calc_w = 0.0
+            calc_v = 0.0
+            for it in items:
+                p_code = str(it[1] or '').strip()
+                p_name = (it[2] or 'Produto').strip()
+                p_unit = (it[3] or 'UN').strip()
+                p_pkg = (it[4] or '').strip()
+                p_qty = float(it[5] or 0)
+                p_price = float(it[6] or 0)
+                p_val = float(it[7] or (p_qty * p_price))
+                p_w = float(it[9] or 0)
+                calc_w += p_w
+                calc_v += p_val
+                notes_str = f"Emb: {p_pkg} | R$ {p_price:.2f}" if p_pkg else f"R$ {p_price:.2f}"
+                db.execute("""
+                    INSERT INTO order_items (
+                        order_id, product_code, product_name, quantity, unit, weight_kg, unit_price, total_value, status, problem_notes, notes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pendente', '', ?)
+                """, (order_id, p_code, p_name, p_qty, p_unit, p_w, p_price, p_val, notes_str))
+
+            row_o = db.execute("SELECT weight_kg, total_value FROM orders WHERE id=?", (order_id,)).fetchone()
+            if row_o:
+                if (not row_o['weight_kg'] or row_o['weight_kg'] == 0) and calc_w > 0:
+                    db.execute("UPDATE orders SET weight_kg = ? WHERE id = ?", (calc_w, order_id))
+                if (not row_o['total_value'] or row_o['total_value'] == 0) and calc_v > 0:
+                    db.execute("UPDATE orders SET total_value = ? WHERE id = ?", (calc_v, order_id))
+            db.commit()
+            return True
+    except Exception as exc:
+        _log.warning('Falha ao enriquecer itens do pedido %s: %s', order_number, exc)
+        return False
+
+
+def sync_orders_from_carga_view():
+    """
+    Sincroniza pedidos e produtos da view de carga do ERP (VW_PEDIDO_CARGA_CC).
+    Esta view filtra apenas os pedidos com 'Entrega ao cliente' (transporte rodoviário/caminhão).
+    Insere novos pedidos com status 'Faturado' e seus produtos em 'order_items'.
+    Atualiza pedidos existentes caso ainda não tenham saído para entrega.
+    """
+    if not _ERP_AVAILABLE:
+        return {'ok': False, 'message': 'Módulo ERP não disponível.', 'imported': 0, 'updated': 0}
+
+    import logging as _logging
+    _log = _logging.getLogger('logistica.carga_sync')
+    cfg = _erp_connector.get_erp_config()
+    if not cfg.enabled:
+        return {'ok': False, 'message': 'Integração ERP desabilitada.', 'imported': 0, 'updated': 0}
+
+    view_carga = getattr(cfg, 'view_carga', None) or get_setting('erp_view_carga', 'VW_PEDIDO_CARGA_CC')
+    view_cli = getattr(cfg, 'view_clientes', None) or get_setting('erp_view_clientes', 'VW_CLIENTES_CAD_LM')
+
+    try:
+        with _erp_connector._erp_connection(cfg) as ora_conn:
+            cur = ora_conn.cursor()
+            v_carga_full = f"{cfg.schema}.{view_carga}" if cfg.schema and '.' not in view_carga else view_carga
+            v_cli_full = f"{cfg.schema}.{view_cli}" if cfg.schema and '.' not in view_cli else view_cli
+            
+            sql = f"""
+                SELECT 
+                    p.NUMERO_PEDIDO,
+                    p.CODIGO_CLIENTE,
+                    p.CLIENTE,
+                    p.CNPJ_CLIENTE,
+                    p.CODIGO_RCA,
+                    p.DATA_EMISSAO_PEDIDO,
+                    p.DATA_FATURAMENTO_PEDIDO,
+                    p.NUM_NOTA_ORIGINAL,
+                    p.POSICAO_PEDIDO,
+                    p.CODIGO_PRODUTO,
+                    p.DESCRICAO_PRODUTO,
+                    p.EMBALAGEM_PRODUTO,
+                    p.UNIDADE_PRODUTO,
+                    p.QUANTIDADE_PRODUTO,
+                    p.PRECO_UNITARIO_PRODUTO,
+                    p.VALOR_TOTAL_PRODUTO,
+                    p.PESO_BRUTO_PRODUTO,
+                    p.PESO_LIQUIDO_PRODUTO,
+                    p.ITEM,
+                    c.ENDERECO,
+                    c.NUMERO,
+                    c.BAIRRO,
+                    c.NOME_CIDADE,
+                    c.UF,
+                    c.FONE1
+                FROM {v_carga_full} p
+                LEFT JOIN {v_cli_full} c ON c.CODIGO = p.CODIGO_CLIENTE
+                ORDER BY p.NUMERO_PEDIDO, p.ITEM
+            """
+            cur.execute(sql)
+            cols = [d[0].lower() for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            # Consulta faturamento real de cada pedido em lote
+            unique_peds = list({int(r['numero_pedido']) for r in rows if str(r.get('numero_pedido') or '').strip().isdigit()})
+            ped_billing_map = {}
+            if unique_peds:
+                try:
+                    schema_pfx = f"{cfg.schema}." if cfg.schema else ""
+                    for i in range(0, len(unique_peds), 500):
+                        batch = unique_peds[i:i+500]
+                        in_clause = ','.join(str(x) for x in batch)
+                        cur.execute(f"""
+                            SELECT 
+                                p.NUMERO AS numero_pedido,
+                                p.POSICAO_PEDIDO AS posicao_pedido,
+                                COALESCE(NULLIF(n.NUMERO, 0), NULLIF(p.NUMERO_NOTA_FISCAL_SAIDA, 0)) AS nota_fiscal,
+                                p.DATA_FATURAMENTO_PEDIDO AS data_faturamento,
+                                p.HORA_FATURAMENTO_PEDIDO AS hora_faturamento,
+                                p.MINUTO_FATURAMENTO_PEDIDO AS minuto_faturamento
+                            FROM {schema_pfx}don_pedido_venda p
+                            LEFT JOIN {schema_pfx}DON_NOTA_FISCAL_SAIDA n ON n.NUMERO_PEDIDO = p.NUMERO AND n.CANCELADA = 'N'
+                            WHERE p.NUMERO IN ({in_clause})
+                        """)
+                        for brow in cur.fetchall():
+                            b_ped = str(brow[0])
+                            b_pos = str(brow[1] or '').upper()
+                            b_nf = str(brow[2] or '').strip()
+                            if b_nf in ('0', '0.0', 'None', 'null', ''):
+                                b_nf = ''
+                            b_dt = brow[3]
+                            b_h = brow[4] or 0
+                            b_m = brow[5] or 0
+                            b_fat_ts = None
+                            if b_dt:
+                                d_s = b_dt.strftime("%Y-%m-%d") if hasattr(b_dt, "strftime") else str(b_dt)[:10]
+                                b_fat_ts = f"{d_s} {b_h:02d}:{b_m:02d}:00" if (b_h or b_m) else d_s
+                            is_b_fat = (b_pos == 'F') or bool(b_nf)
+                            ped_billing_map[b_ped] = {
+                                'is_invoiced': is_b_fat,
+                                'posicao': b_pos,
+                                'invoice_number': b_nf,
+                                'invoiced_at': b_fat_ts
+                            }
+
+                    # Carrega catálogo de vendedores/RCAs do ERP para resolver o nome real
+                    rca_name_map = {}
+                    try:
+                        cur.execute(f"SELECT CODIGO, NOME FROM {schema_pfx}DON_RCA WHERE NOME IS NOT NULL")
+                        for rca_row in cur.fetchall():
+                            if rca_row[0] is not None and rca_row[1]:
+                                rca_name_map[str(rca_row[0]).strip()] = str(rca_row[1]).strip()
+                    except Exception as rca_exc:
+                        _log.warning('Erro ao buscar DON_RCA na carga: %s', rca_exc)
+                    try:
+                        cur.execute(f"SELECT CODI_VED, NOME_VED FROM {schema_pfx}VW_VENDEDOR_CAD_LM WHERE NOME_VED IS NOT NULL")
+                        for rca_row in cur.fetchall():
+                            if rca_row[0] is not None and rca_row[1]:
+                                c_k = str(rca_row[0]).strip()
+                                if c_k not in rca_name_map:
+                                    rca_name_map[c_k] = str(rca_row[1]).strip()
+                    except Exception as rca_exc2:
+                        _log.warning('Erro ao buscar VW_VENDEDOR_CAD_LM na carga: %s', rca_exc2)
+                    if rca_name_map:
+                        _SELLER_NAME_BY_CODE.update(rca_name_map)
+                except Exception as b_exc:
+                    _log.warning('Erro ao verificar faturamento/vendedores em lote na carga ERP: %s', b_exc)
+    except Exception as exc:
+        _log.error('Erro ao consultar view de carga no ERP (%s): %s', view_carga, exc)
+        return {'ok': False, 'message': f'Erro ao ler view do ERP: {exc}', 'imported': 0, 'updated': 0}
+
+    if not rows:
+        return {'ok': True, 'message': 'Nenhum pedido de carga pendente na view do ERP.', 'imported': 0, 'updated': 0, 'total': 0}
+
+    orders_map = {}
+    for r in rows:
+        ped = str(r.get('numero_pedido') or '').strip()
+        if not ped:
+            continue
+        if ped not in orders_map:
+            sale_dt = str(r.get('data_emissao_pedido') or '')[:10]
+            if not sale_dt or len(sale_dt) < 10:
+                sale_dt = today()
+            inv_dt = str(r.get('data_faturamento_pedido') or '')[:10] if r.get('data_faturamento_pedido') else None
+            num_nota = str(r.get('num_nota_original') or '').strip()
+            if num_nota in ('0', 'None', 'null', ''):
+                num_nota = ''
+            
+            b_info = ped_billing_map.get(ped, {})
+            is_invoiced = b_info.get('is_invoiced', False)
+            real_nf = b_info.get('invoice_number') or num_nota
+            real_fat_date = b_info.get('invoiced_at') or inv_dt
+
+            addr_parts = [str(r.get('endereco') or '').strip()]
+            num_str = str(r.get('numero') or '').strip()
+            if num_str and num_str not in ('0', 'S/N', 'SN'):
+                addr_parts.append(num_str)
+            full_addr = ' '.join(p for p in addr_parts if p).strip()
+
+            s_code = str(r.get('codigo_rca') or '').strip()
+            s_name = rca_name_map.get(s_code) or resolve_seller_name(s_code) or 'Vendedor ERP'
+
+            orders_map[ped] = {
+                'order_number': ped,
+                'client_code': r.get('codigo_cliente'),
+                'client_name': (r.get('cliente') or 'Cliente ERP').strip(),
+                'document': (r.get('cnpj_cliente') or '').strip(),
+                'seller_code': s_code,
+                'seller_name': s_name,
+                'sale_date': sale_dt,
+                'invoice_date': real_fat_date if is_invoiced else None,
+                'invoice_number': real_nf if is_invoiced else '',
+                'is_invoiced': is_invoiced,
+                'position': b_info.get('posicao') or r.get('posicao_pedido'),
+                'address': full_addr,
+                'neighborhood': (r.get('bairro') or '').strip(),
+                'city': (r.get('nome_cidade') or 'Teófilo Otoni').strip(),
+                'uf': (r.get('uf') or 'MG').strip(),
+                'phone': (r.get('fone1') or '').strip(),
+                'total_value': 0.0,
+                'total_weight': 0.0,
+                'items': []
+            }
+
+        qty = float(r.get('quantidade_produto') or 1)
+        val = float(r.get('valor_total_produto') or 0)
+        w = float(r.get('peso_bruto_produto') or 0)
+        orders_map[ped]['total_value'] += val
+        orders_map[ped]['total_weight'] += w
+        orders_map[ped]['items'].append({
+            'item_seq': r.get('item'),
+            'product_code': str(r.get('codigo_produto') or '').strip(),
+            'product_name': (r.get('descricao_produto') or 'Produto').strip(),
+            'unit': (r.get('unidade_produto') or 'UN').strip(),
+            'package': (r.get('embalagem_produto') or '').strip(),
+            'quantity': qty,
+            'unit_price': float(r.get('preco_unitario_produto') or 0),
+            'total_value': val,
+            'weight_kg': w
+        })
+
+    imported_count = 0
+    updated_count = 0
+    now_ts = now()
+
+    with conn() as db:
+        if rca_name_map:
+            for c_cod, c_nom in rca_name_map.items():
+                db.execute(
+                    "INSERT OR REPLACE INTO erp_cache_vendedores (codigovendedor, raw_json, erp_synced_at) VALUES (?, ?, ?)",
+                    (c_cod, json.dumps({'codi_ved': c_cod, 'nome_ved': c_nom, 'nome': c_nom}, ensure_ascii=False), now_ts)
+                )
+
+        deleted_peds = {r['order_number'] for r in db.execute("SELECT order_number FROM deleted_orders").fetchall()}
+        for ped, o_data in orders_map.items():
+            if ped in deleted_peds:
+                continue
+            client_id = _get_or_create_client_from_erp(
+                db, o_data['client_code'], o_data['client_name'], o_data['document'],
+                o_data['phone'], o_data['city'], o_data['address'], o_data['neighborhood'], o_data['uf']
+            )
+            route_name = _resolve_route_name_for_city(db, o_data['city'])
+
+            try:
+                d_sale = datetime.strptime(o_data['sale_date'], '%Y-%m-%d').date()
+            except Exception:
+                d_sale = datetime.now().date()
+            deadline = (d_sale + timedelta(days=15)).strftime('%Y-%m-%d')
+
+            existing = db.execute(
+                "SELECT id, status, total_value, weight_kg, invoice_number, invoiced_at, route_name FROM orders WHERE order_number = ?",
+                (ped,)
+            ).fetchone()
+
+            seller_label = o_data.get('seller_name') or resolve_seller_name(o_data.get('seller_code'), db) or 'Vendedor ERP'
+            status_to_insert = 'Faturado' if o_data['is_invoiced'] else 'Venda'
+
+            if not existing:
+                cur_ins = db.execute("""
+                    INSERT INTO orders (
+                        order_number, client_id, seller_name, status, urgency,
+                        sale_date, expected_delivery_date, invoice_limit_date,
+                        total_value, weight_kg, delivery_address, city, uf, route_name,
+                        invoice_number, invoiced_at, created_at, updated_at, version
+                    ) VALUES (
+                        ?, ?, ?, ?, 'Normal',
+                        ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, 1
+                    )
+                """, (
+                    ped, client_id, seller_label, status_to_insert,
+                    o_data['sale_date'], deadline, deadline,
+                    o_data['total_value'], o_data['total_weight'], o_data['address'], o_data['city'], o_data['uf'], route_name,
+                    o_data['invoice_number'], o_data['invoice_date'],
+                    now_ts, now_ts
+                ))
+                new_oid = cur_ins.lastrowid
+
+                for it in o_data['items']:
+                    notes_str = f"Emb: {it['package']} | R$ {it['unit_price']:.2f}" if it['package'] else f"R$ {it['unit_price']:.2f}"
+                    db.execute("""
+                        INSERT INTO order_items (
+                            order_id, product_code, product_name, quantity, unit, weight_kg, unit_price, total_value, status, problem_notes, notes
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pendente', '', ?)
+                    """, (
+                        new_oid, it['product_code'], it['product_name'], it['quantity'], it['unit'],
+                        it['weight_kg'], it['unit_price'], it['total_value'], notes_str
+                    ))
+
+                if status_to_insert == 'Faturado':
+                    add_hist(db, new_oid, 1, 'ERP', 'Faturado', 'Pedido faturado importado do ERP', f'NF: {o_data["invoice_number"]} | View {view_carga} | Rota {route_name}')
+                else:
+                    add_hist(db, new_oid, 1, 'ERP', 'Venda', 'Pedido em venda importado do ERP', f'Aguardando Faturamento | View {view_carga} | Rota {route_name}')
+                imported_count += 1
+            else:
+                oid = existing['id']
+                current_st = normalize_order_status(existing['status'])
+                if current_st in ('Venda', 'Faturado', 'Carga Montada'):
+                    if current_st == 'Carga Montada':
+                        update_st = 'Carga Montada'
+                    else:
+                        update_st = 'Faturado' if o_data['is_invoiced'] else 'Venda'
+                    upd_nf = o_data['invoice_number'] if o_data['is_invoiced'] else ''
+                    upd_fat_date = o_data['invoice_date'] if o_data['is_invoiced'] else None
+                    db.execute("""
+                        UPDATE orders 
+                        SET status = ?,
+                            seller_name = CASE WHEN (seller_name LIKE 'RCA %' OR seller_name IS NULL OR seller_name = '' OR seller_name GLOB '*[0-9]*') AND ? != '' THEN ? ELSE seller_name END,
+                            total_value = ?, weight_kg = ?,
+                            route_name = CASE WHEN route_name IS NULL OR route_name='' OR route_name='Sem rota' OR route_name='Mista' THEN ? ELSE route_name END,
+                            delivery_address = COALESCE(NULLIF(delivery_address,''), ?),
+                            city = COALESCE(NULLIF(city,''), ?),
+                            uf = COALESCE(NULLIF(uf,''), ?),
+                            invoice_number = ?,
+                            invoiced_at = ?,
+                            updated_at = ?,
+                            version = COALESCE(version, 1) + 1
+                        WHERE id = ?
+                    """, (
+                        update_st, seller_label, seller_label, o_data['total_value'], o_data['total_weight'], route_name,
+                        o_data['address'], o_data['city'], o_data['uf'], upd_nf,
+                        upd_fat_date, now_ts, oid
+                    ))
+
+                    existing_items = db.execute("SELECT id, status FROM order_items WHERE order_id = ?", (oid,)).fetchall()
+                    has_settled_items = any(it['status'] in ('Entregue', 'Problema') for it in existing_items)
+                    if not has_settled_items:
+                        db.execute("DELETE FROM order_items WHERE order_id = ?", (oid,))
+                        for it in o_data['items']:
+                            notes_str = f"Emb: {it['package']} | R$ {it['unit_price']:.2f}" if it['package'] else f"R$ {it['unit_price']:.2f}"
+                            db.execute("""
+                                INSERT INTO order_items (
+                                    order_id, product_code, product_name, quantity, unit, weight_kg, unit_price, total_value, status, problem_notes, notes
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pendente', '', ?)
+                            """, (
+                                oid, it['product_code'], it['product_name'], it['quantity'], it['unit'],
+                                it['weight_kg'], it['unit_price'], it['total_value'], notes_str
+                            ))
+
+                    if current_st == 'Venda' and update_st == 'Faturado':
+                        add_hist(db, oid, 1, 'Venda', 'Faturado', 'Pedido promovido pelo ERP', f'NF: {upd_nf}')
+                    elif current_st == 'Faturado' and update_st == 'Venda':
+                        add_hist(db, oid, 1, 'Faturado', 'Venda', 'Ajuste de status ERP (Aguardando faturamento)', '')
+                    updated_count += 1
+                else:
+                    if o_data['invoice_number'] and not existing['invoice_number']:
+                        db.execute("UPDATE orders SET invoice_number=?, invoiced_at=COALESCE(?, invoiced_at), updated_at=? WHERE id=?", (o_data['invoice_number'], o_data['invoice_date'], now_ts, oid))
+
+        try:
+            open_placeholders = db.execute("""
+                SELECT DISTINCT o.id, o.order_number 
+                FROM orders o 
+                JOIN order_items oi ON oi.order_id = o.id 
+                WHERE (oi.product_name LIKE '%Carga/volume%' OR oi.product_name LIKE '%volume%')
+                  AND o.status NOT IN ('Acertado', 'Cancelado')
+            """).fetchall()
+            for po in open_placeholders:
+                enrich_order_items_from_erp(db, po['id'], po['order_number'])
+        except Exception as _e:
+            _log.warning('Falha ao enriquecer itens pendentes: %s', _e)
+
+        db.commit()
+
+    if imported_count > 0 or updated_count > 0:
+        GLOBAL_BROKER.publish('orders_updated')
+        GLOBAL_BROKER.publish('routes_updated')
+
+    return {
+        'ok': True,
+        'imported': imported_count,
+        'updated': updated_count,
+        'total': len(orders_map),
+        'message': f'{imported_count} novo(s) pedido(s) importado(s), {updated_count} atualizado(s) da view de carga.'
+    }
+
 
 
 def start_pdf_report_scheduler():
@@ -7691,6 +14049,7 @@ def _erp_invoice_sync_worker():
 
     last_full_sync_ts = 0.0
     last_pending_check_ts = 0.0
+    last_carga_sync_ts = 0.0
 
     while True:
         try:
@@ -7716,7 +14075,17 @@ def _erp_invoice_sync_worker():
                 if updated_pending > 0:
                     _log.info('Sync ERP: %d pedido(s) promovido(s) para Faturado em Logística.', updated_pending)
 
-            # 2. Executa sync completo de cache nos intervalos configurados (ex: a cada 30 min)
+            # 2. Puxa novos pedidos de caminhão da view de carga (VW_PEDIDO_CARGA_CC) a cada 60 segundos
+            if (now_ts - last_carga_sync_ts) >= 60:
+                last_carga_sync_ts = now_ts
+                try:
+                    res_carga = sync_orders_from_carga_view()
+                    if res_carga.get('imported', 0) > 0 or res_carga.get('updated', 0) > 0:
+                        _log.info('Sync Carga ERP: %s', res_carga.get('message'))
+                except Exception as c_exc:
+                    _log.error('Sync Carga ERP: erro ao sincronizar view de carga: %s', c_exc)
+
+            # 3. Executa sync completo de cache nos intervalos configurados (ex: a cada 30 min)
             interval_min = max(1, cfg.sync_interval_min if cfg.sync_interval_min > 0 else 30)
             interval_sec = interval_min * 60
 
@@ -7726,8 +14095,9 @@ def _erp_invoice_sync_worker():
                 sync_res = _erp_connector.sync_erp_cache()
                 _log.info('Sync ERP resultado: %s', sync_res.get('message'))
 
-                # Re-executa verificação de faturamento após o sync de cache
+                # Re-executa verificação de faturamento e carga após o sync de cache
                 sync_pending_invoiced_orders_to_logistica()
+                sync_orders_from_carga_view()
 
         except Exception as sync_exc:
             _log.error('Sync ERP: erro no ciclo de sync: %s', sync_exc)
@@ -7764,6 +14134,27 @@ def create_server(host: str = HOST, port: int = PORT) -> SafeThreadingHTTPServer
 def start_server(host: str = HOST, port: int = PORT):
     print_runtime_banner(host, int(port))
     server = create_server(host=host, port=int(port))
+
+    # Inicia servidor HTTPS na porta 3443 para liberar GPS e recursos de segurança no celular
+    https_port = int(os.environ.get('LOGISTICA_SSL_PORT', '3443'))
+    https_server = None
+    try:
+        from app_core.ssl_cert import get_ssl_context
+        ctx = get_ssl_context()
+        if ctx:
+            https_server = SafeThreadingHTTPServer((host, https_port), App)
+            https_server.socket = ctx.wrap_socket(https_server.socket, server_side=True)
+            t_https = threading.Thread(
+                target=https_server.serve_forever,
+                kwargs={'poll_interval': 0.5},
+                daemon=True,
+                name='https-listener'
+            )
+            t_https.start()
+            print(f"🔒 Servidor HTTPS (GPS Ativo) escutando em https://{host}:{https_port}")
+    except Exception as ssl_err:
+        print(f"[AVISO] Servidor HTTPS não pôde ser iniciado: {ssl_err}")
+
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
@@ -7773,6 +14164,11 @@ def start_server(host: str = HOST, port: int = PORT):
             server.server_close()
         except Exception:
             pass
+        if https_server:
+            try:
+                https_server.server_close()
+            except Exception:
+                pass
 
 
 if __name__=='__main__':

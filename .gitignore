@@ -10,6 +10,8 @@ venv/
 
 # Local environment secrets
 .env
+.env.*
+!.env.example
 
 # Node and frontend deps
 node_modules/
@@ -34,6 +36,7 @@ data/*.sqlite3-wal
 data/*.sqlite3-shm
 data/*.sqlite3-journal
 data/relatorio_pedidos.csv
+/data/
 
 # Runtime logs & backups
 logs/
@@ -41,6 +44,9 @@ backups/
 releases/
 
 # Generated docs/artifacts
+/tmp/
+/output/pdf/*.pdf
+*.apk
 *.tmp
 *.log
 
